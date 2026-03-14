@@ -1,0 +1,25 @@
+# Frontend
+node_modules/
+dist/
+
+# Backend
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.kiro
+.vscode
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
