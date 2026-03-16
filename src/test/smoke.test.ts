@@ -11,7 +11,7 @@ describe('Project Setup', () => {
   });
 
   it('should have Tauri API mocked', async () => {
-    const { invoke } = await import('@tauri-apps/api/tauri');
+    const { invoke } = await import('@tauri-apps/api/core');
     expect(invoke).toBeDefined();
   });
 });
