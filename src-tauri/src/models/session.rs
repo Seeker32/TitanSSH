@@ -16,6 +16,8 @@ pub struct SessionInfo {
 pub enum SessionStatus {
     Connecting,
     Connected,
+    AuthFailed,
     Disconnected,
-    Failed,
+    Timeout,
+    Error,
 }

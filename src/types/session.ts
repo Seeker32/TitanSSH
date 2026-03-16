@@ -7,11 +7,14 @@ export interface SessionInfo {
   status: SessionStatus;
   created_at: number;
   active: boolean;
+  isHome?: boolean;
 }
 
 export enum SessionStatus {
   Connecting = "Connecting",
   Connected = "Connected",
+  AuthFailed = "AuthFailed",
   Disconnected = "Disconnected",
-  Failed = "Failed",
+  Timeout = "Timeout",
+  Error = "Error",
 }

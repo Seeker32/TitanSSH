@@ -4,15 +4,24 @@ mod errors;
 mod models;
 mod storage;
 
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+use crate::core::session_manager::SessionManager;
+use std::sync::Mutex;
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .manage(Mutex::new(SessionManager::new()))
+        .invoke_handler(tauri::generate_handler![
+            commands::host::list_hosts,
+            commands::host::save_host,
+            commands::host::delete_host,
+            commands::session::open_session,
+            commands::session::close_session,
+            commands::session::write_terminal,
+            commands::session::resize_terminal,
+            commands::session::list_sessions,
+            commands::monitor::get_server_status
+        ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running Titan SSH");
 }
