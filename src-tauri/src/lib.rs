@@ -20,7 +20,10 @@ pub fn run() {
             commands::session::write_terminal,
             commands::session::resize_terminal,
             commands::session::list_sessions,
-            commands::monitor::get_server_status
+            commands::session::sync_session_status,
+            commands::monitor::start_monitoring,
+            commands::monitor::stop_monitoring,
+            commands::monitor::get_monitor_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running Titan SSH");
