@@ -1,10 +1,51 @@
-import { ref, watchEffect } from 'vue';
+import { ref, computed, watchEffect } from 'vue';
 import { defineStore } from 'pinia';
+import { darkTheme, lightTheme } from 'naive-ui';
+import type { GlobalThemeOverrides } from 'naive-ui';
 
 type Theme = 'light' | 'dark';
 
+const inputOverrides = {
+  boxShadowFocus: 'none',
+  borderFocus: '1px solid rgba(16, 185, 129, 0.6)',
+  borderHover: '1px solid rgba(16, 185, 129, 0.4)',
+};
+
+const darkOverrides: GlobalThemeOverrides = {
+  common: {
+    primaryColor: '#10b981',
+    primaryColorHover: '#6ee7b7',
+    primaryColorPressed: '#059669',
+    primaryColorSuppl: '#10b981',
+    borderRadius: '12px',
+    fontFamily: '"SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif',
+  },
+  Input: inputOverrides,
+  Select: { boxShadowFocus: 'none' },
+  InputNumber: { boxShadowFocus: 'none' },
+};
+
+const lightOverrides: GlobalThemeOverrides = {
+  common: {
+    primaryColor: '#059669',
+    primaryColorHover: '#10b981',
+    primaryColorPressed: '#047857',
+    primaryColorSuppl: '#059669',
+    borderRadius: '12px',
+    fontFamily: '"SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif',
+  },
+  Input: inputOverrides,
+  Select: { boxShadowFocus: 'none' },
+  InputNumber: { boxShadowFocus: 'none' },
+};
+
 export const useThemeStore = defineStore('theme', () => {
   const theme = ref<Theme>('dark');
+
+  const naiveTheme = computed(() => (theme.value === 'dark' ? darkTheme : lightTheme));
+  const naiveThemeOverrides = computed(() =>
+    theme.value === 'dark' ? darkOverrides : lightOverrides,
+  );
 
   function setTheme(newTheme: Theme) {
     theme.value = newTheme;
@@ -29,6 +70,8 @@ export const useThemeStore = defineStore('theme', () => {
 
   return {
     theme,
+    naiveTheme,
+    naiveThemeOverrides,
     setTheme,
     toggleTheme,
     initTheme,

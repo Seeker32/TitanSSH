@@ -5,9 +5,8 @@ export interface SessionInfo {
   port: number;
   username: string;
   status: SessionStatus;
+  /** Unix 毫秒时间戳 */
   created_at: number;
-  active: boolean;
-  isHome?: boolean;
 }
 
 export enum SessionStatus {
