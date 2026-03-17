@@ -5,7 +5,15 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::time::Duration;
 
-pub fn connect(host: &HostConfig) -> Result<Session, AppError> {
+/// 建立 SSH 连接并完成认证，返回已认证的 Session
+/// - host: 主机配置（不含明文凭据）
+/// - password: 运行时从安全存储读取的明文密码（Password 认证时必须提供）
+/// - passphrase: 运行时从安全存储读取的明文私钥口令（PrivateKey 认证时可选）
+pub fn connect(
+    host: &HostConfig,
+    password: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<Session, AppError> {
     let tcp = TcpStream::connect(format!("{}:{}", host.host, host.port)).map_err(|error| {
         if matches!(
             error.kind(),
@@ -26,12 +34,11 @@ pub fn connect(host: &HostConfig) -> Result<Session, AppError> {
 
     match host.auth_type {
         AuthType::Password => {
-            let password = host
-                .password
-                .as_deref()
-                .ok_or_else(|| AppError::InvalidHostConfig("Password is required".to_string()))?;
+            let pwd = password.ok_or_else(|| {
+                AppError::InvalidHostConfig("Password is required".to_string())
+            })?;
             session
-                .userauth_password(&host.username, password)
+                .userauth_password(&host.username, pwd)
                 .map_err(|error| AppError::AuthenticationError(error.to_string()))?;
         }
         AuthType::PrivateKey => {
@@ -43,7 +50,7 @@ pub fn connect(host: &HostConfig) -> Result<Session, AppError> {
                     &host.username,
                     None,
                     Path::new(private_key),
-                    host.passphrase.as_deref(),
+                    passphrase,
                 )
                 .map_err(|error| AppError::AuthenticationError(error.to_string()))?;
         }

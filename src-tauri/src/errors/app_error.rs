@@ -22,6 +22,9 @@ pub enum AppError {
 
     #[error("SSH error: {0}")]
     Ssh2Error(#[from] ssh2::Error),
+
+    #[error("Secure store error: {0}")]
+    SecureStoreError(String),
 }
 
 impl From<AppError> for String {
