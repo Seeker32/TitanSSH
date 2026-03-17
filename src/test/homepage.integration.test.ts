@@ -5,7 +5,7 @@ import { nextTick } from 'vue';
 import HomePage from '@/pages/HomePage.vue';
 import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
-import { makeHost, makeSession, makeStatus } from './fixtures';
+import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
 
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
@@ -48,9 +48,9 @@ describe('HomePage integration', () => {
 
   it('loads hosts and opens a session from the host list', async () => {
     vi.mocked(invoke)
-      .mockResolvedValueOnce([makeHost()])
-      .mockResolvedValueOnce(makeSession())
-      .mockResolvedValueOnce(makeStatus());
+      .mockResolvedValueOnce([makeHost()])   // list_hosts
+      .mockResolvedValueOnce(makeSession())  // open_session
+      .mockResolvedValueOnce(makeTaskInfo()); // start_monitoring
 
     const wrapper = mount(HomePage, {
       global: {
@@ -78,21 +78,17 @@ describe('HomePage integration', () => {
       session_id: 'session-1',
       data: 'ready',
     });
-    emitMockEvent('monitor:update', makeStatus({ uptime_text: '9h 1m' }));
+    emitMockEvent('monitor:snapshot', makeSnapshot({ session_id: 'session-1', cpu_usage: 42.0 }));
 
     await flushUi();
 
     expect(invoke).toHaveBeenCalledWith('list_hosts');
     expect(invoke).toHaveBeenCalledWith('open_session', { hostId: 'host-1' });
-    expect(invoke).toHaveBeenCalledWith('get_server_status', { sessionId: 'session-1' });
     expect(invoke).toHaveBeenCalledWith('resize_terminal', {
       sessionId: 'session-1',
       cols: 120,
       rows: 32,
     });
     expect(wrapper.text()).toContain('已连接');
-    expect(wrapper.text()).toContain('9h 1m');
-    expect(wrapper.text()).toContain('用户 root');
-    expect(wrapper.text()).toContain('主机 10.0.0.8:22');
   });
 });

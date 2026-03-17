@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { useHostStore } from '@/stores/host';
 import { invoke } from '@tauri-apps/api/core';
-import { makeHost } from './fixtures';
+import { makeHost, makeSaveHostRequest } from './fixtures';
 
 describe('host store', () => {
   beforeEach(() => {
@@ -40,12 +40,12 @@ describe('host store', () => {
       .mockResolvedValueOnce(deletedHosts);
     const store = useHostStore();
 
-    await store.saveHost(makeHost());
+    const request = makeSaveHostRequest();
+    await store.saveHost(request);
     await store.deleteHost('host-1');
 
-    expect(invoke).toHaveBeenNthCalledWith(1, 'save_host', {
-      hostConfig: makeHost(),
-    });
+    // save_host 使用 request 参数键
+    expect(invoke).toHaveBeenNthCalledWith(1, 'save_host', { request });
     expect(invoke).toHaveBeenNthCalledWith(2, 'delete_host', { hostId: 'host-1' });
     expect(store.hosts).toEqual(deletedHosts);
   });

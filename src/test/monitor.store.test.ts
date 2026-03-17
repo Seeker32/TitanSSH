@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
-import { makeSession, makeStatus } from './fixtures';
+import { makeSession, makeSnapshot } from './fixtures';
 
 describe('monitor store', () => {
   beforeEach(() => {
@@ -13,27 +13,46 @@ describe('monitor store', () => {
     resetMockEvents();
   });
 
-  it('fetches and stores a server status snapshot', async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(makeStatus());
+  it('fetches and stores a monitor snapshot', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(makeSnapshot());
     const store = useMonitorStore();
 
-    const status = await store.fetchStatus('session-1');
+    const snapshot = await store.fetchSnapshot('session-1');
 
-    expect(invoke).toHaveBeenCalledWith('get_server_status', { sessionId: 'session-1' });
-    expect(status.ip).toBe('10.0.0.8');
-    expect(store.statuses.get('session-1')?.cpu_percent).toBe(21.5);
+    expect(invoke).toHaveBeenCalledWith('get_monitor_status', { sessionId: 'session-1' });
+    expect(snapshot.cpu_usage).toBe(21.5);
+    expect(store.snapshots.get('session-1')?.memory_usage).toBe(25.0);
   });
 
-  it('updates active status when monitor event arrives', async () => {
+  it('updates active snapshot when monitor:snapshot event arrives', async () => {
     const sessionStore = useSessionStore();
-    sessionStore.sessions = new Map([['session-1', makeSession()]]);
-    sessionStore.activeSessionId = 'session-1';
+    vi.mocked(invoke).mockResolvedValueOnce(makeSession());
+    await sessionStore.openSession('host-1');
 
     const store = useMonitorStore();
     const dispose = await store.initListeners();
-    emitMockEvent('monitor:update', makeStatus({ session_id: 'session-1', ip: '172.16.0.3' }));
 
-    expect(store.activeStatus?.ip).toBe('172.16.0.3');
+    emitMockEvent('monitor:snapshot', makeSnapshot({ session_id: 'session-1', cpu_usage: 77.3 }));
+
+    expect(store.activeSnapshot?.cpu_usage).toBe(77.3);
     dispose();
+  });
+
+  it('activeSnapshot returns null when home view is active', () => {
+    const sessionStore = useSessionStore();
+    sessionStore.setActiveView('home');
+
+    const store = useMonitorStore();
+    expect(store.activeSnapshot).toBeNull();
+  });
+
+  it('snapshot timestamp is in milliseconds', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(makeSnapshot());
+    const store = useMonitorStore();
+
+    const snapshot = await store.fetchSnapshot('session-1');
+
+    // 毫秒时间戳应大于 1_000_000_000_000
+    expect(snapshot.timestamp).toBeGreaterThan(1_000_000_000_000);
   });
 });
