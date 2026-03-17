@@ -1,53 +1,42 @@
 <script setup lang="ts">
+import { NButton, NEmpty, NScrollbar, NText } from 'naive-ui';
 import type { HostConfig } from '@/types/host';
 
-interface Props {
+defineProps<{
   hosts: HostConfig[];
-}
+}>();
 
-interface Emits {
+const emit = defineEmits<{
   open: [hostId: string];
   create: [];
-}
-
-defineProps<Props>();
-const emit = defineEmits<Emits>();
-
-function handleOpen(hostId: string) {
-  emit('open', hostId);
-}
-
-function handleCreate() {
-  emit('create');
-}
+}>();
 </script>
 
 <template>
   <div class="home-quick-actions">
-    <div class="host-section">
-      <div v-if="hosts.length === 0" class="empty-state">
-        <p>暂无保存的主机</p>
-        <span class="hint">点击下方"新建主机"按钮添加您的第一个 SSH 连接</span>
-      </div>
-
+    <NScrollbar style="flex: 1; min-height: 0">
+      <NEmpty
+        v-if="hosts.length === 0"
+        description="暂无保存的主机，点击下方按钮添加第一个 SSH 连接"
+        style="margin-top: 60px"
+      />
       <div v-else class="host-list">
-        <button
+        <div
           v-for="host in hosts"
           :key="host.id"
           class="host-btn"
-          @click="handleOpen(host.id)"
+          @click="emit('open', host.id)"
         >
-          <span class="host-name">{{ host.name || host.host }}</span>
-          <span class="host-info">{{ host.username }}@{{ host.host }}:{{ host.port }}</span>
-        </button>
+          <NText strong>{{ host.name || host.host }}</NText>
+          <NText depth="3" style="font-size: 13px; font-family: monospace">
+            {{ host.username }}@{{ host.host }}:{{ host.port }}
+          </NText>
+        </div>
       </div>
-    </div>
+    </NScrollbar>
 
     <div class="create-section">
-      <button class="create-btn" @click="handleCreate">
-        <span class="icon">+</span>
-        <span>新建主机</span>
-      </button>
+      <NButton block @click="emit('create')">+ 新建主机</NButton>
     </div>
   </div>
 </template>
@@ -58,51 +47,26 @@ function handleCreate() {
   flex-direction: column;
   height: 100%;
   padding: 20px;
-  box-sizing: border-box;
-}
-
-.host-section {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
-
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  height: 100%;
-  padding: 40px;
-  border: 1px dashed var(--color-border);
-  border-radius: 16px;
-  color: var(--color-text-secondary);
-}
-
-.empty-state .hint {
-  font-size: 14px;
-  color: var(--color-text-tertiary);
+  gap: 16px;
 }
 
 .host-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  padding-right: 4px;
 }
 
 .host-btn {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: 4px;
   padding: 14px 18px;
   border: 1px solid var(--color-border);
   border-radius: 12px;
   background: var(--color-card-bg);
   cursor: pointer;
-  transition: all 0.2s ease;
-  text-align: left;
+  transition: all 0.15s ease;
 }
 
 .host-btn:hover {
@@ -111,50 +75,9 @@ function handleCreate() {
   transform: translateY(-1px);
 }
 
-.host-name {
-  font-size: 15px;
-  font-weight: 500;
-  color: var(--color-text-primary);
-}
-
-.host-info {
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  font-family: monospace;
-}
-
 .create-section {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--color-border);
   flex-shrink: 0;
-}
-
-.create-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  width: 100%;
-  padding: 14px 20px;
-  border: 1px solid var(--color-border);
-  border-radius: 12px;
-  background: var(--color-card-bg);
-  color: var(--color-text-primary);
-  font-size: 15px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.create-btn:hover {
-  border-color: var(--color-accent);
-  background: var(--color-accent-bg);
-  color: var(--color-accent);
-}
-
-.create-btn .icon {
-  font-size: 20px;
-  font-weight: 300;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
 }
 </style>

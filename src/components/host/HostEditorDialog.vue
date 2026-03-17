@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from 'vue';
-import { AuthType, type HostConfig } from '@/types/host';
+import {
+  NModal, NCard, NForm, NFormItem, NInput, NInputNumber,
+  NSelect, NButton, NSpace, NGrid, NGridItem,
+} from 'naive-ui';
+import { AuthType, type HostConfig, type SaveHostRequest } from '@/types/host';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -9,10 +13,12 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:modelValue': [boolean];
-  save: [HostConfig];
+  /** 保存时提交 SaveHostRequest，含明文凭据，不含 ref 字段 */
+  save: [SaveHostRequest];
 }>();
 
-const form = reactive<HostConfig>({
+/** 表单内部使用 SaveHostRequest 形状，含明文 password/passphrase */
+const form = reactive<SaveHostRequest>({
   id: '',
   name: '',
   host: '',
@@ -27,6 +33,15 @@ const form = reactive<HostConfig>({
 
 const title = computed(() => (props.editingHost ? '编辑连接' : '新建连接'));
 
+const authOptions = [
+  { label: '密码', value: AuthType.Password },
+  { label: '私钥', value: AuthType.PrivateKey },
+];
+
+/**
+ * 监听对话框打开与编辑目标变化，重置表单。
+ * 编辑时从 HostConfig（含 ref 字段）初始化非敏感字段，密码字段留空让用户重新输入。
+ */
 watch(
   () => [props.modelValue, props.editingHost],
   () => {
@@ -38,171 +53,94 @@ watch(
       port: source?.port ?? 22,
       username: source?.username ?? '',
       auth_type: source?.auth_type ?? AuthType.Password,
-      password: source?.password ?? '',
+      // 编辑时密码字段留空，用户需重新输入
+      password: '',
       private_key_path: source?.private_key_path ?? '',
-      passphrase: source?.passphrase ?? '',
+      // 编辑时口令字段留空，用户需重新输入
+      passphrase: '',
       remark: source?.remark ?? '',
     });
   },
   { immediate: true },
 );
 
+/** 关闭对话框 */
 function close() {
   emit('update:modelValue', false);
 }
 
+/** 提交表单，emit SaveHostRequest，后端负责安全存储明文凭据 */
 function submit() {
-  emit('save', {
+  const request: SaveHostRequest = {
     ...form,
     id: form.id || crypto.randomUUID(),
     password: form.auth_type === AuthType.Password ? form.password : undefined,
     private_key_path:
       form.auth_type === AuthType.PrivateKey ? form.private_key_path : undefined,
     passphrase: form.auth_type === AuthType.PrivateKey ? form.passphrase : undefined,
-  });
+  };
+  emit('save', request);
 }
 </script>
 
 <template>
-  <div v-if="modelValue" class="dialog-mask" @click.self="close">
-    <div class="dialog">
-      <div class="dialog-header">
-        <h2>{{ title }}</h2>
-        <button class="ghost" @click="close">关闭</button>
-      </div>
-
-      <div class="grid">
-        <label>
-          <span>名称</span>
-          <input v-model="form.name" placeholder="生产服务器" />
-        </label>
-        <label>
-          <span>地址</span>
-          <input v-model="form.host" placeholder="192.168.1.12" />
-        </label>
-        <label>
-          <span>端口</span>
-          <input v-model.number="form.port" type="number" min="1" max="65535" />
-        </label>
-        <label>
-          <span>用户名</span>
-          <input v-model="form.username" placeholder="root" />
-        </label>
-        <label>
-          <span>认证方式</span>
-          <select v-model="form.auth_type">
-            <option :value="AuthType.Password">密码</option>
-            <option :value="AuthType.PrivateKey">私钥</option>
-          </select>
-        </label>
-        <label v-if="form.auth_type === AuthType.Password">
-          <span>密码</span>
-          <input v-model="form.password" type="password" />
-        </label>
-        <label v-else>
-          <span>私钥路径</span>
-          <input v-model="form.private_key_path" placeholder="~/.ssh/id_rsa" />
-        </label>
-        <label v-if="form.auth_type === AuthType.PrivateKey">
-          <span>私钥口令</span>
-          <input v-model="form.passphrase" type="password" />
-        </label>
-        <label class="full">
-          <span>备注</span>
-          <textarea v-model="form.remark" rows="3" placeholder="业务说明 / 环境标签" />
-        </label>
-      </div>
-
-      <div class="actions">
-        <button class="ghost" @click="close">取消</button>
-        <button class="primary" @click="submit">保存连接</button>
-      </div>
-    </div>
-  </div>
+  <NModal :show="modelValue" :mask-closable="true" @update:show="emit('update:modelValue', $event)">
+    <NCard :title="title" style="width: min(720px, calc(100vw - 32px))" :bordered="false" role="dialog">
+      <NForm label-placement="top" label-width="auto">
+        <NGrid :cols="2" :x-gap="16">
+          <NGridItem>
+            <NFormItem label="名称">
+              <NInput v-model:value="form.name" placeholder="生产服务器" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem>
+            <NFormItem label="地址">
+              <NInput v-model:value="form.host" placeholder="192.168.1.12" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem>
+            <NFormItem label="端口">
+              <NInputNumber v-model:value="form.port" :min="1" :max="65535" style="width: 100%" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem>
+            <NFormItem label="用户名">
+              <NInput v-model:value="form.username" placeholder="root" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem>
+            <NFormItem label="认证方式">
+              <NSelect v-model:value="form.auth_type" :options="authOptions" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem v-if="form.auth_type === AuthType.Password">
+            <NFormItem label="密码">
+              <NInput v-model:value="form.password" type="password" show-password-on="click" placeholder="留空则保持原密码不变" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem v-else>
+            <NFormItem label="私钥路径">
+              <NInput v-model:value="form.private_key_path" placeholder="~/.ssh/id_rsa" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem v-if="form.auth_type === AuthType.PrivateKey">
+            <NFormItem label="私钥口令">
+              <NInput v-model:value="form.passphrase" type="password" show-password-on="click" placeholder="留空则保持原口令不变" />
+            </NFormItem>
+          </NGridItem>
+          <NGridItem :span="2">
+            <NFormItem label="备注">
+              <NInput v-model:value="form.remark" type="textarea" :rows="3" placeholder="业务说明 / 环境标签" />
+            </NFormItem>
+          </NGridItem>
+        </NGrid>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="close">取消</NButton>
+          <NButton type="primary" @click="submit">保存连接</NButton>
+        </NSpace>
+      </template>
+    </NCard>
+  </NModal>
 </template>
-
-<style scoped>
-.dialog-mask {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: rgba(5, 10, 15, 0.65);
-  backdrop-filter: blur(8px);
-  z-index: 20;
-}
-
-.dialog {
-  width: min(760px, calc(100vw - 32px));
-  padding: 24px;
-  border: 1px solid var(--color-border);
-  border-radius: 24px;
-  background: var(--color-panel-bg);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.38);
-}
-
-.dialog-header,
-.actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-h2 {
-  margin: 0;
-  color: var(--color-text-primary);
-}
-
-.grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-  margin: 18px 0 22px;
-}
-
-label {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  color: var(--color-text-secondary);
-}
-
-.full {
-  grid-column: 1 / -1;
-}
-
-input,
-select,
-textarea {
-  width: 100%;
-  padding: 12px 14px;
-  border: 1px solid var(--color-border);
-  border-radius: 14px;
-  color: var(--color-text-primary);
-  background: var(--color-card-bg);
-}
-
-.ghost,
-.primary {
-  padding: 10px 16px;
-  border-radius: 12px;
-  border: 1px solid var(--color-border);
-}
-
-.ghost {
-  color: var(--color-text-secondary);
-  background: var(--color-card-bg);
-}
-
-.primary {
-  color: var(--color-text-inverse);
-  background: var(--color-accent);
-}
-
-@media (max-width: 700px) {
-  .grid {
-    grid-template-columns: 1fr;
-  }
-}
-</style>

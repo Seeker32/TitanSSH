@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { NText } from 'naive-ui';
+
 defineProps<{
   statusText: string;
   userText: string;
@@ -8,28 +10,21 @@ defineProps<{
 
 <template>
   <footer class="app-footer">
-    <span>{{ statusText }}</span>
-    <span>{{ userText }}</span>
-    <span>{{ hostText }}</span>
-    <span>UTF-8</span>
-    <span>SSH</span>
+    <NText depth="3" style="font-size: 12px">{{ statusText }}</NText>
+    <NText depth="3" style="font-size: 12px">{{ userText }}</NText>
+    <NText depth="3" style="font-size: 12px">{{ hostText }}</NText>
+    <NText depth="3" style="font-size: 12px">UTF-8</NText>
+    <NText depth="3" style="font-size: 12px">SSH</NText>
   </footer>
 </template>
 
 <style scoped>
 .app-footer {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px;
-  padding: 14px 24px 18px;
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  padding: 8px 20px;
   border-top: 1px solid var(--color-border);
-  color: var(--color-text-secondary);
-  font-size: 12px;
-}
-
-@media (max-width: 860px) {
-  .app-footer {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+  flex-shrink: 0;
 }
 </style>

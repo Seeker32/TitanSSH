@@ -1,118 +1,78 @@
 <script setup lang="ts">
+import { NCard, NEmpty, NProgress, NStatistic, NGrid, NGridItem, NText } from 'naive-ui';
+import { computed } from 'vue';
 import type { ServerStatus } from '@/types/monitor';
 
-defineProps<{
+const props = defineProps<{
   status: ServerStatus | null;
 }>();
+
+const memPercent = computed(() => props.status?.memory_percent ?? 0);
+const swapPercent = computed(() => props.status?.swap_percent ?? 0);
+
+function progressStatus(percent: number): 'success' | 'warning' | 'error' | 'default' {
+  if (percent < 60) return 'success';
+  if (percent < 85) return 'warning';
+  return 'error';
+}
 </script>
 
 <template>
-  <section class="status-panel">
-    <div class="panel-title">
-      <p>服务器状态</p>
-      <strong>{{ status?.ip || '未连接' }}</strong>
-    </div>
+  <NCard size="small" :bordered="false" class="status-panel">
+    <template #header>
+      <NText depth="3" style="font-size: 12px">服务器状态</NText>
+      <NText strong style="display: block; margin-top: 2px">{{ status?.ip || '未连接' }}</NText>
+    </template>
 
-    <div v-if="status" class="status-grid">
-      <article>
-        <span>Uptime</span>
-        <strong>{{ status.uptime_text }}</strong>
-      </article>
-      <article>
-        <span>Load</span>
-        <strong>{{ status.load1.toFixed(2) }} / {{ status.load5.toFixed(2) }} / {{ status.load15.toFixed(2) }}</strong>
-      </article>
-      <article>
-        <span>CPU</span>
-        <strong>{{ status.cpu_percent.toFixed(1) }}%</strong>
-      </article>
-      <article>
-        <span>Memory</span>
-        <strong>{{ status.memory_used_mb }} / {{ status.memory_total_mb }} MB</strong>
-        <div class="bar"><div :style="{ width: `${status.memory_percent}%` }" /></div>
-      </article>
-      <article>
-        <span>Swap</span>
-        <strong>{{ status.swap_used_mb }} / {{ status.swap_total_mb }} MB</strong>
-        <div class="bar"><div :style="{ width: `${status.swap_percent}%` }" /></div>
-      </article>
-      <article>
-        <span>Updated</span>
-        <strong>{{ new Date(status.updated_at * 1000).toLocaleTimeString() }}</strong>
-      </article>
-    </div>
+    <NEmpty v-if="!status" description="连接建立后，这里会每 2 秒刷新一次服务器状态" />
 
-    <div v-else class="placeholder">
-      连接建立后，这里会每 2 秒刷新一次服务器状态。
-    </div>
-  </section>
+    <NGrid v-else :cols="2" :x-gap="12" :y-gap="12">
+      <NGridItem>
+        <NStatistic label="Uptime" :value="status.uptime_text" />
+      </NGridItem>
+      <NGridItem>
+        <NStatistic label="CPU" :value="`${status.cpu_percent.toFixed(1)}%`" />
+      </NGridItem>
+      <NGridItem>
+        <NStatistic label="Load" :value="`${status.load1.toFixed(2)}`" />
+        <NText depth="3" style="font-size: 11px">
+          {{ status.load5.toFixed(2) }} / {{ status.load15.toFixed(2) }}
+        </NText>
+      </NGridItem>
+      <NGridItem>
+        <NStatistic label="Updated" :value="new Date(status.updated_at * 1000).toLocaleTimeString()" />
+      </NGridItem>
+      <NGridItem :span="2">
+        <NText depth="3" style="font-size: 12px">
+          Memory {{ status.memory_used_mb }} / {{ status.memory_total_mb }} MB
+        </NText>
+        <NProgress
+          type="line"
+          :percentage="memPercent"
+          :status="progressStatus(memPercent)"
+          :show-indicator="false"
+          style="margin-top: 4px"
+        />
+      </NGridItem>
+      <NGridItem :span="2">
+        <NText depth="3" style="font-size: 12px">
+          Swap {{ status.swap_used_mb }} / {{ status.swap_total_mb }} MB
+        </NText>
+        <NProgress
+          type="line"
+          :percentage="swapPercent"
+          :status="progressStatus(swapPercent)"
+          :show-indicator="false"
+          style="margin-top: 4px"
+        />
+      </NGridItem>
+    </NGrid>
+  </NCard>
 </template>
 
 <style scoped>
 .status-panel {
-  padding: 20px;
-  border: 1px solid var(--color-border);
-  border-radius: 24px;
-  background: var(--color-card-bg);
-}
-
-.panel-title p,
-article span {
-  margin: 0;
-  color: var(--color-text-secondary);
-}
-
-.panel-title strong {
-  display: block;
-  margin-top: 4px;
-  font-size: 22px;
-  color: var(--color-text-primary);
-}
-
-.status-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-  margin-top: 18px;
-}
-
-article {
-  padding: 16px;
-  border-radius: 18px;
-  background: var(--color-card-bg);
-}
-
-article strong {
-  display: block;
-  margin-top: 6px;
-  color: var(--color-text-primary);
-}
-
-.bar {
-  height: 8px;
-  margin-top: 12px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--color-border);
-}
-
-.bar div {
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, var(--color-accent), var(--color-accent-light));
-}
-
-.placeholder {
-  margin-top: 18px;
-  padding: 18px;
-  border: 1px dashed var(--color-border);
-  border-radius: 16px;
-  color: var(--color-text-secondary);
-}
-
-@media (max-width: 860px) {
-  .status-grid {
-    grid-template-columns: 1fr;
-  }
+  border: 1px solid var(--color-border) !important;
+  border-radius: 16px !important;
 }
 </style>

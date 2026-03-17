@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted } from 'vue';
+import { NConfigProvider, NMessageProvider, NDialogProvider } from 'naive-ui';
 import HomePage from '@/pages/HomePage.vue';
 import { useThemeStore } from '@/stores/theme';
 
@@ -11,7 +12,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <HomePage />
+  <NConfigProvider :theme="themeStore.naiveTheme" :theme-overrides="themeStore.naiveThemeOverrides">
+    <NMessageProvider>
+      <NDialogProvider>
+        <HomePage />
+      </NDialogProvider>
+    </NMessageProvider>
+  </NConfigProvider>
 </template>
 
 <style>
@@ -158,6 +165,17 @@ textarea:focus {
 input::placeholder,
 textarea::placeholder {
   color: var(--color-text-tertiary);
+}
+
+/* 覆盖 Naive UI 输入框 focus 时四角溢出的 box-shadow */
+.n-input--focus,
+.n-input-wrapper:focus-within {
+  box-shadow: none !important;
+}
+
+.n-base-selection--focus,
+.n-base-selection:focus-within {
+  box-shadow: none !important;
 }
 
 /* 按钮默认样式 */

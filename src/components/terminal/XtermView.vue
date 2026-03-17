@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { listen } from '@tauri-apps/api/event';
+import { nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
+import { ref } from 'vue';
 import { useThemeStore } from '@/stores/theme';
 
 const props = defineProps<{
   sessionId: string;
-  output: string;
   active: boolean;
 }>();
 
@@ -20,9 +21,9 @@ const themeStore = useThemeStore();
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 let resizeObserver: ResizeObserver | null = null;
-let renderedLength = 0;
+let unlistenTerminalData: (() => void) | null = null;
 
-// 浅色主题配色
+/** 浅色主题配色 */
 const lightTheme = {
   background: '#ffffff',
   foreground: '#0f172a',
@@ -45,7 +46,7 @@ const lightTheme = {
   brightWhite: '#ffffff',
 };
 
-// 深色主题配色
+/** 深色主题配色 */
 const darkTheme = {
   background: '#0b1118',
   foreground: '#e6eff6',
@@ -68,29 +69,9 @@ const darkTheme = {
   brightWhite: '#ffffff',
 };
 
-function syncOutput(nextOutput: string) {
-  if (!terminal) {
-    return;
-  }
-
-  if (nextOutput.length < renderedLength) {
-    terminal.clear();
-    terminal.write(nextOutput);
-    renderedLength = nextOutput.length;
-    return;
-  }
-
-  const delta = nextOutput.slice(renderedLength);
-  if (delta) {
-    terminal.write(delta);
-    renderedLength = nextOutput.length;
-  }
-}
-
+/** 重新计算终端尺寸并上报后端 */
 function fit() {
-  if (!fitAddon || !terminal || !props.active) {
-    return;
-  }
+  if (!fitAddon || !terminal || !props.active) return;
   fitAddon.fit();
   emit('resize', {
     sessionId: props.sessionId,
@@ -99,24 +80,26 @@ function fit() {
   });
 }
 
+/** 根据当前主题更新终端配色 */
 function updateTerminalTheme() {
   if (!terminal) return;
-  const theme = themeStore.theme === 'dark' ? darkTheme : lightTheme;
-  terminal.options.theme = theme;
+  terminal.options.theme = themeStore.theme === 'dark' ? darkTheme : lightTheme;
 }
 
 onMounted(async () => {
   const theme = themeStore.theme === 'dark' ? darkTheme : lightTheme;
-  
+
   terminal = new Terminal({
     cursorBlink: true,
     fontFamily: '"SFMono-Regular", "JetBrains Mono", monospace',
     fontSize: 13,
-    theme: theme,
+    theme,
   });
   fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
   terminal.open(containerRef.value!);
+
+  // 采集用户输入并上送后端
   terminal.onData((data) => emit('input', { sessionId: props.sessionId, data }));
 
   resizeObserver = new ResizeObserver(() => fit());
@@ -124,15 +107,24 @@ onMounted(async () => {
 
   await nextTick();
   fit();
-  syncOutput(props.output);
+
+  // 直接监听 terminal:data 事件流，按 session_id 过滤后写入 xterm 实例
+  unlistenTerminalData = await listen<{ session_id: string; data: string }>(
+    'terminal:data',
+    (event) => {
+      if (event.payload.session_id === props.sessionId && terminal) {
+        terminal.write(event.payload.data);
+      }
+    },
+  );
 });
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
+  unlistenTerminalData?.();
   terminal?.dispose();
 });
 
-watch(() => props.output, syncOutput);
 watch(
   () => props.active,
   async (active) => {
@@ -143,7 +135,7 @@ watch(
   },
 );
 
-// 监听主题变化
+// 监听主题变化并同步终端配色
 watch(() => themeStore.theme, updateTerminalTheme);
 </script>
 
@@ -155,9 +147,7 @@ watch(() => themeStore.theme, updateTerminalTheme);
 .terminal-view {
   width: 100%;
   height: 100%;
-  min-height: 440px;
-  padding: 16px;
-  border-radius: 22px;
+  padding: 8px;
   background: var(--color-terminal-bg);
 }
 </style>
