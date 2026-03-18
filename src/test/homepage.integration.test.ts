@@ -6,6 +6,7 @@ import HomePage from '@/pages/HomePage.vue';
 import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
+import { SessionStatus } from '@/types/session';
 
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
@@ -90,5 +91,43 @@ describe('HomePage integration', () => {
       rows: 32,
     });
     expect(wrapper.text()).toContain('已连接');
+  });
+
+  it('leaves connecting state after a timeout status event', async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([makeHost()])   // list_hosts
+      .mockResolvedValueOnce(makeSession())  // open_session
+      .mockResolvedValueOnce(makeTaskInfo()); // start_monitoring
+
+    const wrapper = mount(HomePage, {
+      global: {
+        plugins: [createPinia()],
+        stubs: {
+          Teleport: true,
+        },
+      },
+    });
+
+    await flushUi();
+    await wrapper.get('.host-card').trigger('click');
+    await flushUi();
+
+    expect(wrapper.text()).toContain('连接中');
+
+    vi.mocked(invoke).mockResolvedValueOnce(undefined); // sync_session_status
+    emitMockEvent('session:status', {
+      session_id: 'session-1',
+      status: SessionStatus.Timeout,
+      message: 'Connection timeout after 10s',
+    });
+
+    await flushUi();
+
+    expect(wrapper.text()).not.toContain('连接中');
+    expect(wrapper.text()).toContain('离线');
+    expect(invoke).toHaveBeenCalledWith('sync_session_status', {
+      sessionId: 'session-1',
+      status: SessionStatus.Timeout,
+    });
   });
 });

@@ -148,6 +148,19 @@ watch(() => themeStore.theme, updateTerminalTheme);
   width: 100%;
   height: 100%;
   padding: 8px;
-  background: var(--color-terminal-bg);
+  background: #0b1118;
+}
+
+/* 覆盖 xterm.js 内部元素的默认白色背景 */
+.terminal-view :deep(.xterm) {
+  height: 100%;
+}
+
+.terminal-view :deep(.xterm-viewport) {
+  background-color: transparent !important;
+}
+
+.terminal-view :deep(.xterm-screen) {
+  background-color: transparent !important;
 }
 </style>
