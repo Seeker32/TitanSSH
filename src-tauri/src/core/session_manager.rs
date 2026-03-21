@@ -239,6 +239,7 @@ mod tests {
     use crate::models::host::{AuthType, HostConfig};
 
     /// 构造测试用 HostConfig
+    #[allow(dead_code)]
     fn make_host(id: &str) -> HostConfig {
         HostConfig {
             id: id.to_string(), name: "test".to_string(),

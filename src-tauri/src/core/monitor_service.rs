@@ -10,11 +10,11 @@ use tauri::{AppHandle, Emitter, Runtime};
 use uuid::Uuid;
 
 /// 监控任务句柄，包含任务元数据和关闭信号
-struct MonitorTaskHandle {
+pub(crate) struct MonitorTaskHandle {
     /// 任务基本信息（ID、类型、状态等）
-    task_info: TaskInfo,
+    pub(crate) task_info: TaskInfo,
     /// 关闭标志，设置为 true 时通知工作线程退出
-    shutdown: Arc<AtomicBool>,
+    pub(crate) shutdown: Arc<AtomicBool>,
 }
 
 /// 独立监控服务
@@ -23,7 +23,7 @@ struct MonitorTaskHandle {
 /// 通过 Arc<Mutex<...>> 保证多线程安全访问。
 pub struct MonitorService {
     /// 活跃监控任务的 HashMap，键为 task_id
-    pub tasks: Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
+    pub(crate) tasks: Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
     /// 最新监控快照的 HashMap，键为 session_id
     snapshots: Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
 }
@@ -161,7 +161,7 @@ impl MonitorService {
         let mut tasks = self.tasks.lock().unwrap();
         if let Some(handle) = tasks.remove(task_id) {
             // 通知工作线程退出
-            handle.shutdown.store(true, Ordering::Relaxed);
+            handle.shutdown.store(true, Ordering::Release);
         }
     }
 
