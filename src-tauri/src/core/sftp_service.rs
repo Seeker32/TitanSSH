@@ -417,49 +417,97 @@ fn run_transfer_blocking<R: Runtime>(
     let mut last_report = Instant::now();
     let mut last_transferred: u64 = 0;
 
+    /// 内联辅助：推送进度事件
+    macro_rules! emit_progress {
+        () => {
+            if last_report.elapsed().as_millis() >= 500 {
+                let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
+                let speed = ((transferred - last_transferred) as f64 / elapsed) as u64;
+                let _ = app.emit("sftp:progress", SftpProgressEvent {
+                    task_id: task_id.to_string(),
+                    session_id: session_id.to_string(),
+                    transferred_bytes: transferred,
+                    total_bytes,
+                    speed_bps: speed,
+                });
+                last_transferred = transferred;
+                last_report = Instant::now();
+            }
+        };
+    }
+
     match transfer_type {
         TransferType::Download => {
             let mut remote_file = sftp.open(std::path::Path::new(remote_path)).map_err(|_| false)?;
+            // 创建本地文件；失败或取消时通过 cleanup_local 删除残留
             let mut local_file = std::fs::File::create(local_path).map_err(|_| false)?;
             let mut buf = vec![0u8; CHUNK];
+
+            /// 关闭本地文件句柄并删除残留文件（取消或 IO 失败时调用）
+            macro_rules! cleanup_local {
+                () => {{
+                    drop(local_file);
+                    let _ = std::fs::remove_file(local_path);
+                }};
+            }
+
             loop {
-                if cancel_token.is_cancelled() { return Err(true); }
-                let n = remote_file.read(&mut buf).map_err(|_| false)?;
-                if n == 0 { break; }
-                local_file.write_all(&buf[..n]).map_err(|_| false)?;
-                transferred += n as u64;
-                if last_report.elapsed().as_millis() >= 500 {
-                    let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
-                    let speed = ((transferred - last_transferred) as f64 / elapsed) as u64;
-                    let _ = app.emit("sftp:progress", SftpProgressEvent {
-                        task_id: task_id.to_string(), session_id: session_id.to_string(),
-                        transferred_bytes: transferred, total_bytes, speed_bps: speed,
-                    });
-                    last_transferred = transferred;
-                    last_report = Instant::now();
+                if cancel_token.is_cancelled() {
+                    // 主动取消：删除本地残留文件后返回取消标志
+                    cleanup_local!();
+                    return Err(true);
                 }
+                let n = match remote_file.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        // IO 失败：同样删除本地残留文件
+                        cleanup_local!();
+                        return Err(false);
+                    }
+                };
+                if n == 0 { break; }
+                if local_file.write_all(&buf[..n]).is_err() {
+                    cleanup_local!();
+                    return Err(false);
+                }
+                transferred += n as u64;
+                emit_progress!();
             }
         }
         TransferType::Upload => {
             let mut local_file = std::fs::File::open(local_path).map_err(|_| false)?;
+            // 创建远端文件；失败或取消时通过 cleanup_remote 删除残留
             let mut remote_file = sftp.create(std::path::Path::new(remote_path)).map_err(|_| false)?;
             let mut buf = vec![0u8; CHUNK];
+
+            /// 关闭远端文件句柄并删除残留文件（取消或 IO 失败时调用）
+            macro_rules! cleanup_remote {
+                () => {{
+                    drop(remote_file);
+                    let _ = sftp.unlink(std::path::Path::new(remote_path));
+                }};
+            }
+
             loop {
-                if cancel_token.is_cancelled() { return Err(true); }
-                let n = local_file.read(&mut buf).map_err(|_| false)?;
-                if n == 0 { break; }
-                remote_file.write_all(&buf[..n]).map_err(|_| false)?;
-                transferred += n as u64;
-                if last_report.elapsed().as_millis() >= 500 {
-                    let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
-                    let speed = ((transferred - last_transferred) as f64 / elapsed) as u64;
-                    let _ = app.emit("sftp:progress", SftpProgressEvent {
-                        task_id: task_id.to_string(), session_id: session_id.to_string(),
-                        transferred_bytes: transferred, total_bytes, speed_bps: speed,
-                    });
-                    last_transferred = transferred;
-                    last_report = Instant::now();
+                if cancel_token.is_cancelled() {
+                    // 主动取消：删除远端残留文件后返回取消标志
+                    cleanup_remote!();
+                    return Err(true);
                 }
+                let n = match local_file.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        cleanup_remote!();
+                        return Err(false);
+                    }
+                };
+                if n == 0 { break; }
+                if remote_file.write_all(&buf[..n]).is_err() {
+                    cleanup_remote!();
+                    return Err(false);
+                }
+                transferred += n as u64;
+                emit_progress!();
             }
         }
     }
