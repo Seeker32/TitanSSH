@@ -7,6 +7,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
 import { SessionStatus } from '@/types/session';
+import {
+  DEFAULT_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+} from '@/stores/layout';
 
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
@@ -40,11 +45,38 @@ async function flushUi() {
   await nextTick();
 }
 
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, 'innerWidth', {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+}
+
 describe('HomePage integration', () => {
   beforeEach(() => {
     vi.mocked(invoke).mockReset();
     resetMockEvents();
     vi.stubGlobal('ResizeObserver', ResizeObserverMock);
+    setViewportWidth(1280);
+  });
+
+  it('renders the sidebar with the default width', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([]);
+
+    const wrapper = mount(HomePage, {
+      global: {
+        plugins: [createPinia()],
+        stubs: {
+          Teleport: true,
+        },
+      },
+    });
+
+    await flushUi();
+
+    const sidebar = wrapper.get('.sidebar').element as HTMLElement;
+    expect(sidebar.style.width).toBe(`${DEFAULT_SIDEBAR_WIDTH}px`);
   });
 
   it('loads hosts and opens a session from the host list', async () => {
@@ -129,5 +161,59 @@ describe('HomePage integration', () => {
       sessionId: 'session-1',
       status: SessionStatus.Timeout,
     });
+  });
+
+  it('updates the sidebar width when dragging the resize handle', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([]);
+
+    const wrapper = mount(HomePage, {
+      attachTo: document.body,
+      global: {
+        plugins: [createPinia()],
+        stubs: {
+          Teleport: true,
+        },
+      },
+    });
+
+    await flushUi();
+
+    await wrapper.get('.sidebar-resizer').trigger('pointerdown', { clientX: DEFAULT_SIDEBAR_WIDTH });
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 420 }));
+    window.dispatchEvent(new MouseEvent('pointerup'));
+    await flushUi();
+
+    const sidebar = wrapper.get('.sidebar').element as HTMLElement;
+    expect(sidebar.style.width).toBe('420px');
+  });
+
+  it('clamps the sidebar width to min and max boundaries during drag', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([]);
+
+    const wrapper = mount(HomePage, {
+      attachTo: document.body,
+      global: {
+        plugins: [createPinia()],
+        stubs: {
+          Teleport: true,
+        },
+      },
+    });
+
+    await flushUi();
+
+    await wrapper.get('.sidebar-resizer').trigger('pointerdown', { clientX: DEFAULT_SIDEBAR_WIDTH });
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: MIN_SIDEBAR_WIDTH - 50 }));
+    await flushUi();
+
+    let sidebar = wrapper.get('.sidebar').element as HTMLElement;
+    expect(sidebar.style.width).toBe(`${MIN_SIDEBAR_WIDTH}px`);
+
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: MAX_SIDEBAR_WIDTH + 120 }));
+    window.dispatchEvent(new MouseEvent('pointerup'));
+    await flushUi();
+
+    sidebar = wrapper.get('.sidebar').element as HTMLElement;
+    expect(sidebar.style.width).toBe(`${MAX_SIDEBAR_WIDTH}px`);
   });
 });

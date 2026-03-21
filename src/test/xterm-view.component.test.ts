@@ -10,7 +10,7 @@
  * 6. active=true 时 watch 触发 fit，emit resize
  * 7. 组件卸载时清理监听器和 ResizeObserver
  */
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount } from '@vue/test-utils';
 import { nextTick } from 'vue';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
@@ -18,7 +18,6 @@ import { createPinia, setActivePinia } from 'pinia';
 
 // xterm 和 FitAddon 的 mock
 const mockWrite = vi.fn();
-const mockOnData = vi.fn();
 const mockDispose = vi.fn();
 const mockOpen = vi.fn();
 const mockLoadAddon = vi.fn();
@@ -50,7 +49,7 @@ vi.mock('@xterm/addon-fit', () => ({
 // ResizeObserver mock
 const mockObserve = vi.fn();
 const mockDisconnect = vi.fn();
-vi.stubGlobal('ResizeObserver', vi.fn().mockImplementation((cb: ResizeObserverCallback) => ({
+vi.stubGlobal('ResizeObserver', vi.fn().mockImplementation(() => ({
   observe: mockObserve,
   disconnect: mockDisconnect,
 })));
@@ -155,9 +154,6 @@ describe('XtermView 组件', () => {
   });
 
   it('不同 session 的 XtermView 互不干扰', async () => {
-    const writeA = vi.fn();
-    const writeB = vi.fn();
-
     // 两个独立实例，各自有独立的 write mock
     // 通过验证只有匹配 session_id 的实例收到数据来验证隔离性
     mountXterm('session-A', true);

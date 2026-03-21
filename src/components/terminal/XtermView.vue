@@ -94,6 +94,8 @@ onMounted(async () => {
     fontFamily: '"SFMono-Regular", "JetBrains Mono", monospace',
     fontSize: 13,
     theme,
+    // 允许透明背景，确保 xterm-viewport 的 transparent 设置生效
+    allowTransparency: true,
   });
   fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
@@ -148,7 +150,8 @@ watch(() => themeStore.theme, updateTerminalTheme);
   width: 100%;
   height: 100%;
   padding: 8px;
-  background: #0b1118;
+  /* 背景色由 xterm theme.background 控制，此处跟随深色主题默认值 */
+  background: v-bind('themeStore.theme === "dark" ? darkTheme.background : lightTheme.background');
 }
 
 /* 覆盖 xterm.js 内部元素的默认白色背景 */
