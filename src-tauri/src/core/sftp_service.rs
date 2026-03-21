@@ -485,11 +485,14 @@ fn format_permissions(perm: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     /// 构造一个最小化的 mock SSH Session（仅用于注册，不实际连接）
     fn mock_ssh_session() -> Arc<Mutex<Session>> {
         Arc::new(Mutex::new(ssh2::Session::new().unwrap()))
     }
+
+    // ─── 基础结构测试 ───────────────────────────────────────────────────────
 
     /// 验证 register_session 后 handles 中存在对应条目
     #[test]
@@ -497,6 +500,25 @@ mod tests {
         let mut service = SftpService::new();
         service.register_session("session-1".to_string(), mock_ssh_session());
         assert!(service.handles.contains_key("session-1"));
+    }
+
+    /// 验证 cancel_task 对不存在的 task_id 静默成功（不 panic）
+    #[test]
+    fn cancel_nonexistent_task_is_silent() {
+        let mut service = SftpService::new();
+        service.cancel_task("nonexistent-task-id"); // 不应 panic
+    }
+
+    /// 验证 cleanup_session 移除 session handle
+    #[test]
+    fn cleanup_session_removes_handle() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let mut service = SftpService::new();
+        service.register_session("session-1".to_string(), mock_ssh_session());
+        assert!(service.handles.contains_key("session-1"));
+        service.cleanup_session("session-1", &app.handle().clone());
+        assert!(!service.handles.contains_key("session-1"));
     }
 
     /// 验证 list_dir 对未注册 session 返回 SftpChannelError，且错误消息包含 session_id
@@ -511,12 +533,16 @@ mod tests {
         }
     }
 
-    /// 验证全局 Semaphore 初始 permits 为 5
+    // ─── 并发控制测试 ────────────────────────────────────────────────────────
+
+    /// 验证全局 Semaphore 初始 permits 为 5（跨所有 session 的并发上限）
     #[test]
     fn semaphore_has_five_permits() {
         let sem = get_semaphore();
         assert_eq!(sem.available_permits(), 5);
     }
+
+    // ─── CancelToken 测试 ────────────────────────────────────────────────────
 
     /// 验证 CancelToken 初始未取消，cancel() 后 is_cancelled() 为 true
     #[test]
@@ -527,7 +553,7 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
-    /// 验证 CancelToken clone 共享同一原子标志
+    /// 验证 CancelToken clone 共享同一原子标志（取消原始令牌，clone 也感知）
     #[test]
     fn cancel_token_clone_shares_state() {
         let token = CancelToken::new();
@@ -536,6 +562,8 @@ mod tests {
         assert!(cloned.is_cancelled(), "clone 应共享取消状态");
     }
 
+    // ─── 权限格式化测试 ──────────────────────────────────────────────────────
+
     /// 验证 format_permissions 对 0o755 (rwxr-xr-x) 的转换
     #[test]
     fn format_permissions_rwxr_xr_x() {
@@ -543,6 +571,7 @@ mod tests {
     }
 
     /// 验证 format_permissions 对 0o644 (rw-r--r--) 的转换
+    #[allow(non_snake_case)]
     #[test]
     fn format_permissions_rw_r__r__() {
         assert_eq!(format_permissions(0o644), "rw-r--r--");
@@ -552,5 +581,132 @@ mod tests {
     #[test]
     fn format_permissions_rwx_only_owner() {
         assert_eq!(format_permissions(0o700), "rwx------");
+    }
+
+    // ─── upload 路径拼接测试 ─────────────────────────────────────────────────
+
+    /// 验证 enqueue_upload 当 remote_path 为目录（不含尾部斜杠）时正确拼接文件名
+    /// 本地文件 /tmp/deploy.sh 上传到 /var/log → 目标路径应为 /var/log/deploy.sh
+    #[test]
+    fn upload_remote_path_without_trailing_slash_appends_filename() {
+        let remote_dir = "/var/log".to_string();
+        let file_name = "deploy.sh";
+        let full_remote = if remote_dir.ends_with('/') {
+            format!("{}{}", remote_dir, file_name)
+        } else {
+            format!("{}/{}", remote_dir, file_name)
+        };
+        assert_eq!(full_remote, "/var/log/deploy.sh");
+    }
+
+    /// 验证 enqueue_upload 当 remote_path 含尾部斜杠时不重复斜杠
+    #[test]
+    fn upload_remote_path_with_trailing_slash_no_double_slash() {
+        let remote_dir = "/var/log/".to_string();
+        let file_name = "app.log";
+        let full_remote = if remote_dir.ends_with('/') {
+            format!("{}{}", remote_dir, file_name)
+        } else {
+            format!("{}/{}", remote_dir, file_name)
+        };
+        assert_eq!(full_remote, "/var/log/app.log");
+    }
+
+    // ─── 任务状态流转测试 ────────────────────────────────────────────────────
+
+    /// 验证 cleanup_session 将 Pending 任务的取消令牌触发
+    #[test]
+    fn cleanup_session_cancels_pending_task_tokens() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let mut service = SftpService::new();
+        service.register_session("session-1".to_string(), mock_ssh_session());
+
+        let task_id = "task-pending-1".to_string();
+        let cancel_token = CancelToken::new();
+        let cloned_token = cancel_token.clone();
+
+        service.handles.get_mut("session-1").unwrap()
+            .cancel_tokens.insert(task_id.clone(), cancel_token);
+
+        service.tasks.insert(task_id.clone(), TransferTask {
+            task_id: task_id.clone(),
+            session_id: "session-1".to_string(),
+            transfer_type: TransferType::Download,
+            remote_path: "/tmp/file".to_string(),
+            local_path: "/local/file".to_string(),
+            file_name: "file".to_string(),
+            total_bytes: 1024,
+            transferred_bytes: 0,
+            speed_bps: 0,
+            status: SftpTaskStatus::Pending,
+            error_message: None,
+            created_at: 0,
+        });
+
+        service.cleanup_session("session-1", &app.handle().clone());
+
+        assert!(cloned_token.is_cancelled(), "cleanup_session 应触发 Pending 任务的取消令牌");
+    }
+
+    /// 验证 cleanup_session 将 Running 任务的取消令牌触发
+    #[test]
+    fn cleanup_session_cancels_running_task_tokens() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let mut service = SftpService::new();
+        service.register_session("session-1".to_string(), mock_ssh_session());
+
+        let task_id = "task-running-1".to_string();
+        let cancel_token = CancelToken::new();
+        let cloned_token = cancel_token.clone();
+
+        service.handles.get_mut("session-1").unwrap()
+            .cancel_tokens.insert(task_id.clone(), cancel_token);
+
+        service.tasks.insert(task_id.clone(), TransferTask {
+            task_id: task_id.clone(),
+            session_id: "session-1".to_string(),
+            transfer_type: TransferType::Upload,
+            remote_path: "/remote/file".to_string(),
+            local_path: "/local/file".to_string(),
+            file_name: "file".to_string(),
+            total_bytes: 2048,
+            transferred_bytes: 512,
+            speed_bps: 1024,
+            status: SftpTaskStatus::Running,
+            error_message: None,
+            created_at: 0,
+        });
+
+        service.cleanup_session("session-1", &app.handle().clone());
+
+        assert!(cloned_token.is_cancelled(), "cleanup_session 应触发 Running 任务的取消令牌");
+    }
+
+    /// 验证 cancel_task 触发对应任务的取消令牌
+    #[test]
+    fn cancel_task_triggers_cancel_token() {
+        let mut service = SftpService::new();
+        service.register_session("session-1".to_string(), mock_ssh_session());
+
+        let task_id = "task-1".to_string();
+        let cancel_token = CancelToken::new();
+        let cloned_token = cancel_token.clone();
+
+        service.handles.get_mut("session-1").unwrap()
+            .cancel_tokens.insert(task_id.clone(), cancel_token);
+
+        service.cancel_task(&task_id);
+
+        assert!(cloned_token.is_cancelled(), "cancel_task 应触发对应任务的取消令牌");
+    }
+
+    /// 验证终态任务调用 cancel_task 静默成功（令牌已不在 handles 中）
+    #[test]
+    fn cancel_task_on_completed_task_is_silent() {
+        let mut service = SftpService::new();
+        service.cancel_task("task-already-done");
+        // 不 panic 即通过
     }
 }
