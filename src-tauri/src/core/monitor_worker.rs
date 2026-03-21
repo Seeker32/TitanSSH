@@ -18,9 +18,12 @@ echo "DISK=$DISK"
 /// - host: 主机配置，用于建立 SSH 连接
 /// - session_id: 关联的会话 ID
 pub fn collect_status(host: &HostConfig, session_id: &str) -> Result<MonitorSnapshot, AppError> {
-    let session = ssh_client::connect(host, None, None)?;
+    let session = ssh_client::connect(host, None, None, |_| {})?;
     let mut channel = session.channel_session()?;
-    channel.exec(&format!("sh -lc '{}'", STATUS_SCRIPT.replace('\'', "'\\''")))?;
+    channel.exec(&format!(
+        "sh -lc '{}'",
+        STATUS_SCRIPT.replace('\'', "'\\''")
+    ))?;
 
     let mut output = String::new();
     channel.read_to_string(&mut output)?;
@@ -60,10 +63,11 @@ fn parse_snapshot(session_id: &str, output: &str) -> Result<MonitorSnapshot, App
 mod tests {
     use super::parse_snapshot;
 
+    /// 验证 parse_snapshot 能正确解析标准脚本输出，提取 CPU/内存/磁盘指标
     #[test]
     fn parse_snapshot_extracts_metrics() {
         let raw = "CPU=17.5\nMEM=42.3\nDISK=65";
-        let snap = parse_snapshot("session-1", raw).expect("should parse");
+        let snap = parse_snapshot("session-1", raw).expect("应能正常解析");
         assert_eq!(snap.session_id, "session-1");
         assert!((snap.cpu_usage - 17.5).abs() < f64::EPSILON);
         assert!((snap.memory_usage - 42.3).abs() < 0.01);
@@ -72,9 +76,10 @@ mod tests {
         assert!(snap.timestamp > 1_000_000_000_000);
     }
 
+    /// 验证 parse_snapshot 在脚本输出为空时不报错，各指标默认为 0.0
     #[test]
     fn parse_snapshot_defaults_on_missing_fields() {
-        let snap = parse_snapshot("session-2", "").expect("empty output should not fail");
+        let snap = parse_snapshot("session-2", "").expect("空输出不应返回错误");
         assert_eq!(snap.cpu_usage, 0.0);
         assert_eq!(snap.memory_usage, 0.0);
         assert_eq!(snap.disk_usage, 0.0);

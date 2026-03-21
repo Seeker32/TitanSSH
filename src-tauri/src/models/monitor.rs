@@ -59,21 +59,23 @@ mod tests {
     /// 生成任意合法 SessionInfo 的策略，created_at 使用毫秒时间戳
     fn arb_session_info() -> impl Strategy<Value = SessionInfo> {
         (
-            arb_nonempty_string(), // session_id
-            arb_nonempty_string(), // host_id
-            arb_nonempty_string(), // host
-            1u16..=65535u16,       // port
-            arb_nonempty_string(), // username
+            arb_nonempty_string(),  // session_id
+            arb_nonempty_string(),  // host_id
+            arb_nonempty_string(),  // host
+            1u16..=65535u16,        // port
+            arb_nonempty_string(),  // username
             arb_millis_timestamp(), // created_at（毫秒）
         )
-            .prop_map(|(session_id, host_id, host, port, username, created_at)| SessionInfo {
-                session_id,
-                host_id,
-                host,
-                port,
-                username,
-                status: SessionStatus::Connecting,
-                created_at,
+            .prop_map(|(session_id, host_id, host, port, username, created_at)| {
+                SessionInfo {
+                    session_id,
+                    host_id,
+                    host,
+                    port,
+                    username,
+                    status: SessionStatus::Connecting,
+                    created_at,
+                }
             })
     }
 
@@ -86,15 +88,15 @@ mod tests {
             0.0f64..100.0f64,       // memory_usage
             0.0f64..100.0f64,       // disk_usage
         )
-            .prop_map(|(session_id, timestamp, cpu_usage, memory_usage, disk_usage)| {
-                MonitorSnapshot {
+            .prop_map(
+                |(session_id, timestamp, cpu_usage, memory_usage, disk_usage)| MonitorSnapshot {
                     session_id,
                     timestamp,
                     cpu_usage,
                     memory_usage,
                     disk_usage,
-                }
-            })
+                },
+            )
     }
 
     /// 生成任意合法 TaskInfo 的策略，created_at 使用毫秒时间戳

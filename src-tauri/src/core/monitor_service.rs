@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use uuid::Uuid;
 
 /// 监控任务句柄，包含任务元数据和关闭信号
@@ -47,7 +47,7 @@ impl MonitorService {
     ///
     /// # 返回
     /// 新建的 TaskInfo，包含 task_id 和初始状态
-    pub fn start_monitoring(&self, session_id: String, app: AppHandle) -> TaskInfo {
+    pub fn start_monitoring<R: Runtime>(&self, session_id: String, app: AppHandle<R>) -> TaskInfo {
         // 生成唯一任务 ID
         let task_id = Uuid::new_v4().to_string();
 
@@ -206,12 +206,12 @@ fn update_task_status(
 /// 派发任务状态变更事件到前端
 ///
 /// # 参数
-/// - `app`: Tauri 应用句柄
+/// - `app`: Tauri 应用句柄（泛型，支持真实运行时和测试 MockRuntime）
 /// - `task_id`: 任务 ID
 /// - `status`: 新的任务状态
 /// - `message`: 可选的附加消息（如错误详情）
-fn emit_task_status(
-    app: &AppHandle,
+fn emit_task_status<R: Runtime>(
+    app: &AppHandle<R>,
     task_id: &str,
     status: TaskStatus,
     message: Option<String>,

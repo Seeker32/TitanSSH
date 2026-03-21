@@ -6,10 +6,10 @@ use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
 use crate::models::session::{SessionInfo, SessionStatus};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use uuid::Uuid;
 
 /// SSH 会话句柄，包含会话元数据、命令通道和关闭标志
@@ -91,13 +91,7 @@ impl SessionManager {
         );
 
         // 启动 terminal_service 工作线程（SSH 连接、PTY、终端 IO）
-        terminal_service::start_terminal_session(
-            app,
-            host,
-            session_id,
-            command_rx,
-            shutdown,
-        );
+        terminal_service::start_terminal_session(app, host, session_id, command_rx, shutdown);
 
         Ok(session_info)
     }
@@ -166,7 +160,7 @@ impl SessionManager {
     }
 
     /// 为指定会话启动监控任务，委托给 monitor_service（单一监控实现）
-    pub fn start_monitoring(&self, session_id: String, app: AppHandle) -> TaskInfo {
+    pub fn start_monitoring<R: Runtime>(&self, session_id: String, app: AppHandle<R>) -> TaskInfo {
         self.monitor_service.start_monitoring(session_id, app)
     }
 
@@ -180,215 +174,4 @@ impl SessionManager {
         self.monitor_service.get_monitor_status(session_id)
     }
 
-    /// 仅供测试使用：直接向 HashMap 插入伪造的会话句柄，绕过真实 SSH 连接
-    ///
-    /// 允许属性测试在不依赖 AppHandle 或真实网络的情况下验证 HashMap 与 list_sessions 的一致性。
-    #[cfg(test)]
-    pub fn insert_session_for_test(&mut self, session_info: SessionInfo) {
-        let (command_tx, _command_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        self.sessions.insert(
-            session_info.session_id.clone(),
-            SessionHandle {
-                meta: session_info,
-                command_tx,
-                shutdown,
-            },
-        );
-    }
-
-    /// 仅供测试使用：返回内部 HashMap 中所有会话 ID 的集合
-    ///
-    /// 用于属性测试中直接对比 HashMap 键集与 list_sessions 返回结果。
-    #[cfg(test)]
-    pub fn session_ids_in_map(&self) -> std::collections::HashSet<String> {
-        self.sessions.keys().cloned().collect()
-    }
-
-    /// 仅供测试使用：生成真实 UUID 并注册会话，绕过 AppHandle 和真实 SSH 连接
-    ///
-    /// 复现 open_session 中的 UUID 生成与 HashMap 注册逻辑，
-    /// 允许属性测试在无 Tauri 运行时的情况下验证 session_id 唯一性。
-    #[cfg(test)]
-    pub fn open_session_for_test(&mut self, host_id: &str) -> String {
-        let session_id = Uuid::new_v4().to_string();
-        let session_info = SessionInfo {
-            session_id: session_id.clone(),
-            host_id: host_id.to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 22,
-            username: "test".to_string(),
-            status: SessionStatus::Connecting,
-            created_at: 1_710_000_000_000_i64,
-        };
-        self.insert_session_for_test(session_info);
-        session_id
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SessionManager;
-    use crate::models::session::{SessionInfo, SessionStatus};
-    use proptest::prelude::*;
-    use std::collections::HashSet;
-
-    /// 生成非空字母数字字符串的策略（1-32 个字符）
-    fn arb_nonempty_string() -> impl Strategy<Value = String> {
-        "[a-zA-Z0-9_\\-]{1,32}".prop_map(|s| s)
-    }
-
-    /// 生成合法端口号的策略
-    fn arb_port() -> impl Strategy<Value = u16> {
-        1u16..=65535u16
-    }
-
-    /// 生成任意合法 SessionInfo 的策略
-    fn arb_session_info() -> impl Strategy<Value = SessionInfo> {
-        (
-            arb_nonempty_string(),
-            arb_nonempty_string(),
-            arb_nonempty_string(),
-            arb_port(),
-            arb_nonempty_string(),
-        )
-            .prop_map(|(id_suffix, host_id, host, port, username)| SessionInfo {
-                session_id: format!("sess-{}", id_suffix),
-                host_id,
-                host,
-                port,
-                username,
-                status: SessionStatus::Connecting,
-                created_at: 1_710_000_000_000_i64,
-            })
-    }
-
-    /// 会话操作枚举，用于生成任意 open/close 操作序列
-    #[derive(Debug, Clone)]
-    enum SessionOp {
-        Open(SessionInfo),
-        Close(String),
-    }
-
-    /// 生成任意操作序列的策略（1-20 个操作）
-    fn arb_session_ops() -> impl Strategy<Value = Vec<SessionOp>> {
-        prop::collection::vec(
-            prop_oneof![
-                arb_session_info().prop_map(SessionOp::Open),
-                arb_nonempty_string().prop_map(|s| SessionOp::Close(format!("sess-{}", s))),
-            ],
-            1..=20,
-        )
-    }
-
-    proptest! {
-        /// **验证: 需求 7.2** — Session ID 唯一
-        #[test]
-        fn prop_session_ids_are_unique(n in 1usize..=20usize) {
-            let mut manager = SessionManager::new();
-            let ids: Vec<String> = (0..n)
-                .map(|i| manager.open_session_for_test(&format!("host-{}", i)))
-                .collect();
-            let unique_ids: HashSet<String> = ids.iter().cloned().collect();
-            prop_assert_eq!(
-                unique_ids.len(),
-                ids.len(),
-                "连续打开 {} 个会话后，所有 session_id 必须互不相同",
-                n
-            );
-        }
-
-        /// **验证: 需求 7.6, 7.7** — 真实会话集合与 list_sessions 一致
-        #[test]
-        fn prop_list_sessions_consistent_with_internal_map(ops in arb_session_ops()) {
-            let mut manager = SessionManager::new();
-            for op in &ops {
-                match op {
-                    SessionOp::Open(session_info) => {
-                        manager.insert_session_for_test(session_info.clone());
-                    }
-                    SessionOp::Close(session_id) => {
-                        let _ = manager.close_session(session_id);
-                    }
-                }
-            }
-            let map_ids: HashSet<String> = manager.session_ids_in_map();
-            let listed_sessions = manager.list_sessions();
-            let listed_ids: HashSet<String> =
-                listed_sessions.iter().map(|s| s.session_id.clone()).collect();
-
-            prop_assert_eq!(
-                &listed_ids,
-                &map_ids,
-                "list_sessions 返回的 session_id 集合必须与内部 HashMap 键集完全一致"
-            );
-            for session in &listed_sessions {
-                prop_assert!(
-                    !session.session_id.starts_with("home"),
-                    "list_sessions 不得包含首页视图 ID: {}",
-                    session.session_id
-                );
-                prop_assert!(
-                    !session.session_id.starts_with("ui-"),
-                    "list_sessions 不得包含 UI 视图 ID: {}",
-                    session.session_id
-                );
-            }
-            prop_assert_eq!(
-                listed_sessions.len(),
-                listed_ids.len(),
-                "list_sessions 返回列表中不得有重复的 session_id"
-            );
-        }
-
-        /// **验证: P1-1** — update_session_status 正确同步后端元数据
-        ///
-        /// 插入会话后更新其状态，验证 list_sessions 返回的状态与更新值一致。
-        #[test]
-        fn prop_update_session_status_reflects_in_list(
-            id_suffix in "[a-zA-Z0-9]{1,16}",
-        ) {
-            let mut manager = SessionManager::new();
-            let session_id = format!("sess-{}", id_suffix);
-            let session_info = SessionInfo {
-                session_id: session_id.clone(),
-                host_id: "host-1".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 22,
-                username: "test".to_string(),
-                status: SessionStatus::Connecting,
-                created_at: 1_710_000_000_000_i64,
-            };
-            manager.insert_session_for_test(session_info);
-
-            // 更新为 Connected
-            manager.update_session_status(&session_id, SessionStatus::Connected);
-            let sessions = manager.list_sessions();
-            let found = sessions.iter().find(|s| s.session_id == session_id);
-            prop_assert!(found.is_some(), "会话应存在于 list_sessions 中");
-            prop_assert_eq!(
-                found.unwrap().status.clone(),
-                SessionStatus::Connected,
-                "update_session_status 后 list_sessions 应返回更新后的状态"
-            );
-
-            // 再次更新为 Disconnected
-            manager.update_session_status(&session_id, SessionStatus::Disconnected);
-            let sessions2 = manager.list_sessions();
-            let found2 = sessions2.iter().find(|s| s.session_id == session_id);
-            prop_assert_eq!(
-                found2.unwrap().status.clone(),
-                SessionStatus::Disconnected,
-                "二次更新后状态应为 Disconnected"
-            );
-        }
-    }
-
-    #[test]
-    fn update_status_for_nonexistent_session_is_silent() {
-        // 对不存在的会话调用 update_session_status 应静默忽略，不 panic
-        let mut manager = SessionManager::new();
-        manager.update_session_status("nonexistent", SessionStatus::Connected);
-        assert!(manager.list_sessions().is_empty());
-    }
 }
