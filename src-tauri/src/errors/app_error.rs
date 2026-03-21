@@ -41,6 +41,22 @@ pub enum AppError {
     /// 凭据在安全存储中不存在（主机配置可能已损坏或凭据未写入）
     #[error("凭据不存在: {0}，请重新编辑主机配置以重新保存凭据")]
     CredentialNotFound(String),
+
+    /// SFTP 子通道建立失败（含 SSH session 已断开）
+    #[error("SFTP 通道错误: {0}")]
+    SftpChannelError(String),
+
+    /// 无权限访问远程路径
+    #[error("SFTP 权限拒绝: {0}")]
+    SftpPermissionDenied(String),
+
+    /// 远程路径不存在
+    #[error("SFTP 路径不存在: {0}")]
+    SftpPathNotFound(String),
+
+    /// 传输中断（含传输中通道断开）
+    #[error("SFTP 传输错误: {0}")]
+    SftpTransferError(String),
 }
 
 /// 将 AppError 转换为 String，供 Tauri command 层返回给前端
