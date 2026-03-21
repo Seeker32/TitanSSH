@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Sender};
 use tauri::{AppHandle, Runtime};
 use uuid::Uuid;
 
-/// SSH 会话句柄，包含会话元数据、命令通道和关闭标志
+/// SSH 会话句柄，包含会话元数据、命令通道、关闭标志和主机配置
 #[derive(Clone)]
 pub struct SessionHandle {
     /// 会话基本信息（ID、主机、状态等）
@@ -21,6 +21,8 @@ pub struct SessionHandle {
     pub command_tx: Sender<TerminalCommand>,
     /// 会话关闭标志，设置为 true 时通知所有工作线程退出
     pub shutdown: Arc<AtomicBool>,
+    /// 主机配置（不含明文凭据），供 start_monitoring 读取
+    pub host: HostConfig,
 }
 
 /// 会话管理器（纯协调层）
@@ -80,6 +82,9 @@ impl SessionManager {
         // 创建共享关闭标志
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        // 克隆 host 存入 SessionHandle，terminal_service 消费原始 host
+        let host_for_handle = host.clone();
+
         // 注册会话句柄到 HashMap
         self.sessions.insert(
             session_id.clone(),
@@ -87,6 +92,7 @@ impl SessionManager {
                 meta: session_info.clone(),
                 command_tx,
                 shutdown: shutdown.clone(),
+                host: host_for_handle,
             },
         );
 
@@ -159,16 +165,60 @@ impl SessionManager {
             .collect()
     }
 
-    /// 为指定会话启动监控任务，委托给 monitor_service（单一监控实现）
+    /// 为指定会话启动监控任务
+    ///
+    /// 从 SessionHandle 取出主机配置，从 secure_store 读取运行时凭据，
+    /// 委托给 monitor_service 创建后台采集任务。
+    /// 凭据读取失败时直接返回错误，不启动监控任务。
+    ///
+    /// # 参数
+    /// - `session_id`: 关联的会话 ID
+    /// - `app`: Tauri 应用句柄，用于派发事件
+    ///
+    /// # 返回
+    /// 成功返回 TaskInfo，失败返回 AppError
     pub fn start_monitoring<R: Runtime>(
         &self,
         session_id: String,
-        host: HostConfig,
-        password: Option<String>,
-        passphrase: Option<String>,
         app: AppHandle<R>,
-    ) -> TaskInfo {
-        self.monitor_service.start_monitoring(session_id, host, password, passphrase, app)
+    ) -> Result<TaskInfo, AppError> {
+        use crate::models::host::AuthType;
+        use crate::storage::secure_store;
+
+        // 取出主机配置
+        let handle = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?;
+        let host = handle.host.clone();
+
+        // 根据认证类型从 secure_store 读取运行时凭据
+        // passphrase_ref 为 None 时直接传 None，不调用 get_credential
+        let (password, passphrase) = match host.auth_type {
+            AuthType::Password => {
+                let pw_ref = host.password_ref.as_deref()
+                    .ok_or_else(|| AppError::InvalidHostConfig("密码引用为空".to_string()))?;
+                let pw = secure_store::get_credential(pw_ref)?;
+                (Some(pw), None)
+            }
+            AuthType::PrivateKey => {
+                let pp = if let Some(ref pp_ref) = host.passphrase_ref {
+                    Some(secure_store::get_credential(pp_ref)?)
+                } else {
+                    None
+                };
+                (None, pp)
+            }
+        };
+
+        let task_info = self.monitor_service.start_monitoring(
+            session_id,
+            host,
+            password,
+            passphrase,
+            app,
+        );
+        Ok(task_info)
     }
 
     /// 停止指定监控任务，委托给 monitor_service
@@ -181,4 +231,36 @@ impl SessionManager {
         self.monitor_service.get_monitor_status(session_id)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::host::{AuthType, HostConfig};
+
+    /// 构造测试用 HostConfig
+    fn make_host(id: &str) -> HostConfig {
+        HostConfig {
+            id: id.to_string(), name: "test".to_string(),
+            host: "127.0.0.1".to_string(), port: 22,
+            username: "root".to_string(),
+            auth_type: AuthType::Password,
+            password_ref: Some("ref".to_string()),
+            private_key_path: None, passphrase_ref: None, remark: None,
+        }
+    }
+
+    /// start_monitoring 对不存在的 session_id 返回 SessionNotFound 错误
+    #[test]
+    fn start_monitoring_unknown_session_returns_error() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let manager = SessionManager::new();
+        let result = manager.start_monitoring("nonexistent".to_string(), app.handle().clone());
+        assert!(result.is_err(), "不存在的 session_id 应返回错误");
+        match result.unwrap_err() {
+            AppError::SessionNotFound(id) => assert_eq!(id, "nonexistent"),
+            other => panic!("期望 SessionNotFound，实际: {:?}", other),
+        }
+    }
 }

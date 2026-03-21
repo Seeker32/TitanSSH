@@ -1,27 +1,24 @@
 use crate::core::session_manager::SessionManager;
-use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
 
 /// 为指定会话启动监控任务
 ///
-/// 委托给 session_manager，由其调用 monitor_service 创建后台采集任务。
+/// 委托给 session_manager，由其读取凭据并调用 monitor_service 创建后台采集任务。
 /// 返回包含 task_id 的 TaskInfo，前端可用于跟踪任务状态。
+/// 凭据读取失败或 session 不存在时返回错误字符串。
 #[tauri::command]
 pub fn start_monitoring(
     app: AppHandle,
     session_id: String,
-    host: HostConfig,
-    password: Option<String>,
-    passphrase: Option<String>,
     session_manager: State<'_, Mutex<SessionManager>>,
 ) -> Result<TaskInfo, String> {
-    let task_info = session_manager
+    session_manager
         .lock()
         .map_err(|error| error.to_string())?
-        .start_monitoring(session_id, host, password, passphrase, app);
-    Ok(task_info)
+        .start_monitoring(session_id, app)
+        .map_err(|error| error.to_string())
 }
 
 /// 停止指定 task_id 对应的监控任务
