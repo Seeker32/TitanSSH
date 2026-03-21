@@ -5,18 +5,22 @@ import HostEditorDialog from '@/components/host/HostEditorDialog.vue';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel.vue';
 import TerminalPane from '@/components/terminal/TerminalPane.vue';
 import TerminalTabs from '@/components/terminal/TerminalTabs.vue';
+import SftpPanel from '@/components/sftp/SftpPanel.vue';
 import { useHostStore } from '@/stores/host';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useThemeStore } from '@/stores/theme';
 import { useLayoutStore } from '@/stores/layout';
+import { useSftpStore } from '@/stores/sftp';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
+import type { TransferTask } from '@/types/sftp';
 
 const hostStore = useHostStore();
 const sessionStore = useSessionStore();
 const monitorStore = useMonitorStore();
 const themeStore = useThemeStore();
 const layoutStore = useLayoutStore();
+const sftpStore = useSftpStore();
 
 const editorVisible = ref(false);
 const editingHost = ref<HostConfig | null>(null);
@@ -24,6 +28,7 @@ const activeHostId = ref<string | null>(null);
 const isResizingSidebar = ref(false);
 let disposeSessionListeners: (() => void) | null = null;
 let disposeMonitorListeners: (() => void) | null = null;
+let disposeSftpListeners: (() => void) | null = null;
 
 /** 打开指定主机的 SSH 会话，并同步当前激活主机。 */
 async function openSession(hostId: string) {
@@ -104,6 +109,41 @@ function handleWindowResize() {
   layoutStore.syncSidebarWidthForViewport(window.innerWidth);
 }
 
+/** 处理文件浏览器导航事件，列举目标目录 */
+async function handleSftpNavigate(sessionId: string, path: string) {
+  await sftpStore.listDir(sessionId, path);
+}
+
+/** 处理文件下载：发起下载任务（本地路径由用户通过系统对话框选择） */
+async function handleSftpDownload(sessionId: string, remotePaths: string[]) {
+  for (const remotePath of remotePaths) {
+    const fileName = remotePath.split('/').pop() ?? 'download';
+    // TODO: 集成 Tauri dialog API 获取本地保存路径
+    const localPath = `/tmp/${fileName}`;
+    await sftpStore.download(sessionId, remotePath, localPath);
+  }
+}
+
+/** 处理文件上传：发起上传任务（本地文件路径由用户通过系统对话框选择） */
+async function handleSftpUpload(sessionId: string, remotePath: string) {
+  // TODO: 集成 Tauri dialog API 获取本地文件路径
+  console.warn('Upload dialog not yet integrated', sessionId, remotePath);
+}
+
+/** 处理取消传输任务 */
+async function handleSftpCancel(taskId: string) {
+  await sftpStore.cancelTask(taskId);
+}
+
+/** 处理重新发起传输任务 */
+async function handleSftpRetry(task: TransferTask) {
+  if (task.transfer_type === 'Download') {
+    await sftpStore.download(task.session_id, task.remote_path, task.local_path);
+  } else {
+    await sftpStore.upload(task.session_id, task.local_path, task.remote_path);
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('pointermove', handleSidebarPointerMove);
   window.addEventListener('pointerup', stopSidebarResize);
@@ -111,6 +151,7 @@ onMounted(async () => {
   handleWindowResize();
   disposeSessionListeners = await sessionStore.initListeners();
   disposeMonitorListeners = await monitorStore.initListeners();
+  disposeSftpListeners = await sftpStore.initListeners();
   await hostStore.loadHosts();
 });
 
@@ -121,6 +162,7 @@ onBeforeUnmount(() => {
   stopSidebarResize();
   disposeSessionListeners?.();
   disposeMonitorListeners?.();
+  disposeSftpListeners?.();
 });
 </script>
 
@@ -169,6 +211,16 @@ onBeforeUnmount(() => {
           @edit-host="editHostById"
           @remove-host="removeHost"
           @create-host="createHost"
+        />
+        <SftpPanel
+          v-if="sessionStore.activeView !== 'home'"
+          :session-id="sessionStore.activeView"
+          :state="sftpStore.activeState"
+          @navigate="handleSftpNavigate"
+          @download="handleSftpDownload"
+          @upload="handleSftpUpload"
+          @cancel="handleSftpCancel"
+          @retry="handleSftpRetry"
         />
       </div>
     </section>
@@ -254,6 +306,8 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .page-shell--resizing {
