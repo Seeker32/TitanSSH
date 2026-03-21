@@ -1,12 +1,15 @@
 use crate::core::monitor_service::MonitorService;
+use crate::core::sftp_service::SftpService;
 use crate::core::terminal_service;
 use crate::core::terminal_service::TerminalCommand;
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
 use crate::models::session::{SessionInfo, SessionStatus};
+use crate::models::sftp::{RemoteEntry, TransferTask};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use tauri::{AppHandle, Runtime};
@@ -35,6 +38,8 @@ pub struct SessionManager {
     sessions: HashMap<String, SessionHandle>,
     /// 独立监控服务，负责管理所有监控任务的生命周期（单一实现）
     monitor_service: MonitorService,
+    /// SFTP 服务，Arc<Mutex> 包装以支持跨线程注册 session
+    sftp_service: Arc<Mutex<SftpService>>,
 }
 
 impl SessionManager {
@@ -43,6 +48,7 @@ impl SessionManager {
         Self {
             sessions: HashMap::new(),
             monitor_service: MonitorService::new(),
+            sftp_service: Arc::new(Mutex::new(SftpService::new())),
         }
     }
 
@@ -229,6 +235,68 @@ impl SessionManager {
     /// 获取指定会话的最新监控快照，委托给 monitor_service
     pub fn get_monitor_snapshot(&self, session_id: &str) -> Option<MonitorSnapshot> {
         self.monitor_service.get_monitor_status(session_id)
+    }
+
+    /// 列举远程目录，委托给 sftp_service
+    ///
+    /// # 参数
+    /// - `session_id`: 关联的 SSH 会话 ID
+    /// - `path`: 远程目录绝对路径
+    pub fn sftp_list_dir(&self, session_id: &str, path: &str) -> Result<Vec<RemoteEntry>, AppError> {
+        self.sftp_service
+            .lock()
+            .map_err(|e| AppError::SftpChannelError(e.to_string()))?
+            .list_dir(session_id, path)
+    }
+
+    /// 发起下载任务，委托给 sftp_service
+    ///
+    /// # 参数
+    /// - `session_id`: 关联会话 ID
+    /// - `remote_path`: 远程文件完整路径
+    /// - `local_path`: 本地保存路径
+    /// - `app`: Tauri 应用句柄
+    pub fn sftp_download<R: Runtime>(
+        &mut self,
+        session_id: String,
+        remote_path: String,
+        local_path: String,
+        app: AppHandle<R>,
+    ) -> Result<TransferTask, AppError> {
+        self.sftp_service
+            .lock()
+            .map_err(|e| AppError::SftpChannelError(e.to_string()))?
+            .enqueue_download(session_id, remote_path, local_path, app)
+    }
+
+    /// 发起上传任务，委托给 sftp_service
+    ///
+    /// # 参数
+    /// - `session_id`: 关联会话 ID
+    /// - `local_path`: 本地文件完整路径
+    /// - `remote_path`: 远程目标目录路径
+    /// - `app`: Tauri 应用句柄
+    pub fn sftp_upload<R: Runtime>(
+        &mut self,
+        session_id: String,
+        local_path: String,
+        remote_path: String,
+        app: AppHandle<R>,
+    ) -> Result<TransferTask, AppError> {
+        self.sftp_service
+            .lock()
+            .map_err(|e| AppError::SftpChannelError(e.to_string()))?
+            .enqueue_upload(session_id, local_path, remote_path, app)
+    }
+
+    /// 取消传输任务，委托给 sftp_service
+    ///
+    /// # 参数
+    /// - `task_id`: 要取消的任务 ID
+    pub fn sftp_cancel_task(&mut self, task_id: &str) {
+        if let Ok(mut svc) = self.sftp_service.lock() {
+            svc.cancel_task(task_id);
+        }
     }
 
 }
