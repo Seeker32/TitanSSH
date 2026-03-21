@@ -38,6 +38,13 @@ const authOptions = [
   { label: '私钥', value: AuthType.PrivateKey },
 ];
 
+/** 统一关闭主机表单文本输入的系统自动纠正，避免 WebView 自动首字母大写。 */
+const textInputProps = {
+  autocapitalize: 'none',
+  autocomplete: 'off',
+  spellcheck: false,
+};
+
 /**
  * 监听对话框打开与编辑目标变化，重置表单。
  * 编辑时从 HostConfig（含 ref 字段）初始化非敏感字段，密码字段留空让用户重新输入。
@@ -90,12 +97,12 @@ function submit() {
         <NGrid :cols="2" :x-gap="16">
           <NGridItem>
             <NFormItem label="名称">
-              <NInput v-model:value="form.name" placeholder="生产服务器" />
+              <NInput v-model:value="form.name" :input-props="textInputProps" placeholder="生产服务器" />
             </NFormItem>
           </NGridItem>
           <NGridItem>
             <NFormItem label="地址">
-              <NInput v-model:value="form.host" placeholder="192.168.1.12" />
+              <NInput v-model:value="form.host" :input-props="textInputProps" placeholder="192.168.1.12" />
             </NFormItem>
           </NGridItem>
           <NGridItem>
@@ -105,7 +112,7 @@ function submit() {
           </NGridItem>
           <NGridItem>
             <NFormItem label="用户名">
-              <NInput v-model:value="form.username" placeholder="root" />
+              <NInput v-model:value="form.username" :input-props="textInputProps" placeholder="root" />
             </NFormItem>
           </NGridItem>
           <NGridItem>
@@ -115,22 +122,40 @@ function submit() {
           </NGridItem>
           <NGridItem v-if="form.auth_type === AuthType.Password">
             <NFormItem label="密码">
-              <NInput v-model:value="form.password" type="password" show-password-on="click" placeholder="留空则保持原密码不变" />
+              <NInput
+                v-model:value="form.password"
+                :input-props="textInputProps"
+                type="password"
+                show-password-on="click"
+                placeholder="留空则保持原密码不变"
+              />
             </NFormItem>
           </NGridItem>
           <NGridItem v-else>
             <NFormItem label="私钥路径">
-              <NInput v-model:value="form.private_key_path" placeholder="~/.ssh/id_rsa" />
+              <NInput v-model:value="form.private_key_path" :input-props="textInputProps" placeholder="~/.ssh/id_rsa" />
             </NFormItem>
           </NGridItem>
           <NGridItem v-if="form.auth_type === AuthType.PrivateKey">
             <NFormItem label="私钥口令">
-              <NInput v-model:value="form.passphrase" type="password" show-password-on="click" placeholder="留空则保持原口令不变" />
+              <NInput
+                v-model:value="form.passphrase"
+                :input-props="textInputProps"
+                type="password"
+                show-password-on="click"
+                placeholder="留空则保持原口令不变"
+              />
             </NFormItem>
           </NGridItem>
           <NGridItem :span="2">
             <NFormItem label="备注">
-              <NInput v-model:value="form.remark" type="textarea" :rows="3" placeholder="业务说明 / 环境标签" />
+              <NInput
+                v-model:value="form.remark"
+                :input-props="textInputProps"
+                type="textarea"
+                :rows="3"
+                placeholder="业务说明 / 环境标签"
+              />
             </NFormItem>
           </NGridItem>
         </NGrid>

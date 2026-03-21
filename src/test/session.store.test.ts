@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
@@ -15,9 +15,14 @@ function mockOpenSession(sessionOverrides = {}, taskOverrides = {}) {
 
 describe('session store', () => {
   beforeEach(() => {
+    vi.useFakeTimers();
     setActivePinia(createPinia());
     vi.mocked(invoke).mockReset();
     resetMockEvents();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('opens a session and sets it as active view', async () => {
@@ -162,6 +167,86 @@ describe('session store', () => {
     dispose();
   });
 
+  it('updates statusMessage from session:progress while session is still connecting', async () => {
+    mockOpenSession();
+    const store = useSessionStore();
+    const dispose = await store.initListeners();
+    await store.openSession('host-1');
+
+    emitMockEvent('session:progress', {
+      sessionId: 'session-1',
+      phase: 'LoadingCredentials',
+      message: '正在读取凭据...',
+      timestamp: 1_710_000_000_111,
+    });
+
+    expect(store.statusMessage).toBe('正在读取凭据...');
+    expect(store.activeSession?.status).toBe(SessionStatus.Connecting);
+
+    dispose();
+  });
+
+  it('ignores session:progress after a terminal status has been received', async () => {
+    mockOpenSession();
+    const store = useSessionStore();
+    const dispose = await store.initListeners();
+    await store.openSession('host-1');
+
+    emitMockEvent('session:status', {
+      session_id: 'session-1',
+      status: SessionStatus.Timeout,
+      message: null,
+    });
+
+    emitMockEvent('session:progress', {
+      sessionId: 'session-1',
+      phase: 'StartingShell',
+      message: '正在启动 Shell...',
+      timestamp: 1_710_000_000_222,
+    });
+
+    expect(store.statusMessage).toBe('连接超时，请检查网络或主机地址');
+    expect(store.activeSession?.status).toBe(SessionStatus.Timeout);
+
+    dispose();
+  });
+
+  it('marks a session as timeout when connecting exceeds the watchdog threshold', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    mockOpenSession();
+    const store = useSessionStore();
+
+    await store.openSession('host-1');
+    await vi.advanceTimersByTimeAsync(15_001);
+
+    expect(store.activeSession?.status).toBe(SessionStatus.Timeout);
+    expect(store.statusMessage).toBe('连接超时，请检查网络或主机地址');
+    expect(invoke).toHaveBeenCalledWith('sync_session_status', {
+      sessionId: 'session-1',
+      status: SessionStatus.Timeout,
+    });
+  });
+
+  it('clears the watchdog once a terminal status event arrives', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    mockOpenSession();
+    const store = useSessionStore();
+    const dispose = await store.initListeners();
+
+    await store.openSession('host-1');
+    emitMockEvent('session:status', {
+      session_id: 'session-1',
+      status: SessionStatus.Connected,
+      message: null,
+    });
+
+    await vi.advanceTimersByTimeAsync(15_001);
+
+    expect(store.activeSession?.status).toBe(SessionStatus.Connected);
+
+    dispose();
+  });
+
   it('closes the active session and falls back to home view', async () => {
     mockOpenSession({ session_id: 'session-1', host_id: 'host-1' }, { task_id: 'task-1', session_id: 'session-1' });
     mockOpenSession({ session_id: 'session-2', host_id: 'host-2' }, { task_id: 'task-2', session_id: 'session-2' });
@@ -225,7 +310,7 @@ describe('session store', () => {
         message: null,
       });
 
-      await new Promise((r) => setTimeout(r, 0));
+      await Promise.resolve();
 
       expect(invoke).toHaveBeenCalledWith('sync_session_status', {
         sessionId: 'session-1',
@@ -246,7 +331,7 @@ describe('session store', () => {
       const statuses = [SessionStatus.Connected, SessionStatus.Disconnected];
       for (const status of statuses) {
         emitMockEvent('session:status', { session_id: 'session-1', status, message: null });
-        await new Promise((r) => setTimeout(r, 0));
+        await Promise.resolve();
         expect(invoke).toHaveBeenCalledWith('sync_session_status', {
           sessionId: 'session-1',
           status,

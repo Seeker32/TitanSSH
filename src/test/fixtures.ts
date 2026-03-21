@@ -12,7 +12,7 @@ export function makeHost(overrides: Partial<HostConfig> = {}): HostConfig {
     port: 22,
     username: 'root',
     auth_type: AuthType.Password,
-    password_ref: 'titanssh:host-1:password',
+    password_ref: 'titanssh-host-1-password',
     remark: 'primary',
     ...overrides,
   };

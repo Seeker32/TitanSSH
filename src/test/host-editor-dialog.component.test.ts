@@ -90,17 +90,26 @@ describe('HostEditorDialog 组件', () => {
   });
 
   it('编辑模式：密码字段留空（不预填旧值）', async () => {
-    const host = makeHost({ auth_type: AuthType.Password, password_ref: 'titanssh:host-1:password' });
+    const host = makeHost({ auth_type: AuthType.Password, password_ref: 'titanssh-host-1-password' });
     const wrapper = mountDialog(true, host);
     await nextTick();
     expect((wrapper.vm as any).form.password).toBe('');
   });
 
   it('编辑模式：口令字段留空（不预填旧值）', async () => {
-    const host = makeHost({ auth_type: AuthType.PrivateKey, passphrase_ref: 'titanssh:host-1:passphrase' });
+    const host = makeHost({ auth_type: AuthType.PrivateKey, passphrase_ref: 'titanssh-host-1-passphrase' });
     const wrapper = mountDialog(true, host);
     await nextTick();
     expect((wrapper.vm as any).form.passphrase).toBe('');
+  });
+
+  it('文本输入框：关闭自动首字母大写，避免系统输入纠正', () => {
+    const wrapper = mountDialog(true, null);
+    expect((wrapper.vm as any).textInputProps).toMatchObject({
+      autocapitalize: 'none',
+      autocomplete: 'off',
+      spellcheck: false,
+    });
   });
 
   it('close() 触发 update:modelValue false', async () => {

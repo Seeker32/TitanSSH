@@ -2,10 +2,12 @@ import { defineStore } from 'pinia';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { computed, ref } from 'vue';
-import type { SessionInfo } from '@/types/session';
-import { SessionStatus } from '@/types/session';
+import type { SessionInfo, SessionProgressEvent } from '@/types/session';
+import { ConnectionPhase, SessionStatus } from '@/types/session';
 import type { MonitorSnapshot } from '@/types/monitor';
 import { useMonitorStore } from './monitor';
+
+const CONNECT_WATCHDOG_MS = 15_000;
 
 /** session:status 事件 payload */
 interface SessionStatusPayload {
@@ -23,6 +25,8 @@ interface TerminalDataPayload {
 export const useSessionStore = defineStore('session', () => {
   /** 真实 SSH 会话集合，不含首页或占位项 */
   const sessions = ref(new Map<string, SessionInfo>());
+  /** 连接阶段 watchdog 定时器，避免后端阻塞时 UI 永久停留在“连接中” */
+  const connectWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
    * 当前激活视图 ID：'home' 表示首页，其他值为真实 session_id
@@ -55,6 +59,7 @@ export const useSessionStore = defineStore('session', () => {
     sessions.value = new Map(sessions.value).set(session.session_id, session);
     activeView.value = session.session_id;
     statusMessage.value = `正在连接 ${session.username}@${session.host}`;
+    scheduleConnectWatchdog(session.session_id);
     // 会话建立后立即启动监控任务，失败时静默处理不影响主流程
     try {
       const monitorStore = useMonitorStore();
@@ -67,6 +72,7 @@ export const useSessionStore = defineStore('session', () => {
 
   /** 关闭指定会话，先停止监控任务，若关闭的是当前激活会话则回退到首页视图 */
   async function closeSession(sessionId: string) {
+    clearConnectWatchdog(sessionId);
     // 关闭会话前先停止监控任务，失败时静默处理
     try {
       const monitorStore = useMonitorStore();
@@ -112,6 +118,9 @@ export const useSessionStore = defineStore('session', () => {
         status: payload.status,
       });
     }
+    if (payload.status !== SessionStatus.Connecting) {
+      clearConnectWatchdog(payload.session_id);
+    }
     statusMessage.value = statusLabel(payload.status, payload.message ?? undefined);
     // 同步状态到后端 SessionManager 元数据，修复 P1-1（list_sessions 状态不可靠）
     try {
@@ -125,6 +134,44 @@ export const useSessionStore = defineStore('session', () => {
     } catch {
       // 同步失败静默处理
     }
+  }
+
+  /** 处理 session:progress 事件，仅在会话仍处于 Connecting 时更新状态栏诊断信息 */
+  function applySessionProgress(payload: SessionProgressEvent) {
+    const current = sessions.value.get(payload.sessionId);
+    if (!current || current.status !== SessionStatus.Connecting) {
+      return;
+    }
+    statusMessage.value = progressLabel(payload.phase, payload.message);
+  }
+
+  /** 为指定会话注册连接超时 watchdog，防止系统钥匙串等阻塞导致前端永久卡在连接中 */
+  function scheduleConnectWatchdog(sessionId: string) {
+    clearConnectWatchdog(sessionId);
+    connectWatchdogs.set(
+      sessionId,
+      setTimeout(() => {
+        const current = sessions.value.get(sessionId);
+        if (!current || current.status !== SessionStatus.Connecting) {
+          return;
+        }
+        applySessionStatus({
+          session_id: sessionId,
+          status: SessionStatus.Timeout,
+          message: `Connection watchdog timeout after ${CONNECT_WATCHDOG_MS / 1000}s`,
+        });
+      }, CONNECT_WATCHDOG_MS),
+    );
+  }
+
+  /** 清理指定会话的连接 watchdog，避免终态后重复触发超时收敛 */
+  function clearConnectWatchdog(sessionId: string) {
+    const timer = connectWatchdogs.get(sessionId);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    connectWatchdogs.delete(sessionId);
   }
 
   /** 处理 monitor:snapshot 事件，更新对应会话的监控快照 */
@@ -155,16 +202,48 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+  /** 将连接阶段转换为用户可读的中文进度文本，优先使用后端附带文案 */
+  function progressLabel(phase: ConnectionPhase, message?: string): string {
+    if (message?.trim()) {
+      return message.trim();
+    }
+
+    switch (phase) {
+      case ConnectionPhase.LoadingCredentials:
+        return '正在读取凭据...';
+      case ConnectionPhase.ConnectingTcp:
+        return '正在建立 TCP 连接...';
+      case ConnectionPhase.SshHandshake:
+        return '正在进行 SSH 握手...';
+      case ConnectionPhase.Authenticating:
+        return '正在进行 SSH 认证...';
+      case ConnectionPhase.OpeningChannel:
+        return '正在打开终端通道...';
+      case ConnectionPhase.RequestingPty:
+        return '正在请求终端 PTY...';
+      case ConnectionPhase.StartingShell:
+        return '正在启动 Shell...';
+      default:
+        return '正在连接...';
+    }
+  }
+
   /**
    * 初始化后端事件监听器：
    * - session:status：会话状态变更
+   * - session:progress：连接阶段诊断进度
    * - terminal:data：终端数据流（不在 store 中缓冲，仅供 XtermView 直接消费）
    * - monitor:snapshot：同步更新本 store 的快照缓存（monitorStore 为主，此处为兼容层）
    * 返回取消监听的清理函数
    */
   async function initListeners() {
     const unlistenStatus = await listen<SessionStatusPayload>('session:status', (event) => {
+      console.log('[diagnostic] session:status received:', event.payload);
       applySessionStatus(event.payload);
+    });
+
+    const unlistenProgress = await listen<SessionProgressEvent>('session:progress', (event) => {
+      applySessionProgress(event.payload);
     });
 
     // terminal:data 不在 store 中缓冲，XtermView 组件自行监听此事件流
@@ -176,6 +255,7 @@ export const useSessionStore = defineStore('session', () => {
 
     return () => {
       unlistenStatus();
+      unlistenProgress();
       unlistenData();
       unlistenSnapshot();
     };
@@ -195,6 +275,7 @@ export const useSessionStore = defineStore('session', () => {
     resizeTerminal,
     setActiveView,
     applySessionStatus,
+    applySessionProgress,
     applySnapshot,
     initListeners,
   };

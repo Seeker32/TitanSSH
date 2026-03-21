@@ -159,23 +159,11 @@ select:focus,
 textarea:focus {
   outline: none;
   border-color: var(--color-border-focus);
-  box-shadow: 0 0 0 3px var(--color-accent-bg);
 }
 
 input::placeholder,
 textarea::placeholder {
   color: var(--color-text-tertiary);
-}
-
-/* 覆盖 Naive UI 输入框 focus 时四角溢出的 box-shadow */
-.n-input--focus,
-.n-input-wrapper:focus-within {
-  box-shadow: none !important;
-}
-
-.n-base-selection--focus,
-.n-base-selection:focus-within {
-  box-shadow: none !important;
 }
 
 /* 按钮默认样式 */

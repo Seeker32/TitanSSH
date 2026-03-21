@@ -9,6 +9,23 @@ export interface SessionInfo {
   created_at: number;
 }
 
+export enum ConnectionPhase {
+  LoadingCredentials = "LoadingCredentials",
+  ConnectingTcp = "ConnectingTcp",
+  SshHandshake = "SshHandshake",
+  Authenticating = "Authenticating",
+  OpeningChannel = "OpeningChannel",
+  RequestingPty = "RequestingPty",
+  StartingShell = "StartingShell",
+}
+
+export interface SessionProgressEvent {
+  sessionId: string;
+  phase: ConnectionPhase;
+  message: string;
+  timestamp: number;
+}
+
 export enum SessionStatus {
   Connecting = "Connecting",
   Connected = "Connected",
