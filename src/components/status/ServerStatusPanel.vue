@@ -1,51 +1,57 @@
 <script setup lang="ts">
 import { NCard, NEmpty, NProgress, NStatistic, NGrid, NGridItem, NText } from 'naive-ui';
 import { computed } from 'vue';
-import type { ServerStatus } from '@/types/monitor';
+import type { MonitorSnapshot } from '@/types/monitor';
 
+/** 接收后端推送的监控快照，null 表示尚未连接或无数据 */
 const props = defineProps<{
-  status: ServerStatus | null;
+  snapshot: MonitorSnapshot | null;
 }>();
 
-const memPercent = computed(() => props.status?.memory_percent ?? 0);
-const swapPercent = computed(() => props.status?.swap_percent ?? 0);
+/** CPU 使用率百分比，用于进度条渲染 */
+const cpuPercent = computed(() => props.snapshot?.cpu_usage ?? 0);
+/** 内存使用率百分比，用于进度条渲染 */
+const memPercent = computed(() => props.snapshot?.memory_usage ?? 0);
+/** 磁盘使用率百分比，用于进度条渲染 */
+const diskPercent = computed(() => props.snapshot?.disk_usage ?? 0);
 
+/** 根据使用率返回进度条颜色状态：< 60% 绿，< 85% 黄，>= 85% 红 */
 function progressStatus(percent: number): 'success' | 'warning' | 'error' | 'default' {
   if (percent < 60) return 'success';
   if (percent < 85) return 'warning';
   return 'error';
 }
+
+/** 将毫秒时间戳格式化为本地时间字符串 */
+const updatedAt = computed(() =>
+  props.snapshot ? new Date(props.snapshot.timestamp).toLocaleTimeString() : '--'
+);
 </script>
 
 <template>
   <NCard size="small" :bordered="false" class="status-panel">
     <template #header>
       <NText depth="3" style="font-size: 12px">服务器状态</NText>
-      <NText strong style="display: block; margin-top: 2px">{{ status?.ip || '未连接' }}</NText>
+      <NText strong style="display: block; margin-top: 2px">
+        {{ snapshot ? '已连接' : '未连接' }}
+      </NText>
     </template>
 
-    <NEmpty v-if="!status" description="连接建立后，这里会每 2 秒刷新一次服务器状态" />
+    <NEmpty v-if="!snapshot" description="连接建立后，这里会每 2 秒刷新一次服务器状态" />
 
     <NGrid v-else :cols="2" :x-gap="12" :y-gap="12">
       <NGridItem>
-        <NStatistic label="Uptime" :value="status.uptime_text" />
+        <NStatistic label="CPU" :value="`${cpuPercent.toFixed(1)}%`" />
+        <NProgress
+          type="line"
+          :percentage="cpuPercent"
+          :status="progressStatus(cpuPercent)"
+          :show-indicator="false"
+          style="margin-top: 4px"
+        />
       </NGridItem>
       <NGridItem>
-        <NStatistic label="CPU" :value="`${status.cpu_percent.toFixed(1)}%`" />
-      </NGridItem>
-      <NGridItem>
-        <NStatistic label="Load" :value="`${status.load1.toFixed(2)}`" />
-        <NText depth="3" style="font-size: 11px">
-          {{ status.load5.toFixed(2) }} / {{ status.load15.toFixed(2) }}
-        </NText>
-      </NGridItem>
-      <NGridItem>
-        <NStatistic label="Updated" :value="new Date(status.updated_at * 1000).toLocaleTimeString()" />
-      </NGridItem>
-      <NGridItem :span="2">
-        <NText depth="3" style="font-size: 12px">
-          Memory {{ status.memory_used_mb }} / {{ status.memory_total_mb }} MB
-        </NText>
+        <NStatistic label="Memory" :value="`${memPercent.toFixed(1)}%`" />
         <NProgress
           type="line"
           :percentage="memPercent"
@@ -55,16 +61,17 @@ function progressStatus(percent: number): 'success' | 'warning' | 'error' | 'def
         />
       </NGridItem>
       <NGridItem :span="2">
-        <NText depth="3" style="font-size: 12px">
-          Swap {{ status.swap_used_mb }} / {{ status.swap_total_mb }} MB
-        </NText>
+        <NStatistic label="Disk" :value="`${diskPercent.toFixed(1)}%`" />
         <NProgress
           type="line"
-          :percentage="swapPercent"
-          :status="progressStatus(swapPercent)"
+          :percentage="diskPercent"
+          :status="progressStatus(diskPercent)"
           :show-indicator="false"
           style="margin-top: 4px"
         />
+      </NGridItem>
+      <NGridItem :span="2">
+        <NText depth="3" style="font-size: 11px">Updated: {{ updatedAt }}</NText>
       </NGridItem>
     </NGrid>
   </NCard>
