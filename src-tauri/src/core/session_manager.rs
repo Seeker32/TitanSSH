@@ -103,7 +103,23 @@ impl SessionManager {
         );
 
         // 启动 terminal_service 工作线程（SSH 连接、PTY、终端 IO）
-        terminal_service::start_terminal_session(app, host, session_id, command_rx, shutdown);
+        // 创建 SSH session 回传通道，连接成功后将 Arc<Mutex<Session>> 注册到 sftp_service
+        let (ssh_tx, ssh_rx) = std::sync::mpsc::sync_channel::<Arc<Mutex<ssh2::Session>>>(1);
+        terminal_service::start_terminal_session(app, host, session_id.clone(), command_rx, shutdown, Some(ssh_tx));
+
+        // 在后台线程中等待 SSH session 回传，成功后注册到 sftp_service
+        // 使用独立线程避免阻塞 open_session 调用方
+        let sftp_service = self.sftp_service.clone();
+        let sid = session_id.clone();
+        std::thread::spawn(move || {
+            // 最多等待 30s（SSH 连接超时时间内）
+            if let Ok(ssh_session) = ssh_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                // SSH 连接成功后将 session 注册到 sftp_service，供后续 SFTP 操作使用
+                if let Ok(mut svc) = sftp_service.lock() {
+                    svc.register_session(sid, ssh_session);
+                }
+            }
+        });
 
         Ok(session_info)
     }
@@ -149,7 +165,12 @@ impl SessionManager {
     /// 关闭指定会话
     ///
     /// 设置 shutdown 标志，发送 Close 命令，并从 HashMap 中移除会话句柄。
-    pub fn close_session(&mut self, session_id: &str) -> Result<(), AppError> {
+    /// 同时清理 sftp_service 中该会话的所有 Pending/Running 任务，推送取消状态事件。
+    ///
+    /// # 参数
+    /// - `session_id`: 要关闭的会话 ID
+    /// - `app`: Tauri 应用句柄，用于派发 sftp 任务取消事件
+    pub fn close_session<R: Runtime>(&mut self, session_id: &str, app: &AppHandle<R>) -> Result<(), AppError> {
         let handle = self
             .sessions
             .remove(session_id)
@@ -158,6 +179,10 @@ impl SessionManager {
         handle.shutdown.store(true, Ordering::Relaxed);
         // 发送关闭命令到终端工作线程
         let _ = handle.command_tx.send(TerminalCommand::Close);
+        // 清理 SFTP 状态，取消所有 Pending/Running 任务并推送 sftp:task_status = Cancelled
+        if let Ok(mut svc) = self.sftp_service.lock() {
+            svc.cleanup_session(session_id, app);
+        }
         Ok(())
     }
 

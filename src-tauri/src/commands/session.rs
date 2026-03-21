@@ -37,16 +37,18 @@ pub fn open_session(
 
 /// 关闭指定 SSH 会话
 ///
-/// 通知 session_manager 设置关闭标志并清理会话资源。
+/// 通知 session_manager 设置关闭标志并清理会话资源，
+/// 同时取消该会话下所有 Pending/Running 的 SFTP 任务。
 #[tauri::command]
 pub fn close_session(
+    app: AppHandle,
     session_id: String,
     session_manager: State<'_, Mutex<SessionManager>>,
 ) -> Result<(), String> {
     session_manager
         .lock()
         .map_err(|error| error.to_string())?
-        .close_session(&session_id)
+        .close_session(&session_id, &app)
         .map_err(String::from)
 }
 

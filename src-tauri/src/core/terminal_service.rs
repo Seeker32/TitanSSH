@@ -65,6 +65,8 @@ pub enum TerminalCommand {
 ///
 /// 负责从安全存储读取凭据、建立 SSH 连接、请求 PTY、启动 Shell，
 /// 并进入非阻塞 IO 循环处理终端数据读写，派发 terminal:data 和 session:status 事件。
+/// SSH 连接成功后，通过 session_tx 将 Arc<Mutex<Session>> 回传给 SessionManager，
+/// 供 sftp_service 复用同一 SSH 连接，避免重复建立连接。
 ///
 /// # 参数
 /// - `app`: Tauri 应用句柄，用于派发事件到前端
@@ -72,12 +74,14 @@ pub enum TerminalCommand {
 /// - `session_id`: 会话唯一标识符
 /// - `command_rx`: 命令接收端，接收来自协调层的终端命令
 /// - `shutdown`: 关闭标志，设置为 true 时工作线程退出
+/// - `session_tx`: 可选的 SSH session 回传通道，连接成功后发送 Arc<Mutex<Session>>
 pub fn start_terminal_session(
     app: AppHandle,
     host: HostConfig,
     session_id: String,
     command_rx: Receiver<TerminalCommand>,
     shutdown: Arc<AtomicBool>,
+    session_tx: Option<std::sync::mpsc::SyncSender<Arc<Mutex<Session>>>>,
 ) {
     thread::spawn(move || {
         // 从安全存储读取运行时凭据，并对钥匙串阻塞设置独立超时
@@ -175,12 +179,18 @@ pub fn start_terminal_session(
             }
         };
 
-        let session = session;
-        session.set_timeout(CHANNEL_SETUP_TIMEOUT_MS);
+        // 将 SSH session 包装为 Arc<Mutex> 以支持 sftp_service 复用同一连接
+        // 连接成功后通过 session_tx 回传给 SessionManager，供 sftp_service 注册使用
+        let session = Arc::new(Mutex::new(session));
+        if let Some(ref tx) = session_tx {
+            // send 失败（接收端已丢弃）时静默忽略，不影响终端功能
+            let _ = tx.send(session.clone());
+        }
+        session.lock().unwrap().set_timeout(CHANNEL_SETUP_TIMEOUT_MS);
 
         // 创建 SSH 通道
         emit_connection_progress(&app, &session_id, ConnectionPhase::OpeningChannel);
-        let mut channel = match session.channel_session() {
+        let mut channel = match session.lock().unwrap().channel_session() {
             Ok(channel) => channel,
             Err(error) => {
                 let error = AppError::Ssh2Error(error);
@@ -212,7 +222,7 @@ pub fn start_terminal_session(
         }
 
         // 进入流式 IO 前切回非阻塞模式，避免读取 stdout 阻塞命令处理
-        session.set_blocking(false);
+        session.lock().unwrap().set_blocking(false);
 
         // 派发"已连接"状态事件
         emit_session_status(&app, &session_id, SessionStatus::Connected, None);
