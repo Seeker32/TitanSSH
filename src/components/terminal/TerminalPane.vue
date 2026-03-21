@@ -17,6 +17,8 @@ const emit = defineEmits<{
   input: [{ sessionId: string; data: string }];
   resize: [{ sessionId: string; cols: number; rows: number }];
   openHost: [string];
+  editHost: [string];
+  removeHost: [string];
   createHost: [];
 }>();
 </script>
@@ -29,6 +31,8 @@ const emit = defineEmits<{
         <HomeQuickActions
           :hosts="hosts"
           @open="emit('openHost', $event)"
+          @edit="emit('editHost', $event)"
+          @remove="emit('removeHost', $event)"
           @create="emit('createHost')"
         />
       </div>

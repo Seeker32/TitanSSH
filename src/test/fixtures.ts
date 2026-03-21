@@ -55,6 +55,8 @@ export function makeSnapshot(overrides: Partial<MonitorSnapshot> = {}): MonitorS
     cpu_usage: 21.5,
     memory_usage: 25.0,
     disk_usage: 40.0,
+    disk_available_bytes: 300 * 1024 * 1024 * 1024,
+    disk_total_bytes: 500 * 1024 * 1024 * 1024,
     ...overrides,
   };
 }

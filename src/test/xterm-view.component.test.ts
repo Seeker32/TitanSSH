@@ -15,6 +15,8 @@ import { mount } from '@vue/test-utils';
 import { nextTick } from 'vue';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { createPinia, setActivePinia } from 'pinia';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // xterm 和 FitAddon 的 mock
 const mockWrite = vi.fn();
@@ -81,6 +83,20 @@ describe('XtermView 组件', () => {
     mountXterm();
     await nextTick();
     expect(mockLoadAddon).toHaveBeenCalled();
+  });
+
+  it('使用透明滚动条轨道覆盖 xterm 默认滚动条背景', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/components/terminal/XtermView.vue'), 'utf-8');
+
+    expect(source).toContain('<style>');
+    expect(source).toContain('.terminal-view :deep(.xterm-viewport)');
+    expect(source).toContain("viewport.style.setProperty('scrollbar-width', 'none')");
+    expect(source).toContain('.custom-scrollbar');
+    expect(source).toContain('.custom-scrollbar__thumb');
+    expect(source).toContain('background: rgba(148, 163, 184, 0.45)');
+    expect(source).toContain('::-webkit-scrollbar');
+    expect(source).toContain('width: 0 !important');
+    expect(source).toContain('display: none !important');
   });
 
   it('terminal:data 事件匹配 session_id 时写入终端', async () => {

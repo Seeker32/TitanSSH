@@ -8,6 +8,8 @@ defineProps<{
 
 const emit = defineEmits<{
   open: [hostId: string];
+  edit: [hostId: string];
+  remove: [hostId: string];
   create: [];
 }>();
 </script>
@@ -27,10 +29,33 @@ const emit = defineEmits<{
           class="host-btn"
           @click="emit('open', host.id)"
         >
-          <NText strong>{{ host.name || host.host }}</NText>
-          <NText depth="3" style="font-size: 13px; font-family: monospace">
-            {{ host.username }}@{{ host.host }}:{{ host.port }}
-          </NText>
+          <div class="host-main">
+            <div class="host-copy">
+              <NText strong>{{ host.name || host.host }}</NText>
+              <NText depth="3" style="font-size: 13px; font-family: monospace">
+                {{ host.username }}@{{ host.host }}:{{ host.port }}
+              </NText>
+            </div>
+            <div class="host-actions" @click.stop>
+              <NButton
+                size="tiny"
+                quaternary
+                class="host-action-btn host-action-btn--edit"
+                @click="emit('edit', host.id)"
+              >
+                编辑
+              </NButton>
+              <NButton
+                size="tiny"
+                quaternary
+                type="error"
+                class="host-action-btn host-action-btn--remove"
+                @click="emit('remove', host.id)"
+              >
+                删除
+              </NButton>
+            </div>
+          </div>
         </div>
       </div>
     </NScrollbar>
@@ -60,7 +85,7 @@ const emit = defineEmits<{
 .host-btn {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 10px;
   padding: 14px 18px;
   border: 1px solid var(--color-border);
   border-radius: 12px;
@@ -73,6 +98,34 @@ const emit = defineEmits<{
   border-color: var(--color-border-focus);
   background: var(--color-card-bg-hover);
   transform: translateY(-1px);
+}
+
+.host-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.host-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.host-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.host-action-btn {
+  opacity: 0.8;
+}
+
+.host-btn:hover .host-action-btn {
+  opacity: 1;
 }
 
 .create-section {

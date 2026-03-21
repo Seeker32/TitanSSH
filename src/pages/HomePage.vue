@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { NButton, NText } from 'naive-ui';
 import HostEditorDialog from '@/components/host/HostEditorDialog.vue';
-import HostList from '@/components/host/HostList.vue';
+import ServerStatusPanel from '@/components/status/ServerStatusPanel.vue';
 import TerminalPane from '@/components/terminal/TerminalPane.vue';
 import TerminalTabs from '@/components/terminal/TerminalTabs.vue';
 import { useHostStore } from '@/stores/host';
@@ -25,18 +25,6 @@ const isResizingSidebar = ref(false);
 let disposeSessionListeners: (() => void) | null = null;
 let disposeMonitorListeners: (() => void) | null = null;
 
-const connectedHostIds = computed(() =>
-  sessionStore.sessionList
-    .filter((session) => session.status === 'Connected')
-    .map((session) => session.host_id),
-);
-
-const connectingHostIds = computed(() =>
-  sessionStore.sessionList
-    .filter((session) => session.status === 'Connecting')
-    .map((session) => session.host_id),
-);
-
 /** 打开指定主机的 SSH 会话，并同步当前激活主机。 */
 async function openSession(hostId: string) {
   activeHostId.value = hostId;
@@ -53,6 +41,16 @@ function createHost() {
 function editHost(host: HostConfig) {
   editingHost.value = host;
   editorVisible.value = true;
+}
+
+/** 根据主机 ID 查找配置并打开编辑对话框；若主机不存在则静默忽略。 */
+function editHostById(hostId: string) {
+  const host = hostStore.hosts.find((item) => item.id === hostId);
+  if (!host) {
+    return;
+  }
+
+  editHost(host);
 }
 
 /** 保存主机配置，并在成功后关闭编辑对话框。 */
@@ -137,16 +135,7 @@ onBeforeUnmount(() => {
           {{ themeStore.theme === 'dark' ? '🌙' : '☀️' }}
         </NButton>
       </div>
-      <HostList
-        :hosts="hostStore.hosts"
-        :active-host-id="activeHostId"
-        :connected-host-ids="connectedHostIds"
-        :connecting-host-ids="connectingHostIds"
-        @open="openSession"
-        @create="createHost"
-        @edit="editHost"
-        @remove="removeHost"
-      />
+      <ServerStatusPanel :snapshot="monitorStore.activeSnapshot" />
     </aside>
     <div
       class="sidebar-resizer"
@@ -177,6 +166,8 @@ onBeforeUnmount(() => {
           @input="sessionStore.writeTerminal($event.sessionId, $event.data)"
           @resize="sessionStore.resizeTerminal($event.sessionId, $event.cols, $event.rows)"
           @open-host="openSession"
+          @edit-host="editHostById"
+          @remove-host="removeHost"
           @create-host="createHost"
         />
       </div>

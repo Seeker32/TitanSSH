@@ -6,6 +6,8 @@ export interface MonitorSnapshot {
   cpu_usage: number;
   memory_usage: number;
   disk_usage: number;
+  disk_available_bytes: number;
+  disk_total_bytes: number;
 }
 
 /** 长任务状态枚举 */

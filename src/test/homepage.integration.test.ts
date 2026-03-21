@@ -98,8 +98,10 @@ describe('HomePage integration', () => {
 
     expect(invoke).toHaveBeenCalledWith('list_hosts');
     expect(wrapper.text()).toContain('prod');
+    expect(wrapper.text()).not.toContain('连接列表');
+    expect(wrapper.text()).toContain('服务器状态');
 
-    await wrapper.get('.host-card').trigger('click');
+    await wrapper.get('.host-btn').trigger('click');
     await flushUi();
 
     emitMockEvent('session:status', {
@@ -123,6 +125,7 @@ describe('HomePage integration', () => {
       rows: 32,
     });
     expect(wrapper.text()).toContain('已连接');
+    expect(wrapper.text()).toContain('42.0%');
   });
 
   it('leaves connecting state after a timeout status event', async () => {
@@ -141,10 +144,10 @@ describe('HomePage integration', () => {
     });
 
     await flushUi();
-    await wrapper.get('.host-card').trigger('click');
+    await wrapper.get('.host-btn').trigger('click');
     await flushUi();
 
-    expect(wrapper.text()).toContain('连接中');
+    expect(wrapper.text()).toContain('root@10.0.0.8');
 
     vi.mocked(invoke).mockResolvedValueOnce(undefined); // sync_session_status
     emitMockEvent('session:status', {
@@ -155,8 +158,7 @@ describe('HomePage integration', () => {
 
     await flushUi();
 
-    expect(wrapper.text()).not.toContain('连接中');
-    expect(wrapper.text()).toContain('离线');
+    expect(wrapper.text()).toContain('root@10.0.0.8');
     expect(invoke).toHaveBeenCalledWith('sync_session_status', {
       sessionId: 'session-1',
       status: SessionStatus.Timeout,
@@ -215,5 +217,39 @@ describe('HomePage integration', () => {
 
     sidebar = wrapper.get('.sidebar').element as HTMLElement;
     expect(sidebar.style.width).toBe(`${MAX_SIDEBAR_WIDTH}px`);
+  });
+
+  it('keeps the monitor panel visible but data-free on the home tab', async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([makeHost()])
+      .mockResolvedValueOnce(makeSession())
+      .mockResolvedValueOnce(makeTaskInfo());
+
+    const wrapper = mount(HomePage, {
+      global: {
+        plugins: [createPinia()],
+        stubs: {
+          Teleport: true,
+        },
+      },
+    });
+
+    await flushUi();
+    expect(wrapper.text()).toContain('服务器状态');
+    expect(wrapper.text()).toContain('未连接');
+
+    await wrapper.get('.host-btn').trigger('click');
+    await flushUi();
+
+    emitMockEvent('monitor:snapshot', makeSnapshot({ session_id: 'session-1', cpu_usage: 50.5 }));
+    await flushUi();
+    expect(wrapper.text()).toContain('50.5%');
+
+    await wrapper.get('.tab').trigger('click');
+    await flushUi();
+
+    expect(wrapper.text()).toContain('服务器状态');
+    expect(wrapper.text()).toContain('未连接');
+    expect(wrapper.text()).not.toContain('50.5%');
   });
 });
