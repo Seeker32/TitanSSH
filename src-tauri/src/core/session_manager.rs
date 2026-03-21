@@ -160,8 +160,15 @@ impl SessionManager {
     }
 
     /// 为指定会话启动监控任务，委托给 monitor_service（单一监控实现）
-    pub fn start_monitoring<R: Runtime>(&self, session_id: String, app: AppHandle<R>) -> TaskInfo {
-        self.monitor_service.start_monitoring(session_id, app)
+    pub fn start_monitoring<R: Runtime>(
+        &self,
+        session_id: String,
+        host: HostConfig,
+        password: Option<String>,
+        passphrase: Option<String>,
+        app: AppHandle<R>,
+    ) -> TaskInfo {
+        self.monitor_service.start_monitoring(session_id, host, password, passphrase, app)
     }
 
     /// 停止指定监控任务，委托给 monitor_service

@@ -1,4 +1,5 @@
 use crate::core::session_manager::SessionManager;
+use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
@@ -11,12 +12,15 @@ use tauri::{AppHandle, State};
 pub fn start_monitoring(
     app: AppHandle,
     session_id: String,
+    host: HostConfig,
+    password: Option<String>,
+    passphrase: Option<String>,
     session_manager: State<'_, Mutex<SessionManager>>,
 ) -> Result<TaskInfo, String> {
     let task_info = session_manager
         .lock()
         .map_err(|error| error.to_string())?
-        .start_monitoring(session_id, app);
+        .start_monitoring(session_id, host, password, passphrase, app);
     Ok(task_info)
 }
 

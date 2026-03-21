@@ -1,10 +1,11 @@
+use crate::core::monitor_worker;
+use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, TaskInfo, TaskStatus};
 use crate::models::session::TaskStatusEvent;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime};
 use uuid::Uuid;
 
@@ -22,7 +23,7 @@ struct MonitorTaskHandle {
 /// 通过 Arc<Mutex<...>> 保证多线程安全访问。
 pub struct MonitorService {
     /// 活跃监控任务的 HashMap，键为 task_id
-    tasks: Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
+    pub tasks: Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
     /// 最新监控快照的 HashMap，键为 session_id
     snapshots: Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
 }
@@ -36,18 +37,28 @@ impl MonitorService {
         }
     }
 
-    /// 为指定会话启动监控任务
+    /// 为指定会话启动监控任务（真实 SSH 采集）
     ///
     /// 生成唯一 task_id，创建 TaskInfo（初始状态为 Pending），
-    /// 启动后台工作线程定期采集快照并推送事件。
+    /// 启动后台工作线程通过独立 SSH 连接定期采集快照并推送事件。
     ///
     /// # 参数
     /// - `session_id`: 关联的会话 ID
+    /// - `host`: 主机配置（不含明文凭据）
+    /// - `password`: 运行时密码（Password 认证时必须提供）
+    /// - `passphrase`: 运行时私钥口令（PrivateKey 认证时可选）
     /// - `app`: Tauri 应用句柄，用于派发事件
     ///
     /// # 返回
     /// 新建的 TaskInfo，包含 task_id 和初始状态
-    pub fn start_monitoring<R: Runtime>(&self, session_id: String, app: AppHandle<R>) -> TaskInfo {
+    pub fn start_monitoring<R: Runtime>(
+        &self,
+        session_id: String,
+        host: HostConfig,
+        password: Option<String>,
+        passphrase: Option<String>,
+        app: AppHandle<R>,
+    ) -> TaskInfo {
         // 生成唯一任务 ID
         let task_id = Uuid::new_v4().to_string();
 
@@ -88,45 +99,51 @@ impl MonitorService {
             update_task_status(&tasks_ref, &task_id, TaskStatus::Running);
             emit_task_status(&app, &task_id, TaskStatus::Running, None);
 
-            // 模拟计数器，用于生成变化的占位数据
-            let mut tick: u64 = 0;
+            let tasks_for_error = Arc::clone(&tasks_ref);
+            let app_for_error = app.clone();
+            let task_id_for_error = task_id.clone();
 
-            // 主循环：定期采集快照并推送事件
-            while !shutdown.load(Ordering::Relaxed) {
-                // 生成占位监控快照（MVP 阶段使用模拟数据）
-                let snapshot = generate_placeholder_snapshot(&session_id, tick);
+            let tasks_for_snap = Arc::clone(&tasks_ref);
+            let app_for_snap = app.clone();
+            let task_id_for_snap = task_id.clone();
+            let session_id_for_snap = session_id.clone();
 
-                // 更新最新快照缓存
-                {
-                    let mut snapshots = snapshots_ref.lock().unwrap();
-                    snapshots.insert(session_id.clone(), snapshot.clone());
-                }
-
-                // 推送 monitor:snapshot 事件到前端
-                if let Err(err) = app.emit("monitor:snapshot", &snapshot) {
-                    // 事件派发失败视为监控任务异常，派发 Failed 状态后退出
-                    update_task_status(&tasks_ref, &task_id, TaskStatus::Failed);
-                    emit_task_status(
-                        &app,
-                        &task_id,
-                        TaskStatus::Failed,
-                        Some(format!("监控快照推送失败: {err}")),
-                    );
-                    return;
-                }
-
-                tick = tick.wrapping_add(1);
-
-                // 每 2 秒采集一次，分 20 次 100ms 检查关闭标志
-                for _ in 0..20 {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
+            monitor_worker::run_monitor_loop(
+                host,
+                password,
+                passphrase,
+                session_id,
+                shutdown,
+                move |snapshot| {
+                    // 更新快照缓存
+                    {
+                        let mut snapshots = snapshots_ref.lock().unwrap();
+                        snapshots.insert(session_id_for_snap.clone(), snapshot.clone());
                     }
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
+                    // 推送事件到前端，失败则标记任务为 Failed
+                    if let Err(err) = app_for_snap.emit("monitor:snapshot", &snapshot) {
+                        update_task_status(&tasks_for_snap, &task_id_for_snap, TaskStatus::Failed);
+                        emit_task_status(
+                            &app_for_snap,
+                            &task_id_for_snap,
+                            TaskStatus::Failed,
+                            Some(format!("监控快照推送失败: {err}")),
+                        );
+                    }
+                },
+                move |err| {
+                    // 采集失败：更新任务状态为 Failed 并派发事件
+                    update_task_status(&tasks_for_error, &task_id_for_error, TaskStatus::Failed);
+                    emit_task_status(
+                        &app_for_error,
+                        &task_id_for_error,
+                        TaskStatus::Failed,
+                        Some(format!("监控采集失败: {err}")),
+                    );
+                },
+            );
 
-            // 工作线程正常退出时更新任务状态为 Done
+            // run_monitor_loop 正常退出（shutdown=true）时更新为 Done
             update_task_status(&tasks_ref, &task_id, TaskStatus::Done);
             emit_task_status(&app, &task_id, TaskStatus::Done, None);
         });
@@ -158,31 +175,6 @@ impl MonitorService {
     pub fn get_monitor_status(&self, session_id: &str) -> Option<MonitorSnapshot> {
         let snapshots = self.snapshots.lock().unwrap();
         snapshots.get(session_id).cloned()
-    }
-}
-
-/// 生成占位监控快照（MVP 阶段使用模拟数据）
-///
-/// 使用 tick 计数器生成随时间变化的模拟指标，
-/// 确保任务生命周期和事件推送逻辑可正常验证。
-///
-/// # 参数
-/// - `session_id`: 关联的会话 ID
-/// - `tick`: 当前采集轮次，用于生成变化数据
-fn generate_placeholder_snapshot(session_id: &str, tick: u64) -> MonitorSnapshot {
-    // 使用简单的正弦波模拟 CPU 使用率波动（20% ~ 60%）
-    let cpu_usage = 20.0 + (tick as f64 * 0.3).sin().abs() * 40.0;
-    // 内存使用率缓慢增长后回落（40% ~ 70%）
-    let memory_usage = 40.0 + (tick as f64 * 0.1).sin().abs() * 30.0;
-    // 磁盘使用率相对稳定（50% ~ 65%）
-    let disk_usage = 50.0 + (tick as f64 * 0.05).sin().abs() * 15.0;
-
-    MonitorSnapshot {
-        session_id: session_id.to_string(),
-        timestamp: chrono::Utc::now().timestamp_millis(),
-        cpu_usage,
-        memory_usage,
-        disk_usage,
     }
 }
 
@@ -274,8 +266,6 @@ mod tests {
     use std::collections::HashSet;
 
     /// 生成合法的状态流转序列策略：Pending → Running → Done/Failed
-    ///
-    /// 返回一个包含完整合法流转步骤的 Vec<TaskStatus>
     fn valid_transition_sequence() -> impl Strategy<Value = Vec<TaskStatus>> {
         prop::bool::ANY.prop_map(|use_done| {
             vec![
@@ -302,32 +292,17 @@ mod tests {
     }
 
     proptest! {
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 9: 监控任务具备完整状态流转
-        ///
-        /// 验证合法流转序列（Pending → Running → Done/Failed）全部成功，
-        /// 且最终状态为终止状态
         #[test]
         fn prop_valid_state_transitions_succeed(transitions in valid_transition_sequence()) {
             let mut sm = TaskStateMachine::new();
-            // 初始状态必须为 Pending
             prop_assert!(sm.status == TaskStatus::Pending, "初始状态应为 Pending");
-
             for next in transitions {
                 let result = sm.transition(next);
                 prop_assert!(result, "合法流转应当成功");
             }
-
-            // 经过完整合法序列后，最终状态必须为终止状态
             prop_assert!(sm.is_terminal(), "完整流转后状态应为 Done 或 Failed");
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 9: 非法状态流转被拒绝
-        ///
-        /// 验证从终止状态（Done/Failed）发起的任何流转均被拒绝
         #[test]
         fn prop_invalid_transitions_from_terminal_are_rejected(
             (terminal, next) in invalid_transition_after_terminal()
@@ -337,15 +312,9 @@ mod tests {
             };
             let result = sm.transition(next);
             prop_assert!(!result, "从终止状态发起的流转应当被拒绝");
-            // 状态不应发生变化
             prop_assert!(sm.status == terminal, "拒绝流转后状态不应改变");
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 9: 跳过 Running 直接到终止状态的流转被拒绝
-        ///
-        /// 验证 Pending 不能直接跳转到 Done 或 Failed
         #[test]
         fn prop_pending_cannot_skip_running(
             terminal in prop_oneof![Just(TaskStatus::Done), Just(TaskStatus::Failed)]
@@ -356,14 +325,8 @@ mod tests {
             prop_assert_eq!(sm.status, TaskStatus::Pending, "状态应保持 Pending");
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 9: 多个监控任务的 task_id 唯一
-        ///
-        /// 生成 1..=10 个任务，验证所有 task_id 互不相同
         #[test]
         fn prop_task_ids_are_unique(n in 1usize..=10usize) {
-            // 模拟生成 n 个任务 ID（与 MonitorService 使用相同的 UUID v4 生成方式）
             let ids: Vec<String> = (0..n).map(|_| uuid::Uuid::new_v4().to_string()).collect();
             let unique: HashSet<&String> = ids.iter().collect();
             prop_assert_eq!(
@@ -374,22 +337,70 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 9: Running → Done 和 Running → Failed 均为合法终止流转
-        ///
-        /// 验证两种终止路径都能正常完成
         #[test]
         fn prop_running_can_transition_to_done_or_failed(
             use_done in prop::bool::ANY
         ) {
             let mut sm = TaskStateMachine::new();
-            // Pending → Running
             prop_assert!(sm.transition(TaskStatus::Running));
-            // Running → Done 或 Running → Failed
             let terminal = if use_done { TaskStatus::Done } else { TaskStatus::Failed };
             prop_assert!(sm.transition(terminal));
             prop_assert!(sm.is_terminal());
         }
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::models::host::{AuthType, HostConfig};
+
+    /// 构造测试用 HostConfig
+    fn make_host() -> HostConfig {
+        HostConfig {
+            id: "h1".to_string(), name: "test".to_string(),
+            host: "127.0.0.1".to_string(), port: 22,
+            username: "root".to_string(),
+            auth_type: AuthType::Password,
+            password_ref: Some("ref".to_string()),
+            private_key_path: None, passphrase_ref: None, remark: None,
+        }
+    }
+
+    /// start_monitoring 返回的 TaskInfo 初始状态为 Pending，task_id 非空
+    #[test]
+    fn start_monitoring_initial_task_is_pending() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = MonitorService::new();
+        let task = service.start_monitoring(
+            "session-1".to_string(),
+            make_host(),
+            Some("pw".to_string()),
+            None,
+            app.handle().clone(),
+        );
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(!task.task_id.is_empty());
+        assert_eq!(task.session_id, Some("session-1".to_string()));
+    }
+
+    /// stop_monitoring 设置关闭标志后任务从 HashMap 中移除
+    #[test]
+    fn stop_monitoring_removes_task_handle() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = MonitorService::new();
+        let task = service.start_monitoring(
+            "session-1".to_string(),
+            make_host(),
+            Some("pw".to_string()),
+            None,
+            app.handle().clone(),
+        );
+        service.stop_monitoring(&task.task_id);
+        // 任务已从 HashMap 移除
+        let tasks = service.tasks.lock().unwrap();
+        assert!(!tasks.contains_key(&task.task_id));
     }
 }
