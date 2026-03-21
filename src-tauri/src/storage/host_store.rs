@@ -9,69 +9,71 @@ pub struct HostStore {
 }
 
 impl HostStore {
-    /// Creates a new HostStore instance
-    /// 
-    /// # Arguments
-    /// * `app_handle` - Tauri application handle for accessing app data directory
-    /// 
-    /// # Returns
-    /// * `Result<Self, AppError>` - New HostStore instance or error
+    /// 创建新的 HostStore 实例
+    ///
+    /// 通过 Tauri AppHandle 获取应用数据目录，确保目录存在后构建 hosts.json 文件路径。
+    ///
+    /// # 参数
+    /// - `app_handle`: Tauri 应用句柄，用于解析平台相关的应用数据目录
+    ///
+    /// # 返回
+    /// 成功返回 HostStore 实例，失败返回 StorageError
     pub fn new(app_handle: &AppHandle) -> Result<Self, AppError> {
-        let app_data_dir = app_handle.path().app_data_dir().map_err(|error| {
-            AppError::StorageError(format!("Failed to get app data dir: {error}"))
-        })?;
+        let app_data_dir = app_handle
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::StorageError(format!("无法获取应用数据目录: {error}")))?;
 
-        // Create directory if it doesn't exist
-        fs::create_dir_all(&app_data_dir).map_err(|error| {
-            AppError::StorageError(format!("Failed to create app data directory: {error}"))
-        })?;
+        // 确保数据目录存在，首次运行时自动创建
+        fs::create_dir_all(&app_data_dir)
+            .map_err(|error| AppError::StorageError(format!("无法创建应用数据目录: {error}")))?;
 
         let file_path = app_data_dir.join("hosts.json");
 
         Ok(Self { file_path })
     }
 
+    /// 仅供测试使用：直接通过文件路径构造 HostStore，绕过 AppHandle
     #[cfg(test)]
     fn from_file_path(file_path: PathBuf) -> Self {
         Self { file_path }
     }
 
-    /// Loads all host configurations from storage
-    /// 
-    /// # Returns
-    /// * `Result<Vec<HostConfig>, AppError>` - List of host configs or error
+    /// 从持久化存储加载所有主机配置
+    ///
+    /// 若 hosts.json 不存在则返回空列表（首次运行场景）。
+    /// 文件存在但内容非法时返回 StorageError。
+    ///
+    /// # 返回
+    /// 成功返回主机配置列表，失败返回 StorageError
     pub fn load(&self) -> Result<Vec<HostConfig>, AppError> {
-        // Return empty list if file doesn't exist
+        // 文件不存在时返回空列表，对应首次运行场景
         if !self.file_path.exists() {
             return Ok(Vec::new());
         }
 
-        let content = fs::read_to_string(&self.file_path).map_err(|error| {
-            AppError::StorageError(format!("Failed to read hosts file: {error}"))
-        })?;
+        let content = fs::read_to_string(&self.file_path)
+            .map_err(|error| AppError::StorageError(format!("读取主机配置文件失败: {error}")))?;
 
-        let hosts: Vec<HostConfig> = serde_json::from_str(&content).map_err(|error| {
-            AppError::StorageError(format!("Failed to parse hosts file: {error}"))
-        })?;
+        let hosts: Vec<HostConfig> = serde_json::from_str(&content)
+            .map_err(|error| AppError::StorageError(format!("解析主机配置文件失败: {error}")))?;
 
         Ok(hosts)
     }
 
-    /// Saves host configurations to storage
-    /// 
-    /// # Arguments
-    /// * `hosts` - Slice of host configurations to save
-    /// 
-    /// # Returns
-    /// * `Result<(), AppError>` - Success or error
+    /// 将主机配置列表持久化到 hosts.json
+    ///
+    /// 使用 pretty-print JSON 格式写入，便于人工排查问题。
+    /// 写入前不含任何明文凭据，调用方必须确保已完成凭据剥离。
+    ///
+    /// # 参数
+    /// - `hosts`: 要持久化的主机配置切片（不含明文凭据）
     pub fn save(&self, hosts: &[HostConfig]) -> Result<(), AppError> {
-        let content = serde_json::to_string_pretty(hosts).map_err(|error| {
-            AppError::StorageError(format!("Failed to serialize hosts: {error}"))
-        })?;
+        let content = serde_json::to_string_pretty(hosts)
+            .map_err(|error| AppError::StorageError(format!("序列化主机配置失败: {error}")))?;
 
-        fs::write(&self.file_path, content).map_err(|error| {
-            AppError::StorageError(format!("Failed to write hosts file: {error}"))
-        })?;
+        fs::write(&self.file_path, content)
+            .map_err(|error| AppError::StorageError(format!("写入主机配置文件失败: {error}")))?;
 
         Ok(())
     }
@@ -100,7 +102,7 @@ mod tests {
             port: 22,
             username: "root".to_string(),
             auth_type: AuthType::Password,
-            password_ref: Some("titanssh:host-1:password".to_string()),
+            password_ref: Some("titanssh-host-1-password".to_string()),
             private_key_path: None,
             passphrase_ref: None,
             remark: Some("primary".to_string()),
@@ -132,7 +134,7 @@ mod tests {
         let store = HostStore::from_file_path(file_path);
 
         let error = store.load().expect_err("load should fail");
-        assert!(error.to_string().contains("Failed to parse hosts file"));
+        assert!(error.to_string().contains("解析主机配置文件失败"));
     }
 
     /// 生成任意合法 AuthType 的策略
@@ -150,25 +152,25 @@ mod tests {
     /// - 敏感字段仅使用引用键格式（titanssh:<id>:<field>），不含明文凭据
     fn arb_host_config() -> impl Strategy<Value = HostConfig> {
         (
-            arb_nonempty_string(), // id
-            arb_nonempty_string(), // name
-            arb_nonempty_string(), // host
-            1u16..=65535u16,       // port
-            arb_nonempty_string(), // username
-            arb_auth_type(),       // auth_type
+            arb_nonempty_string(),                       // id
+            arb_nonempty_string(),                       // name
+            arb_nonempty_string(),                       // host
+            1u16..=65535u16,                             // port
+            arb_nonempty_string(),                       // username
+            arb_auth_type(),                             // auth_type
             proptest::option::of(arb_nonempty_string()), // private_key_path
             proptest::option::of(arb_nonempty_string()), // remark
         )
             .prop_map(
                 |(id, name, host, port, username, auth_type, private_key_path, remark)| {
-                    // 敏感字段仅以引用键形式存在，格式为 titanssh:<id>:<field>
+                    // 敏感字段仅以引用键形式存在，格式为 titanssh-<id>-<field>
                     let password_ref = if auth_type == AuthType::Password {
-                        Some(format!("titanssh:{}:password", id))
+                        Some(format!("titanssh-{}-password", id))
                     } else {
                         None
                     };
                     let passphrase_ref = if auth_type == AuthType::PrivateKey {
-                        Some(format!("titanssh:{}:passphrase", id))
+                        Some(format!("titanssh-{}-passphrase", id))
                     } else {
                         None
                     };
@@ -199,41 +201,43 @@ mod tests {
     /// - password 字段非空，用于验证落盘后文件中不含该明文密码
     fn arb_password_save_request() -> impl Strategy<Value = SaveHostRequest> {
         (
-            arb_nonempty_string(), // id
-            arb_nonempty_string(), // name
-            arb_nonempty_string(), // host
-            1u16..=65535u16,       // port
-            arb_nonempty_string(), // username
+            arb_nonempty_string(),   // id
+            arb_nonempty_string(),   // name
+            arb_nonempty_string(),   // host
+            1u16..=65535u16,         // port
+            arb_nonempty_string(),   // username
             arb_credential_string(), // password（明文，不得落盘）
         )
-            .prop_map(|(id, name, host, port, username, password)| SaveHostRequest {
-                id,
-                name,
-                host,
-                port,
-                username,
-                auth_type: AuthType::Password,
-                password: Some(password),
-                private_key_path: None,
-                passphrase: None,
-                remark: None,
-            })
+            .prop_map(
+                |(id, name, host, port, username, password)| SaveHostRequest {
+                    id,
+                    name,
+                    host,
+                    port,
+                    username,
+                    auth_type: AuthType::Password,
+                    password: Some(password),
+                    private_key_path: None,
+                    passphrase: None,
+                    remark: None,
+                },
+            )
     }
 
     /// 生成含明文口令的 SaveHostRequest 策略（私钥认证模式）
     /// - passphrase 字段非空，用于验证落盘后文件中不含该明文口令
     fn arb_passphrase_save_request() -> impl Strategy<Value = SaveHostRequest> {
         (
-            arb_nonempty_string(), // id
-            arb_nonempty_string(), // name
-            arb_nonempty_string(), // host
-            1u16..=65535u16,       // port
-            arb_nonempty_string(), // username
-            arb_nonempty_string(), // private_key_path
+            arb_nonempty_string(),   // id
+            arb_nonempty_string(),   // name
+            arb_nonempty_string(),   // host
+            1u16..=65535u16,         // port
+            arb_nonempty_string(),   // username
+            arb_nonempty_string(),   // private_key_path
             arb_credential_string(), // passphrase（明文，不得落盘）
         )
-            .prop_map(|(id, name, host, port, username, private_key_path, passphrase)| {
-                SaveHostRequest {
+            .prop_map(
+                |(id, name, host, port, username, private_key_path, passphrase)| SaveHostRequest {
                     id,
                     name,
                     host,
@@ -244,21 +248,21 @@ mod tests {
                     private_key_path: Some(private_key_path),
                     passphrase: Some(passphrase),
                     remark: None,
-                }
-            })
+                },
+            )
     }
 
     /// 生成同时含明文密码和口令的 SaveHostRequest 策略
     /// - password 和 passphrase 均非空，验证两者均不出现在落盘文件中
     fn arb_both_credentials_save_request() -> impl Strategy<Value = SaveHostRequest> {
         (
-            arb_nonempty_string(), // id
-            arb_nonempty_string(), // name
-            arb_nonempty_string(), // host
-            1u16..=65535u16,       // port
-            arb_nonempty_string(), // username
+            arb_nonempty_string(),   // id
+            arb_nonempty_string(),   // name
+            arb_nonempty_string(),   // host
+            1u16..=65535u16,         // port
+            arb_nonempty_string(),   // username
             arb_credential_string(), // password（明文，不得落盘）
-            arb_nonempty_string(), // private_key_path
+            arb_nonempty_string(),   // private_key_path
             arb_credential_string(), // passphrase（明文，不得落盘）
         )
             .prop_map(
@@ -281,7 +285,7 @@ mod tests {
 
     /// 模拟 save_host 命令中的凭据剥离逻辑：
     /// 将 SaveHostRequest 转换为不含明文凭据的 HostConfig，
-    /// 明文密码/口令替换为安全存储引用键（格式：titanssh:<id>:<field>）
+    /// 明文密码/口令替换为安全存储引用键（格式：titanssh-<id>-<field>）
     /// 此函数复现 commands/host.rs 中 save_host 的核心落盘逻辑，用于测试隔离
     fn build_host_config_without_plaintext(request: &SaveHostRequest) -> HostConfig {
         // 若存在非空密码，生成引用键；否则为 None
@@ -289,14 +293,14 @@ mod tests {
             .password
             .as_deref()
             .filter(|p| !p.is_empty())
-            .map(|_| format!("titanssh:{}:password", request.id));
+            .map(|_| format!("titanssh-{}-password", request.id));
 
         // 若存在非空口令，生成引用键；否则为 None
         let passphrase_ref = request
             .passphrase
             .as_deref()
             .filter(|p| !p.is_empty())
-            .map(|_| format!("titanssh:{}:passphrase", request.id));
+            .map(|_| format!("titanssh-{}-passphrase", request.id));
 
         HostConfig {
             id: request.id.clone(),
@@ -344,10 +348,10 @@ mod tests {
             prop_assert_eq!(&loaded_host.remark, &host.remark, "remark 应一致");
 
             // 验证敏感字段仅以引用形式存在（不含明文密码或口令）
-            // password_ref 若存在，必须是引用键格式（以 "titanssh:" 开头），不得是明文密码
+            // password_ref 若存在，必须是引用键格式（以 "titanssh-" 开头），不得是明文密码
             if let Some(ref pw_ref) = loaded_host.password_ref {
                 prop_assert!(
-                    pw_ref.starts_with("titanssh:"),
+                    pw_ref.starts_with("titanssh-"),
                     "password_ref 必须是引用键格式，不得含明文密码，实际值: {}",
                     pw_ref
                 );
@@ -355,7 +359,7 @@ mod tests {
             // passphrase_ref 若存在，必须是引用键格式，不得是明文口令
             if let Some(ref pp_ref) = loaded_host.passphrase_ref {
                 prop_assert!(
-                    pp_ref.starts_with("titanssh:"),
+                    pp_ref.starts_with("titanssh-"),
                     "passphrase_ref 必须是引用键格式，不得含明文口令，实际值: {}",
                     pp_ref
                 );

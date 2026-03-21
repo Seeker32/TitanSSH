@@ -29,8 +29,12 @@ pub fn save_host(app: AppHandle, request: SaveHostRequest) -> Result<Vec<HostCon
         if !pwd.is_empty() {
             // 使用统一的 key 生成函数，确保写入 key 与落盘引用值完全一致（修复 P0-1）
             let key = secure_store::password_key(&request.id);
-            secure_store::set_credential(&key, pwd)
-                .map_err(|e| String::from(e))?;
+            eprintln!("[save_host] Writing password to keychain with key: {}", key);
+            secure_store::set_credential(&key, pwd).map_err(|e| {
+                eprintln!("[save_host] FAILED to write password to keychain: {}", e);
+                String::from(e)
+            })?;
+            eprintln!("[save_host] Password saved and verified successfully");
             Some(key)
         } else {
             // 密码留空：编辑时保留旧引用，新建时置 None
@@ -44,8 +48,7 @@ pub fn save_host(app: AppHandle, request: SaveHostRequest) -> Result<Vec<HostCon
     let passphrase_ref = if let Some(ref pp) = request.passphrase {
         if !pp.is_empty() {
             let key = secure_store::passphrase_key(&request.id);
-            secure_store::set_credential(&key, pp)
-                .map_err(|e| String::from(e))?;
+            secure_store::set_credential(&key, pp).map_err(|e| String::from(e))?;
             Some(key)
         } else {
             existing.and_then(|h| h.passphrase_ref.clone())
@@ -102,21 +105,21 @@ pub fn delete_host(app: AppHandle, host_id: String) -> Result<Vec<HostConfig>, S
     Ok(hosts)
 }
 
-/// 验证保存主机请求的必填字段，name/host/username 不得为空
+/// 验证保存主机请求的必填字段，name/host/username 不得为空白
 fn validate_save_request(request: &SaveHostRequest) -> Result<(), String> {
     if request.name.trim().is_empty() {
         return Err(String::from(AppError::InvalidHostConfig(
-            "Host name is required".to_string(),
+            "主机名称为必填项".to_string(),
         )));
     }
     if request.host.trim().is_empty() {
         return Err(String::from(AppError::InvalidHostConfig(
-            "Host address is required".to_string(),
+            "主机地址为必填项".to_string(),
         )));
     }
     if request.username.trim().is_empty() {
         return Err(String::from(AppError::InvalidHostConfig(
-            "Username is required".to_string(),
+            "用户名为必填项".to_string(),
         )));
     }
     Ok(())
@@ -147,7 +150,12 @@ mod tests {
 
     /// 生成至少一个必填字段（name/host/username）为空白的 SaveHostRequest 策略
     fn arb_invalid_save_request() -> impl Strategy<Value = SaveHostRequest> {
-        (0usize..3, arb_blank_string(), arb_valid_string(), arb_valid_string())
+        (
+            0usize..3,
+            arb_blank_string(),
+            arb_valid_string(),
+            arb_valid_string(),
+        )
             .prop_flat_map(|(blank_field, blank, valid_a, valid_b)| {
                 let (name, host, username) = match blank_field {
                     0 => (blank, valid_a, valid_b),
@@ -296,7 +304,7 @@ mod tests {
 
     #[test]
     fn new_host_with_password_generates_correct_ref() {
-        // 新建主机时，非空密码应生成 titanssh:<id>:password 格式的引用
+        // 新建主机时，非空密码应生成 titanssh-<id>-password 格式的引用
         let req = SaveHostRequest {
             id: "host-new".to_string(),
             name: "prod".to_string(),
@@ -310,7 +318,7 @@ mod tests {
             remark: None,
         };
         let ref_val = resolve_password_ref(&req, None);
-        assert_eq!(ref_val, Some("titanssh:host-new:password".to_string()));
+        assert_eq!(ref_val, Some("titanssh-host-new-password".to_string()));
     }
 
     #[test]
@@ -323,7 +331,7 @@ mod tests {
             port: 22,
             username: "root".to_string(),
             auth_type: AuthType::Password,
-            password_ref: Some("titanssh:host-1:password".to_string()),
+            password_ref: Some("titanssh-host-1-password".to_string()),
             private_key_path: None,
             passphrase_ref: None,
             remark: None,
@@ -344,7 +352,7 @@ mod tests {
         let ref_val = resolve_password_ref(&req, Some(&existing));
         assert_eq!(
             ref_val,
-            Some("titanssh:host-1:password".to_string()),
+            Some("titanssh-host-1-password".to_string()),
             "编辑时密码留空应保留旧引用"
         );
     }
@@ -359,7 +367,7 @@ mod tests {
             port: 22,
             username: "root".to_string(),
             auth_type: AuthType::Password,
-            password_ref: Some("titanssh:host-2:password".to_string()),
+            password_ref: Some("titanssh-host-2-password".to_string()),
             private_key_path: None,
             passphrase_ref: None,
             remark: None,
@@ -379,7 +387,7 @@ mod tests {
         let ref_val = resolve_password_ref(&req, Some(&existing));
         assert_eq!(
             ref_val,
-            Some("titanssh:host-2:password".to_string()),
+            Some("titanssh-host-2-password".to_string()),
             "password 为 None 时应保留旧引用"
         );
     }
@@ -396,7 +404,7 @@ mod tests {
             auth_type: AuthType::PrivateKey,
             password_ref: None,
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            passphrase_ref: Some("titanssh:host-3:passphrase".to_string()),
+            passphrase_ref: Some("titanssh-host-3-passphrase".to_string()),
             remark: None,
         };
         let req = SaveHostRequest {
@@ -415,7 +423,7 @@ mod tests {
         let ref_val = resolve_passphrase_ref(&req, Some(&existing));
         assert_eq!(
             ref_val,
-            Some("titanssh:host-3:passphrase".to_string()),
+            Some("titanssh-host-3-passphrase".to_string()),
             "编辑时口令留空应保留旧引用"
         );
     }
@@ -446,8 +454,8 @@ mod tests {
         let host_id = "host-contract-test";
         let key = secure_store::password_key(host_id);
         // 落盘引用值应等于写入 key（P0-1 修复的核心契约）
-        assert_eq!(key, format!("titanssh:{}:password", host_id));
+        assert_eq!(key, format!("titanssh-{}-password", host_id));
         // 确认 load_credentials 使用 password_ref 直接调用 get_credential 时能命中同一条目
-        assert!(key.starts_with("titanssh:"), "key 必须以 titanssh: 开头");
+        assert!(key.starts_with("titanssh-"), "key 必须以 titanssh- 开头");
     }
 }

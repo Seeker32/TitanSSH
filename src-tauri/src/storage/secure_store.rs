@@ -1,5 +1,7 @@
-use keyring::Entry;
 use crate::errors::app_error::AppError;
+use keyring::Entry;
+use std::thread;
+use std::time::Duration;
 
 /// 安全存储服务名，统一使用 titanssh
 const SERVICE_NAME: &str = "titanssh";
@@ -8,28 +10,75 @@ const SERVICE_NAME: &str = "titanssh";
 /// - key: 凭据的唯一标识键
 /// - value: 要存储的明文凭据，存入后调用方应立即清除内存中的明文
 pub fn set_credential(key: &str, value: &str) -> Result<(), AppError> {
-    let entry = Entry::new(SERVICE_NAME, key)
-        .map_err(|e| AppError::SecureStoreError(e.to_string()))?;
-    entry.set_password(value)
-        .map_err(|e| AppError::SecureStoreError(e.to_string()))
+    eprintln!("[secure_store] set_credential called with key: {}", key);
+    let entry =
+        Entry::new(SERVICE_NAME, key).map_err(|e| {
+            eprintln!("[secure_store] Entry::new failed: {}", e);
+            AppError::SecureStoreError(e.to_string())
+        })?;
+    eprintln!("[secure_store] Entry created, calling set_password...");
+    entry
+        .set_password(value)
+        .map_err(|e| {
+            eprintln!("[secure_store] set_password failed: {}", e);
+            AppError::SecureStoreError(e.to_string())
+        })?;
+    eprintln!("[secure_store] set_password succeeded");
+
+    // macOS keychain 有时需要短暂延迟才能同步，添加重试验证
+    eprintln!("[secure_store] Verifying credential was written...");
+    for attempt in 1..=3 {
+        thread::sleep(Duration::from_millis(100));
+        match get_credential(key) {
+            Ok(_) => {
+                eprintln!("[secure_store] Verification succeeded on attempt {}", attempt);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("[secure_store] Verification attempt {} failed: {}", attempt, e);
+                if attempt == 3 {
+                    return Err(AppError::SecureStoreError(
+                        format!("凭据写入后验证失败: {}", e)
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// 从 OS 安全存储读取凭据
 /// - key: 凭据的唯一标识键
 /// - 返回明文凭据字符串，调用方使用完毕后应尽快释放
+/// - 若凭据不存在，返回 CredentialNotFound 而非通用 SecureStoreError，便于上层给出明确提示
 pub fn get_credential(key: &str) -> Result<String, AppError> {
-    let entry = Entry::new(SERVICE_NAME, key)
-        .map_err(|e| AppError::SecureStoreError(e.to_string()))?;
-    entry.get_password()
-        .map_err(|e| AppError::SecureStoreError(e.to_string()))
+    eprintln!("[secure_store] get_credential called with key: {}", key);
+    let entry =
+        Entry::new(SERVICE_NAME, key).map_err(|e| {
+            eprintln!("[secure_store] Entry::new failed: {}", e);
+            AppError::SecureStoreError(e.to_string())
+        })?;
+    eprintln!("[secure_store] Entry created, calling get_password...");
+    entry.get_password().map_err(|e| {
+        eprintln!("[secure_store] get_password failed with error: {:?}", e);
+        // Check if it's a "not found" error by string matching
+        let err_str = e.to_string();
+        if err_str.contains("NoEntry") || err_str.contains("not found") || err_str.contains("不存在") {
+            eprintln!("[secure_store] Error indicates credential not found");
+            AppError::CredentialNotFound(key.to_string())
+        } else {
+            AppError::SecureStoreError(err_str)
+        }
+    })
 }
 
 /// 从 OS 安全存储删除凭据
 /// - key: 凭据的唯一标识键
 /// - 若凭据不存在则静默成功，避免删除时报错影响主流程
 pub fn delete_credential(key: &str) -> Result<(), AppError> {
-    let entry = Entry::new(SERVICE_NAME, key)
-        .map_err(|e| AppError::SecureStoreError(e.to_string()))?;
+    let entry =
+        Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
     match entry.delete_credential() {
         Ok(_) => Ok(()),
         // 凭据不存在时不视为错误
@@ -38,15 +87,15 @@ pub fn delete_credential(key: &str) -> Result<(), AppError> {
     }
 }
 
-/// 根据主机 ID 生成密码凭据的安全存储 key，格式为 titanssh:<id>:password
+/// 根据主机 ID 生成密码凭据的安全存储 key，格式为 titanssh-<id>-password
 /// 此函数确保写入 key 与落盘引用值完全一致，消除 P0-1 不一致问题
 pub fn password_key(host_id: &str) -> String {
-    format!("titanssh:{}:password", host_id)
+    format!("titanssh-{}-password", host_id)
 }
 
-/// 根据主机 ID 生成私钥口令凭据的安全存储 key，格式为 titanssh:<id>:passphrase
+/// 根据主机 ID 生成私钥口令凭据的安全存储 key，格式为 titanssh-<id>-passphrase
 pub fn passphrase_key(host_id: &str) -> String {
-    format!("titanssh:{}:passphrase", host_id)
+    format!("titanssh-{}-passphrase", host_id)
 }
 
 #[cfg(test)]
@@ -66,17 +115,17 @@ mod tests {
         // 写入 key 必须与落盘引用值完全一致（修复 P0-1）
         let host_id = "host-abc123";
         let key = password_key(host_id);
-        assert_eq!(key, "titanssh:host-abc123:password");
-        // 确认 key 以 "titanssh:" 开头，与 load_credentials 使用的引用格式一致
-        assert!(key.starts_with("titanssh:"));
+        assert_eq!(key, "titanssh-host-abc123-password");
+        // 确认 key 以 "titanssh-" 开头，与 load_credentials 使用的引用格式一致
+        assert!(key.starts_with("titanssh-"));
     }
 
     #[test]
     fn passphrase_key_format_matches_ref_format() {
         let host_id = "host-xyz789";
         let key = passphrase_key(host_id);
-        assert_eq!(key, "titanssh:host-xyz789:passphrase");
-        assert!(key.starts_with("titanssh:"));
+        assert_eq!(key, "titanssh-host-xyz789-passphrase");
+        assert!(key.starts_with("titanssh-"));
     }
 
     #[test]
@@ -121,7 +170,11 @@ mod tests {
         // 删除不存在的凭据应静默成功，不返回错误
         let key = test_key("nonexistent");
         let result = delete_credential(&key);
-        assert!(result.is_ok(), "删除不存在凭据应静默成功，实际: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "删除不存在凭据应静默成功，实际: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -158,5 +211,91 @@ mod tests {
 
         // 清理
         let _ = delete_credential(&key);
+    }
+
+    // --- 凭据链路契约测试（纯逻辑，不依赖 OS keyring）---
+
+    /// 验证 password_key 与 passphrase_key 生成的 key 格式满足 load_credentials 的读取契约
+    /// load_credentials 直接使用 password_ref / passphrase_ref 字段值调用 get_credential，
+    /// 因此 save_host 写入时使用的 key 必须与落盘引用值完全一致
+    #[test]
+    fn password_key_matches_load_credentials_ref_format() {
+        let host_id = "host-chain-test";
+        let write_key = password_key(host_id);
+        // 模拟 save_host 落盘的 password_ref 值
+        let disk_ref = format!("titanssh-{}-password", host_id);
+        assert_eq!(
+            write_key, disk_ref,
+            "写入 key 必须与落盘引用值完全一致，否则 load_credentials 无法读取"
+        );
+    }
+
+    /// 验证 passphrase_key 与落盘引用值一致
+    #[test]
+    fn passphrase_key_matches_load_credentials_ref_format() {
+        let host_id = "host-chain-test-2";
+        let write_key = passphrase_key(host_id);
+        let disk_ref = format!("titanssh-{}-passphrase", host_id);
+        assert_eq!(write_key, disk_ref);
+    }
+
+    /// 验证 delete_credential 对不存在的 key 静默成功（NoEntry 不视为错误）
+    #[test]
+    fn delete_nonexistent_is_silent_no_entry() {
+        // 使用唯一 key 确保不存在
+        let key = test_key("silent-delete");
+        let result = delete_credential(&key);
+        assert!(
+            result.is_ok(),
+            "删除不存在的凭据应静默成功，实际: {:?}",
+            result
+        );
+    }
+
+    /// 验证 password_key 对不同 host_id 生成不同的 key（无碰撞）
+    #[test]
+    fn password_keys_for_different_hosts_have_no_collision() {
+        let ids = ["host-a", "host-b", "host-c", "host-1", "host-2"];
+        let keys: Vec<String> = ids.iter().map(|id| password_key(id)).collect();
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "不同 host_id 的 password_key 不得碰撞"
+        );
+    }
+
+    /// 验证 passphrase_key 对不同 host_id 生成不同的 key（无碰撞）
+    #[test]
+    fn passphrase_keys_for_different_hosts_have_no_collision() {
+        let ids = ["host-a", "host-b", "host-c"];
+        let keys: Vec<String> = ids.iter().map(|id| passphrase_key(id)).collect();
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "不同 host_id 的 passphrase_key 不得碰撞"
+        );
+    }
+
+    /// 验证 password_key 与 passphrase_key 对同一 host_id 生成不同的 key
+    /// 防止密码与口令互相覆盖
+    #[test]
+    fn password_and_passphrase_keys_are_distinct_for_same_host() {
+        let host_id = "host-same";
+        assert_ne!(
+            password_key(host_id),
+            passphrase_key(host_id),
+            "同一主机的密码 key 与口令 key 不得相同"
+        );
+    }
+
+    /// 验证 key 格式不含明文凭据（key 本身不是密码）
+    #[test]
+    fn key_format_does_not_contain_plaintext() {
+        let host_id = "host-plaintext-check";
+        let fake_password = "super-secret-password-123";
+        let key = password_key(host_id);
+        assert!(!key.contains(fake_password), "key 不得包含明文凭据");
     }
 }

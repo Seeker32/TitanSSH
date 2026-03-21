@@ -7,6 +7,10 @@ mod storage;
 use crate::core::session_manager::SessionManager;
 use std::sync::Mutex;
 
+/// 初始化并启动 Tauri 应用
+///
+/// 注册所有插件、全局状态和 invoke 命令处理器，
+/// 然后进入 Tauri 事件循环直到应用退出。
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
