@@ -19,7 +19,7 @@ tokio = { version = "1", features = ["full"] }
 ssh2 = "0.9"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-keyring = "3.6.3"
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 thiserror = "1.0"
 anyhow = "1.0"
 

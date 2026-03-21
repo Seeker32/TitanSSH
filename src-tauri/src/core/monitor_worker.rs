@@ -10,12 +10,15 @@ use std::thread;
 use std::time::Duration;
 
 /// 采集脚本：通过 SSH 执行并返回服务器关键指标
-const STATUS_SCRIPT: &str = r#"MEM=$(free 2>/dev/null | awk '/Mem:/ {printf "%.1f", $3/$2*100}')
-CPU=$(top -bn1 2>/dev/null | awk -F'[, ]+' '/Cpu/ {print 100-$8}')
-DISK=$(df / 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
-echo "CPU=$CPU"
-echo "MEM=$MEM"
-echo "DISK=$DISK""#;
+const STATUS_SCRIPT: &str = r#"MEMINFO_LINE=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {available=$2} END {printf "MEM_TOTAL_KB=%s\nMEM_AVAILABLE_KB=%s\n", total, available}' /proc/meminfo 2>/dev/null)
+CPU_LINE=$(awk '/^cpu / {printf "CPU_TOTAL=%s\nCPU_IDLE=%s\n", ($2+$3+$4+$5+$6+$7+$8+$9+$10), ($5+$6)}' /proc/stat 2>/dev/null)
+DISK_LINE=$(df -B1 / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); printf "DISK=%s\nDISK_AVAIL=%s\nDISK_TOTAL=%s\n", $5, $4, $2}')
+echo "$CPU_LINE"
+echo "$MEMINFO_LINE"
+echo "$DISK_LINE""#;
+
+/// CPU 原始计数快照，来自 /proc/stat 第一行累计值
+type CpuSample = (u64, u64);
 
 /// 监控采集主循环（可注入 connect_fn，便于单元测试）
 ///
@@ -44,6 +47,9 @@ pub fn run_monitor_loop_with<ConnFn>(
 ) where
     ConnFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<Session, AppError>,
 {
+    // 保存上一轮 CPU 原始计数，用于根据 /proc/stat 增量计算使用率
+    let mut previous_cpu_sample = None;
+
     // shutdown 预先为 true 时直接退出，不建立连接
     if shutdown.load(Ordering::Relaxed) {
         return;
@@ -60,8 +66,11 @@ pub fn run_monitor_loop_with<ConnFn>(
 
     // 采集循环：每 2 秒开新 channel 执行脚本
     while !shutdown.load(Ordering::Relaxed) {
-        match collect_once(&session, &session_id) {
-            Ok(snapshot) => on_snapshot(snapshot),
+        match collect_once(&session, &session_id, previous_cpu_sample) {
+            Ok((snapshot, current_cpu_sample)) => {
+                previous_cpu_sample = current_cpu_sample;
+                on_snapshot(snapshot);
+            }
             Err(err) => {
                 on_error(err);
                 return;
@@ -106,7 +115,11 @@ pub fn run_monitor_loop(
 ///
 /// 每次调用开新 channel，执行采集脚本，读取输出后关闭 channel。
 /// channel 操作失败或 wait_close 失败均返回 AppError。
-fn collect_once(session: &Session, session_id: &str) -> Result<MonitorSnapshot, AppError> {
+fn collect_once(
+    session: &Session,
+    session_id: &str,
+    previous_cpu_sample: Option<CpuSample>,
+) -> Result<(MonitorSnapshot, Option<CpuSample>), AppError> {
     let mut channel = session.channel_session()?;
     channel.exec(&format!("sh -c '{}'", STATUS_SCRIPT.replace('\'', "'\\''")))?;
 
@@ -114,64 +127,171 @@ fn collect_once(session: &Session, session_id: &str) -> Result<MonitorSnapshot, 
     channel.read_to_string(&mut output)?;
     channel.wait_close()?;
 
-    parse_snapshot(session_id, &output)
+    parse_snapshot(session_id, &output, previous_cpu_sample)
 }
 
 /// 解析脚本输出，构建 MonitorSnapshot
 ///
-/// 解析 KEY=VALUE 格式的脚本输出，提取 CPU/内存/磁盘指标。
-/// 字段缺失或解析失败时默认为 0.0，不返回错误。
+/// 解析 KEY=VALUE 格式的脚本输出，提取 /proc/stat、/proc/meminfo 与 df 原始字段。
+/// 字段缺失或解析失败时默认回退为 0.0，不返回错误。
 ///
 /// # 参数
 /// - `session_id`: 关联的会话 ID
 /// - `output`: 脚本标准输出文本
-pub fn parse_snapshot(session_id: &str, output: &str) -> Result<MonitorSnapshot, AppError> {
-    let mut cpu_usage = 0.0_f64;
-    let mut memory_usage = 0.0_f64;
+/// - `previous_cpu_sample`: 上一轮 CPU 原始计数，用于计算增量使用率
+pub fn parse_snapshot(
+    session_id: &str,
+    output: &str,
+    previous_cpu_sample: Option<CpuSample>,
+) -> Result<(MonitorSnapshot, Option<CpuSample>), AppError> {
+    let mut memory_total_kb = 0.0_f64;
+    let mut memory_available_kb = 0.0_f64;
     let mut disk_usage = 0.0_f64;
+    let mut disk_available_bytes = 0_u64;
+    let mut disk_total_bytes = 0_u64;
+    let mut cpu_total = None;
+    let mut cpu_idle = None;
 
     for line in output.lines() {
-        if let Some(v) = line.strip_prefix("CPU=") {
-            cpu_usage = v.trim().parse().unwrap_or_default();
-        } else if let Some(v) = line.strip_prefix("MEM=") {
-            memory_usage = v.trim().parse().unwrap_or_default();
+        if let Some(v) = line.strip_prefix("CPU_TOTAL=") {
+            cpu_total = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("CPU_IDLE=") {
+            cpu_idle = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("MEM_TOTAL_KB=") {
+            memory_total_kb = v.trim().parse().unwrap_or_default();
+        } else if let Some(v) = line.strip_prefix("MEM_AVAILABLE_KB=") {
+            memory_available_kb = v.trim().parse().unwrap_or_default();
         } else if let Some(v) = line.strip_prefix("DISK=") {
             disk_usage = v.trim().parse().unwrap_or_default();
+        } else if let Some(v) = line.strip_prefix("DISK_AVAIL=") {
+            disk_available_bytes = v.trim().parse().unwrap_or_default();
+        } else if let Some(v) = line.strip_prefix("DISK_TOTAL=") {
+            disk_total_bytes = v.trim().parse().unwrap_or_default();
         }
     }
 
-    Ok(MonitorSnapshot {
-        session_id: session_id.to_string(),
-        timestamp: chrono::Utc::now().timestamp_millis(),
-        cpu_usage,
-        memory_usage,
-        disk_usage,
-    })
+    let current_cpu_sample = cpu_total.zip(cpu_idle);
+    let cpu_usage = compute_cpu_usage(previous_cpu_sample, current_cpu_sample);
+    let memory_usage = resolve_memory_usage(memory_total_kb, memory_available_kb);
+
+    Ok((
+        MonitorSnapshot {
+            session_id: session_id.to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            cpu_usage,
+            memory_usage,
+            disk_usage,
+            disk_available_bytes,
+            disk_total_bytes,
+        },
+        current_cpu_sample,
+    ))
+}
+
+/// 根据 /proc/stat 连续两次原始计数，计算 CPU 使用率百分比。
+///
+/// 首轮无基线样本、计数未增长或字段缺失时统一返回 0.0。
+fn compute_cpu_usage(
+    previous_sample: Option<CpuSample>,
+    current_sample: Option<CpuSample>,
+) -> f64 {
+    let (previous_total, previous_idle) = match previous_sample {
+        Some(sample) => sample,
+        None => return 0.0,
+    };
+    let (current_total, current_idle) = match current_sample {
+        Some(sample) => sample,
+        None => return 0.0,
+    };
+
+    let total_delta = current_total.saturating_sub(previous_total);
+    let idle_delta = current_idle.saturating_sub(previous_idle);
+    if total_delta == 0 {
+        return 0.0;
+    }
+
+    let busy_ratio = ((total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64) * 100.0;
+    (busy_ratio * 10.0).round() / 10.0
+}
+
+/// 根据 /proc/meminfo 的原始字段，计算最终内存使用率。
+///
+/// MemTotal 缺失或非法时回退为 0.0；MemAvailable 超出总量时按 0 已用处理。
+fn resolve_memory_usage(total_kb: f64, available_kb: f64) -> f64 {
+
+    if total_kb <= 0.0 {
+        return 0.0;
+    }
+
+    let used_ratio = ((total_kb - available_kb).max(0.0) / total_kb) * 100.0;
+    (used_ratio * 10.0).round() / 10.0
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_snapshot;
+    use super::{compute_cpu_usage, parse_snapshot};
 
-    /// 验证 parse_snapshot 能正确解析标准脚本输出，提取 CPU/内存/磁盘指标
+    /// 验证 parse_snapshot 能正确解析原始脚本输出，并由 Rust 计算内存与磁盘指标
     #[test]
     fn parse_snapshot_extracts_metrics() {
-        let raw = "CPU=17.5\nMEM=42.3\nDISK=65";
-        let snap = parse_snapshot("session-1", raw).expect("应能正常解析");
+        let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=577\nDISK=65\nDISK_AVAIL=137438953472\nDISK_TOTAL=549755813888";
+        let (snap, cpu_sample) = parse_snapshot("session-1", raw, None).expect("应能正常解析");
         assert_eq!(snap.session_id, "session-1");
-        assert!((snap.cpu_usage - 17.5).abs() < f64::EPSILON);
+        assert_eq!(snap.cpu_usage, 0.0);
         assert!((snap.memory_usage - 42.3).abs() < 0.01);
         assert!((snap.disk_usage - 65.0).abs() < f64::EPSILON);
+        assert_eq!(snap.disk_available_bytes, 137_438_953_472);
+        assert_eq!(snap.disk_total_bytes, 549_755_813_888);
         assert!(snap.timestamp > 1_000_000_000_000);
+        assert_eq!(cpu_sample, None);
     }
 
     /// 验证 parse_snapshot 在脚本输出为空时不报错，各指标默认为 0.0
     #[test]
     fn parse_snapshot_defaults_on_missing_fields() {
-        let snap = parse_snapshot("session-2", "").expect("空输出不应返回错误");
+        let (snap, cpu_sample) = parse_snapshot("session-2", "", None).expect("空输出不应返回错误");
         assert_eq!(snap.cpu_usage, 0.0);
         assert_eq!(snap.memory_usage, 0.0);
         assert_eq!(snap.disk_usage, 0.0);
+        assert_eq!(snap.disk_available_bytes, 0);
+        assert_eq!(snap.disk_total_bytes, 0);
+        assert_eq!(cpu_sample, None);
+    }
+
+    /// 验证 parse_snapshot 在仅收到内存总量/可用量时，仍能推导出内存使用率
+    #[test]
+    fn parse_snapshot_computes_memory_usage_from_meminfo_fields() {
+        let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=250\nDISK=65";
+        let (snap, _) = parse_snapshot("session-3", raw, None).expect("应能从 meminfo 字段推导内存占用");
+        assert!((snap.memory_usage - 75.0).abs() < 0.01);
+    }
+
+    /// 验证 parse_snapshot 在有上一轮 CPU 原始计数时能计算本轮 CPU 使用率
+    #[test]
+    fn parse_snapshot_computes_cpu_usage_from_proc_stat_fields() {
+        let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500";
+        let (snap, cpu_sample) =
+            parse_snapshot("session-4", raw, Some((100, 20))).expect("应能根据 /proc/stat 计数推导 CPU 占用");
+        assert!((snap.cpu_usage - 83.3).abs() < 0.01);
+        assert_eq!(cpu_sample, Some((160, 30)));
+    }
+
+    /// 验证 CPU 使用率会根据两次 /proc/stat 计数增量进行计算
+    #[test]
+    fn compute_cpu_usage_uses_proc_stat_delta() {
+        let usage = compute_cpu_usage(
+            Some((100, 20)),
+            Some((160, 30)),
+        );
+        assert!((usage - 83.3).abs() < 0.01);
+    }
+
+    /// 验证首轮采样或无效增量时 CPU 使用率回退为 0.0
+    #[test]
+    fn compute_cpu_usage_defaults_on_missing_or_invalid_delta() {
+        assert_eq!(compute_cpu_usage(None, Some((160, 30))), 0.0);
+        assert_eq!(compute_cpu_usage(Some((200, 50)), Some((200, 60))), 0.0);
+        assert_eq!(compute_cpu_usage(Some((200, 50)), None), 0.0);
     }
 }
 
@@ -182,7 +302,7 @@ mod loop_tests {
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::monitor::MonitorSnapshot;
     use ssh2::Session;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     /// 构造测试用 HostConfig

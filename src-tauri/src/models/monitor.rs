@@ -12,6 +12,10 @@ pub struct MonitorSnapshot {
     pub memory_usage: f64,
     /// 磁盘使用率，0.0 ~ 100.0
     pub disk_usage: f64,
+    /// 根分区剩余容量，单位字节
+    pub disk_available_bytes: u64,
+    /// 根分区总容量，单位字节
+    pub disk_total_bytes: u64,
 }
 
 /// 长任务信息，所有持续任务必须可跟踪
@@ -87,14 +91,18 @@ mod tests {
             0.0f64..100.0f64,       // cpu_usage
             0.0f64..100.0f64,       // memory_usage
             0.0f64..100.0f64,       // disk_usage
+            0u64..10_000_000_000_000u64, // disk_available_bytes
+            0u64..10_000_000_000_000u64, // disk_total_bytes
         )
             .prop_map(
-                |(session_id, timestamp, cpu_usage, memory_usage, disk_usage)| MonitorSnapshot {
+                |(session_id, timestamp, cpu_usage, memory_usage, disk_usage, disk_available_bytes, disk_total_bytes)| MonitorSnapshot {
                     session_id,
                     timestamp,
                     cpu_usage,
                     memory_usage,
                     disk_usage,
+                    disk_available_bytes,
+                    disk_total_bytes,
                 },
             )
     }

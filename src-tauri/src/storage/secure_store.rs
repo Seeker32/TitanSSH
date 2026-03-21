@@ -1,50 +1,24 @@
 use crate::errors::app_error::AppError;
 use keyring::Entry;
-use std::thread;
-use std::time::Duration;
 
-/// 安全存储服务名，统一使用 titanssh
-const SERVICE_NAME: &str = "titanssh";
+/// 安全存储服务名，与 tauri.conf.json identifier 保持一致
+const SERVICE_NAME: &str = "dev.titanssh.ssh-terminal-manager";
 
 /// 将凭据写入 OS 安全存储（macOS Keychain / Windows Credential Manager / Linux Secret Service）
 /// - key: 凭据的唯一标识键
 /// - value: 要存储的明文凭据，存入后调用方应立即清除内存中的明文
 pub fn set_credential(key: &str, value: &str) -> Result<(), AppError> {
     eprintln!("[secure_store] set_credential called with key: {}", key);
-    let entry =
-        Entry::new(SERVICE_NAME, key).map_err(|e| {
-            eprintln!("[secure_store] Entry::new failed: {}", e);
-            AppError::SecureStoreError(e.to_string())
-        })?;
+    let entry = Entry::new(SERVICE_NAME, key).map_err(|e| {
+        eprintln!("[secure_store] Entry::new failed: {}", e);
+        AppError::SecureStoreError(e.to_string())
+    })?;
     eprintln!("[secure_store] Entry created, calling set_password...");
-    entry
-        .set_password(value)
-        .map_err(|e| {
-            eprintln!("[secure_store] set_password failed: {}", e);
-            AppError::SecureStoreError(e.to_string())
-        })?;
+    entry.set_password(value).map_err(|e| {
+        eprintln!("[secure_store] set_password failed: {}", e);
+        AppError::SecureStoreError(e.to_string())
+    })?;
     eprintln!("[secure_store] set_password succeeded");
-
-    // macOS keychain 有时需要短暂延迟才能同步，添加重试验证
-    eprintln!("[secure_store] Verifying credential was written...");
-    for attempt in 1..=3 {
-        thread::sleep(Duration::from_millis(100));
-        match get_credential(key) {
-            Ok(_) => {
-                eprintln!("[secure_store] Verification succeeded on attempt {}", attempt);
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("[secure_store] Verification attempt {} failed: {}", attempt, e);
-                if attempt == 3 {
-                    return Err(AppError::SecureStoreError(
-                        format!("凭据写入后验证失败: {}", e)
-                    ));
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 
