@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
-import { useHostStore } from '@/stores/host';
+import { filterHosts, useHostStore } from '@/stores/host';
 import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
@@ -45,6 +45,24 @@ describe('Zustand stores', () => {
     mockInvoke.mockRejectedValueOnce(new Error('offline'));
     await useHostStore.getState().loadHosts();
     expect(useHostStore.getState()).toMatchObject({ loading: false, error: 'Error: offline' });
+  });
+
+  it('主机搜索跨名称与地址过滤且不区分大小写', () => {
+    const hosts = [makeHost(), makeHost({ id: 'host-2', name: 'staging', host: '10.0.0.9', username: 'deploy' })];
+    expect(filterHosts(hosts, '')).toHaveLength(2);
+    expect(filterHosts(hosts, 'PROD')).toEqual([hosts[0]]);
+    expect(filterHosts(hosts, '10.0.0.9')).toEqual([hosts[1]]);
+    expect(filterHosts(hosts, '   ')).toHaveLength(2);
+    expect(filterHosts(hosts, 'no-such-host')).toEqual([]);
+  });
+
+  it('主机搜索词与选中状态可切换', () => {
+    useHostStore.getState().setSearchQuery('staging');
+    expect(useHostStore.getState().searchQuery).toBe('staging');
+    useHostStore.getState().selectHost('host-2');
+    expect(useHostStore.getState().selectedHostId).toBe('host-2');
+    useHostStore.getState().selectHost(null);
+    expect(useHostStore.getState().selectedHostId).toBeNull();
   });
 
   it('侧栏宽度使用默认值并限制最小值与主区域空间', () => {

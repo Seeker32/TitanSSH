@@ -3,11 +3,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Typography } from 'antd';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
+import HostListSidebar from '@/components/host/HostListSidebar';
 import SftpPanel from '@/components/sftp/SftpPanel';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
-import { useHostStore } from '@/stores/host';
+import { filterHosts, useHostStore } from '@/stores/host';
 import { clampSidebarWidth, MAX_SIDEBAR_WIDTH, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
@@ -19,6 +20,8 @@ import type { TransferTask } from '@/types/sftp';
 /** 协调主机、会话、终端、监控与 SFTP 视图。 */
 export default function HomePage() {
   const hosts = useHostStore((state) => state.hosts);
+  const searchQuery = useHostStore((state) => state.searchQuery);
+  const selectedHostId = useHostStore((state) => state.selectedHostId);
   const sessionsMap = useSessionStore((state) => state.sessions);
   const activeView = useSessionStore((state) => state.activeView);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
@@ -144,6 +147,10 @@ export default function HomePage() {
         <Button type="text" size="small" data-testid="theme-toggle" aria-label="切换主题"
           onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}</Button>
       </div>
+      <HostListSidebar hosts={filterHosts(hosts, searchQuery)} searchQuery={searchQuery} selectedHostId={selectedHostId}
+        onSearchChange={(query) => useHostStore.getState().setSearchQuery(query)}
+        onSelect={(hostId) => useHostStore.getState().selectHost(hostId)}
+        onOpen={openSession} onCreate={createHost} />
       <ServerStatusPanel snapshot={snapshot} />
     </aside>
     <div className="sidebar-resizer" role="separator" aria-orientation="vertical" aria-valuenow={sidebarWidth}

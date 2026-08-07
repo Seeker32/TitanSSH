@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
@@ -41,16 +41,18 @@ describe('HomePage integration', () => {
 
   it('加载主机并从首页打开真实会话', async () => {
     const user = userEvent.setup();
-    render(<HomePage />);
-    await user.click(await screen.findByText('root@10.0.0.8:22'));
+    const { container } = render(<HomePage />);
+    const homeView = container.querySelector('.home-view') as HTMLElement;
+    await user.click(await within(homeView).findByText('root@10.0.0.8:22'));
     expect(mockInvoke).toHaveBeenCalledWith('open_session', { hostId: 'host-1' });
     expect(await screen.findByTestId('xterm')).toBeInTheDocument();
   });
 
   it('会话与监控事件更新标签和服务器状态', async () => {
     const user = userEvent.setup();
-    render(<HomePage />);
-    await user.click(await screen.findByText('root@10.0.0.8:22'));
+    const { container } = render(<HomePage />);
+    const homeView = container.querySelector('.home-view') as HTMLElement;
+    await user.click(await within(homeView).findByText('root@10.0.0.8:22'));
     await act(async () => {
       emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, message: null });
       emitMockEvent('monitor:snapshot', makeSnapshot());

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import FileExplorer from '@/components/sftp/FileExplorer';
 import HomeQuickActions from '@/components/home/HomeQuickActions';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
+import HostListSidebar from '@/components/host/HostListSidebar';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import SftpPanel from '@/components/sftp/SftpPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
@@ -36,6 +37,40 @@ describe('React components', () => {
   it('空主机列表显示引导文案', () => {
     render(<HomeQuickActions hosts={[]} onOpen={vi.fn()} onEdit={vi.fn()} onRemove={vi.fn()} onCreate={vi.fn()} />);
     expect(screen.getByText(/暂无保存的主机/)).toBeInTheDocument();
+  });
+
+  it('侧栏主机卡片渲染服务器图标，单击选中、双击连接', async () => {
+    const user = userEvent.setup();
+    const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
+    render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} {...handlers} />);
+    const card = screen.getByText('prod').closest('[role="button"]')!;
+    expect(card.querySelector('svg')).not.toBeNull();
+    await user.click(screen.getByText('prod'));
+    expect(handlers.onSelect).toHaveBeenCalledWith('host-1');
+    expect(handlers.onOpen).not.toHaveBeenCalled();
+    await user.dblClick(screen.getByText('prod'));
+    expect(handlers.onOpen).toHaveBeenCalledWith('host-1');
+    expect(screen.getByText('root@10.0.0.8:22')).toBeInTheDocument();
+  });
+
+  it('侧栏搜索可过滤并按结果展示空态', async () => {
+    const user = userEvent.setup();
+    const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
+    const { rerender } = render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} {...handlers} />);
+    await user.type(screen.getByPlaceholderText('搜索主机…'), 'prod');
+    expect(handlers.onSearchChange).toHaveBeenCalledWith('p');
+    rerender(<HostListSidebar hosts={[]} searchQuery="prod" selectedHostId={null} {...handlers} />);
+    expect(screen.getByText('未找到匹配的主机')).toBeInTheDocument();
+  });
+
+  it('无主机时显示新建引导并可打开编辑器', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn();
+    render(<HostListSidebar hosts={[]} searchQuery="" selectedHostId={null}
+      onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={onCreate} />);
+    expect(screen.getByText(/暂无主机/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '新建第一个主机' }));
+    expect(onCreate).toHaveBeenCalledOnce();
   });
 
   it('终端标签保持首页并按会话状态渲染和关闭', async () => {

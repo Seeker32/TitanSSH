@@ -70,9 +70,21 @@ test('视觉基础：平铺 slate 背景且主题切换即时生效', async ({ p
   expect(stillFlat).toBe('none');
 });
 
+test('侧栏主机列表：双击打开会话，单击不连接', async ({ page }) => {
+  await page.goto('/');
+  const openCalls = () => page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string }> } }).__TAURI_TEST__.calls.filter((call) => call.command === 'open_session').length);
+  const sidebar = page.locator('.sidebar');
+  await expect(sidebar.getByText('prod')).toBeVisible();
+  await sidebar.getByText('prod').click();
+  expect(await openCalls()).toBe(0);
+  await sidebar.getByText('prod').dblclick();
+  expect(await openCalls()).toBe(1);
+  await expect(page.getByRole('tab', { name: /root@10.0.0.8/ })).toBeVisible();
+});
+
 test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) => {
   await page.goto('/');
-  await page.getByText('root@10.0.0.8:22').click();
+  await page.locator('.home-view').getByText('root@10.0.0.8:22').click();
   await expect(page.getByRole('tab', { name: /root@10.0.0.8/ })).toBeVisible();
   await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null }));
   await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('monitor:snapshot', {
@@ -90,7 +102,7 @@ test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) 
 
 test('失败状态可见且传输任务可以重试', async ({ page }) => {
   await page.goto('/');
-  await page.getByText('root@10.0.0.8:22').click();
+  await page.locator('.home-view').getByText('root@10.0.0.8:22').click();
   const emit = (name: string, payload: unknown) => page.evaluate(([eventName, eventPayload]) => {
     (window as unknown as { __TAURI_TEST__: { emit: (event: string, value: unknown) => void } }).__TAURI_TEST__.emit(eventName as string, eventPayload);
   }, [name, payload] as const);
