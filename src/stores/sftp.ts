@@ -46,7 +46,7 @@ export const useSftpStore = defineStore('sftp', () => {
     state.error = null;
     try {
       const entries = await invoke<RemoteEntry[]>('sftp_list_dir', { sessionId, path });
-      state.entries = entries;
+      state.entries = Array.isArray(entries) ? entries : [];
       state.currentPath = path;
       state.selectedPaths = new Set();
     } catch (e) {

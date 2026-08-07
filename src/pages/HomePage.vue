@@ -12,8 +12,10 @@ import { useSessionStore } from '@/stores/session';
 import { useThemeStore } from '@/stores/theme';
 import { useLayoutStore } from '@/stores/layout';
 import { useSftpStore } from '@/stores/sftp';
-import type { HostConfig, SaveHostRequest } from '@/types/host';
 import type { TransferTask } from '@/types/sftp';
+import type { HostConfig, SaveHostRequest } from '@/types/host';
+import { listen } from '@tauri-apps/api/event';
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 
 const hostStore = useHostStore();
 const sessionStore = useSessionStore();
@@ -114,20 +116,23 @@ async function handleSftpNavigate(sessionId: string, path: string) {
   await sftpStore.listDir(sessionId, path);
 }
 
-/** 处理文件下载：发起下载任务（本地路径由用户通过系统对话框选择） */
+/** 处理文件下载：通过系统 save 对话框获取本地路径后发起下载任务 */
 async function handleSftpDownload(sessionId: string, remotePaths: string[]) {
   for (const remotePath of remotePaths) {
     const fileName = remotePath.split('/').pop() ?? 'download';
-    // TODO: 集成 Tauri dialog API 获取本地保存路径
-    const localPath = `/tmp/${fileName}`;
-    await sftpStore.download(sessionId, remotePath, localPath);
+    const localPath = await saveFileDialog({ defaultPath: fileName });
+    if (localPath) {
+      await sftpStore.download(sessionId, remotePath, localPath);
+    }
   }
 }
 
-/** 处理文件上传：发起上传任务（本地文件路径由用户通过系统对话框选择） */
+/** 处理文件上传：通过系统 open 对话框获取本地文件路径后发起上传任务 */
 async function handleSftpUpload(sessionId: string, remotePath: string) {
-  // TODO: 集成 Tauri dialog API 获取本地文件路径
-  console.warn('Upload dialog not yet integrated', sessionId, remotePath);
+  const localPath = await openFileDialog({ multiple: false, directory: false });
+  if (typeof localPath === 'string') {
+    await sftpStore.upload(sessionId, localPath, remotePath);
+  }
 }
 
 /** 处理取消传输任务 */
@@ -152,6 +157,22 @@ onMounted(async () => {
   disposeSessionListeners = await sessionStore.initListeners();
   disposeMonitorListeners = await monitorStore.initListeners();
   disposeSftpListeners = await sftpStore.initListeners();
+
+  // 监听 session:status = Connected，自动列举根目录初始化文件浏览器
+  // 在 HomePage 层处理，避免 session store 与 sftp store 产生耦合
+  const unlistenSftpInit = await listen<{ session_id: string; status: string }>(
+    'session:status',
+    (event) => {
+      if (event.payload.status === 'Connected') {
+        sftpStore.listDir(event.payload.session_id, '/').catch(() => {});
+      }
+    },
+  );
+  const _origDispose = disposeSftpListeners;
+  disposeSftpListeners = () => {
+    _origDispose?.();
+    unlistenSftpInit();
+  };
   await hostStore.loadHosts();
 });
 

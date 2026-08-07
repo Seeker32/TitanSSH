@@ -83,7 +83,8 @@ describe('HomePage integration', () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce([makeHost()])   // list_hosts
       .mockResolvedValueOnce(makeSession())  // open_session
-      .mockResolvedValueOnce(makeTaskInfo()); // start_monitoring
+      .mockResolvedValueOnce(makeTaskInfo()) // start_monitoring
+      .mockResolvedValueOnce([]);            // sftp_list_dir (triggered by Connected event)
 
     const wrapper = mount(HomePage, {
       global: {
