@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// 远程文件系统条目（文件或目录）
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteEntry {
     /// 文件或目录名称（不含路径）
     pub name: String,
@@ -36,6 +37,7 @@ pub enum SftpTaskStatus {
 
 /// 传输任务完整状态；初始 status 为 Pending
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransferTask {
     /// 全局唯一任务 ID（UUID v4）
     pub task_id: String,
@@ -65,6 +67,7 @@ pub struct TransferTask {
 
 /// sftp:progress 事件 payload，约每 500ms 推送一次
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SftpProgressEvent {
     /// 任务 ID
     pub task_id: String,
@@ -80,6 +83,7 @@ pub struct SftpProgressEvent {
 
 /// sftp:task_status 事件 payload，任务状态变更时推送
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SftpTaskStatusEvent {
     /// 任务 ID
     pub task_id: String,

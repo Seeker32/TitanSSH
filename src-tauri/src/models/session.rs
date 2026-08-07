@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// 真实 SSH 会话信息，与前端 UI 标签页完全解耦
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub session_id: String,
     pub host_id: String,
@@ -26,6 +27,7 @@ pub enum SessionStatus {
 
 /// 会话状态变更事件 Payload
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionStatusEvent {
     pub session_id: String,
     pub status: SessionStatus,
@@ -35,6 +37,7 @@ pub struct SessionStatusEvent {
 
 /// 终端数据流事件 Payload
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalDataEvent {
     pub session_id: String,
     pub data: String,
@@ -42,6 +45,7 @@ pub struct TerminalDataEvent {
 
 /// 长任务状态变更事件 Payload
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskStatusEvent {
     pub task_id: String,
     pub status: crate::models::monitor::TaskStatus,

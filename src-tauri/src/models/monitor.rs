@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// 服务器监控快照，由后端采集后推送给前端渲染
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct MonitorSnapshot {
     pub session_id: String,
     /// 采集时间，Unix 毫秒时间戳
@@ -20,6 +21,7 @@ pub struct MonitorSnapshot {
 
 /// 长任务信息，所有持续任务必须可跟踪
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskInfo {
     pub task_id: String,
     pub task_type: String,
@@ -86,16 +88,24 @@ mod tests {
     /// 生成任意合法 MonitorSnapshot 的策略，timestamp 使用毫秒时间戳
     fn arb_monitor_snapshot() -> impl Strategy<Value = MonitorSnapshot> {
         (
-            arb_nonempty_string(),  // session_id
-            arb_millis_timestamp(), // timestamp（毫秒）
-            0.0f64..100.0f64,       // cpu_usage
-            0.0f64..100.0f64,       // memory_usage
-            0.0f64..100.0f64,       // disk_usage
+            arb_nonempty_string(),       // session_id
+            arb_millis_timestamp(),      // timestamp（毫秒）
+            0.0f64..100.0f64,            // cpu_usage
+            0.0f64..100.0f64,            // memory_usage
+            0.0f64..100.0f64,            // disk_usage
             0u64..10_000_000_000_000u64, // disk_available_bytes
             0u64..10_000_000_000_000u64, // disk_total_bytes
         )
             .prop_map(
-                |(session_id, timestamp, cpu_usage, memory_usage, disk_usage, disk_available_bytes, disk_total_bytes)| MonitorSnapshot {
+                |(
+                    session_id,
+                    timestamp,
+                    cpu_usage,
+                    memory_usage,
+                    disk_usage,
+                    disk_available_bytes,
+                    disk_total_bytes,
+                )| MonitorSnapshot {
                     session_id,
                     timestamp,
                     cpu_usage,
