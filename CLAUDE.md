@@ -30,16 +30,10 @@ JSON-serializable, camelCase, timestamps in ms. Models: HostConfig, SessionInfo,
 - No plaintext secrets; use OS secure storage
 - Private keys: store path only, passphrase secured
 
-## Feature rules
-
-- Terminal: xterm.js renders, Rust handles IO; no frontend simulation/buffer logic
-- Monitoring: backend collects all metrics, one payload per update; no frontend aggregation, no per-chart requests
-- SFTP: upload/download, progress tracking, task queue
-
 ## Code rules
 
 - Rust: no excessive unwrap, proper Result, clear module boundaries
-- Frontend: React function components + Hooks, immutable Zustand updates, strict TS, no business logic in components
+- Frontend: React function components + Hooks, immutable Zustand updates, strict TS
 - Every method: Chinese comment (purpose, key params, side effects)
 
 ## Performance
@@ -50,10 +44,6 @@ Terminal streaming, bounded chart buffers, no redundant invoke, no unnecessary r
 
 Must: follow architecture, respect service boundaries, complete code + tests
 Must not: demo code, mix layers, skip TDD, break the event model
-
-## Out of scope (early stage)
-
-Jump host, docker, plugins, cloud sync
 
 > Final rule: if it isn't tested, it doesn't exist.
 
