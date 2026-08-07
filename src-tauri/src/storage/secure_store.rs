@@ -8,18 +8,11 @@ const SERVICE_NAME: &str = "dev.titanssh.ssh-terminal-manager";
 /// - key: 凭据的唯一标识键
 /// - value: 要存储的明文凭据，存入后调用方应立即清除内存中的明文
 pub fn set_credential(key: &str, value: &str) -> Result<(), AppError> {
-    eprintln!("[secure_store] set_credential called with key: {}", key);
-    let entry = Entry::new(SERVICE_NAME, key).map_err(|e| {
-        eprintln!("[secure_store] Entry::new failed: {}", e);
-        AppError::SecureStoreError(e.to_string())
-    })?;
-    eprintln!("[secure_store] Entry created, calling set_password...");
-    entry.set_password(value).map_err(|e| {
-        eprintln!("[secure_store] set_password failed: {}", e);
-        AppError::SecureStoreError(e.to_string())
-    })?;
-    eprintln!("[secure_store] set_password succeeded");
-    Ok(())
+    let entry =
+        Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
+    entry
+        .set_password(value)
+        .map_err(|e| AppError::SecureStoreError(e.to_string()))
 }
 
 /// 从 OS 安全存储读取凭据
@@ -27,19 +20,15 @@ pub fn set_credential(key: &str, value: &str) -> Result<(), AppError> {
 /// - 返回明文凭据字符串，调用方使用完毕后应尽快释放
 /// - 若凭据不存在，返回 CredentialNotFound 而非通用 SecureStoreError，便于上层给出明确提示
 pub fn get_credential(key: &str) -> Result<String, AppError> {
-    eprintln!("[secure_store] get_credential called with key: {}", key);
     let entry =
-        Entry::new(SERVICE_NAME, key).map_err(|e| {
-            eprintln!("[secure_store] Entry::new failed: {}", e);
-            AppError::SecureStoreError(e.to_string())
-        })?;
-    eprintln!("[secure_store] Entry created, calling get_password...");
+        Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
     entry.get_password().map_err(|e| {
-        eprintln!("[secure_store] get_password failed with error: {:?}", e);
         // Check if it's a "not found" error by string matching
         let err_str = e.to_string();
-        if err_str.contains("NoEntry") || err_str.contains("not found") || err_str.contains("不存在") {
-            eprintln!("[secure_store] Error indicates credential not found");
+        if err_str.contains("NoEntry")
+            || err_str.contains("not found")
+            || err_str.contains("不存在")
+        {
             AppError::CredentialNotFound(key.to_string())
         } else {
             AppError::SecureStoreError(err_str)

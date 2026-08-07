@@ -1,11 +1,11 @@
+use crate::core::host_service::HostConfigService;
 use crate::core::session_manager::SessionManager;
 use crate::models::session::SessionInfo;
-use crate::storage::host_store::HostStore;
 use tauri::{AppHandle, State};
 
 /// 打开新的 SSH 会话
 ///
-/// 从 host_store 加载主机配置，传递给 session_manager 协调层，
+/// 通过 HostConfigService 查询主机配置,传递给 session_manager 协调层,
 /// 由 terminal_service 在运行时从 secure_store 读取凭据完成认证。
 ///
 /// # 参数
@@ -18,12 +18,10 @@ pub fn open_session(
     host_id: String,
     session_manager: State<'_, SessionManager>,
 ) -> Result<SessionInfo, String> {
-    // 从持久化存储加载主机配置
-    let store = HostStore::new(&app)?;
-    let hosts = store.load()?;
-    let host = hosts
-        .into_iter()
-        .find(|item| item.id == host_id)
+    // 从持久化存储查询主机配置
+    let service = HostConfigService::new(&app)?;
+    let host = service
+        .get_host(&host_id)?
         .ok_or_else(|| format!("Host not found: {host_id}"))?;
 
     // 路由到 session_manager 协调层，由其启动 terminal_service

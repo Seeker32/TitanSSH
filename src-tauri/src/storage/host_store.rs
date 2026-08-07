@@ -35,7 +35,7 @@ impl HostStore {
 
     /// 仅供测试使用：直接通过文件路径构造 HostStore，绕过 AppHandle
     #[cfg(test)]
-    fn from_file_path(file_path: PathBuf) -> Self {
+    pub(crate) fn from_file_path(file_path: PathBuf) -> Self {
         Self { file_path }
     }
 
@@ -82,7 +82,7 @@ impl HostStore {
 #[cfg(test)]
 mod tests {
     use super::HostStore;
-    use crate::models::host::{AuthType, HostConfig, SaveHostRequest};
+    use crate::models::host::{AuthType, HostConfig};
     use proptest::prelude::*;
     use std::fs;
     use std::path::PathBuf;
@@ -190,132 +190,6 @@ mod tests {
             )
     }
 
-    /// 生成非空凭据字符串的策略（至少8个字符，最多24个字符，纯小写字母）
-    /// 使用固定前缀 "TESTPWD__" 确保凭据字符串足够独特，不会与其他字段值（如 username、id 等）产生误匹配
-    /// 其他字段使用 arb_nonempty_string（大写字母/数字/特殊字符），不会包含此前缀
-    fn arb_credential_string() -> impl Strategy<Value = String> {
-        "[a-z]{8,24}".prop_map(|s| format!("TESTPWD__{}", s))
-    }
-
-    /// 生成含明文密码的 SaveHostRequest 策略（密码认证模式）
-    /// - password 字段非空，用于验证落盘后文件中不含该明文密码
-    fn arb_password_save_request() -> impl Strategy<Value = SaveHostRequest> {
-        (
-            arb_nonempty_string(),   // id
-            arb_nonempty_string(),   // name
-            arb_nonempty_string(),   // host
-            1u16..=65535u16,         // port
-            arb_nonempty_string(),   // username
-            arb_credential_string(), // password（明文，不得落盘）
-        )
-            .prop_map(
-                |(id, name, host, port, username, password)| SaveHostRequest {
-                    id,
-                    name,
-                    host,
-                    port,
-                    username,
-                    auth_type: AuthType::Password,
-                    password: Some(password),
-                    private_key_path: None,
-                    passphrase: None,
-                    remark: None,
-                },
-            )
-    }
-
-    /// 生成含明文口令的 SaveHostRequest 策略（私钥认证模式）
-    /// - passphrase 字段非空，用于验证落盘后文件中不含该明文口令
-    fn arb_passphrase_save_request() -> impl Strategy<Value = SaveHostRequest> {
-        (
-            arb_nonempty_string(),   // id
-            arb_nonempty_string(),   // name
-            arb_nonempty_string(),   // host
-            1u16..=65535u16,         // port
-            arb_nonempty_string(),   // username
-            arb_nonempty_string(),   // private_key_path
-            arb_credential_string(), // passphrase（明文，不得落盘）
-        )
-            .prop_map(
-                |(id, name, host, port, username, private_key_path, passphrase)| SaveHostRequest {
-                    id,
-                    name,
-                    host,
-                    port,
-                    username,
-                    auth_type: AuthType::PrivateKey,
-                    password: None,
-                    private_key_path: Some(private_key_path),
-                    passphrase: Some(passphrase),
-                    remark: None,
-                },
-            )
-    }
-
-    /// 生成同时含明文密码和口令的 SaveHostRequest 策略
-    /// - password 和 passphrase 均非空，验证两者均不出现在落盘文件中
-    fn arb_both_credentials_save_request() -> impl Strategy<Value = SaveHostRequest> {
-        (
-            arb_nonempty_string(),   // id
-            arb_nonempty_string(),   // name
-            arb_nonempty_string(),   // host
-            1u16..=65535u16,         // port
-            arb_nonempty_string(),   // username
-            arb_credential_string(), // password（明文，不得落盘）
-            arb_nonempty_string(),   // private_key_path
-            arb_credential_string(), // passphrase（明文，不得落盘）
-        )
-            .prop_map(
-                |(id, name, host, port, username, password, private_key_path, passphrase)| {
-                    SaveHostRequest {
-                        id,
-                        name,
-                        host,
-                        port,
-                        username,
-                        auth_type: AuthType::Password,
-                        password: Some(password),
-                        private_key_path: Some(private_key_path),
-                        passphrase: Some(passphrase),
-                        remark: None,
-                    }
-                },
-            )
-    }
-
-    /// 模拟 save_host 命令中的凭据剥离逻辑：
-    /// 将 SaveHostRequest 转换为不含明文凭据的 HostConfig，
-    /// 明文密码/口令替换为安全存储引用键（格式：titanssh-<id>-<field>）
-    /// 此函数复现 commands/host.rs 中 save_host 的核心落盘逻辑，用于测试隔离
-    fn build_host_config_without_plaintext(request: &SaveHostRequest) -> HostConfig {
-        // 若存在非空密码，生成引用键；否则为 None
-        let password_ref = request
-            .password
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(|_| format!("titanssh-{}-password", request.id));
-
-        // 若存在非空口令，生成引用键；否则为 None
-        let passphrase_ref = request
-            .passphrase
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(|_| format!("titanssh-{}-passphrase", request.id));
-
-        HostConfig {
-            id: request.id.clone(),
-            name: request.name.clone(),
-            host: request.host.clone(),
-            port: request.port,
-            username: request.username.clone(),
-            auth_type: request.auth_type.clone(),
-            password_ref,
-            private_key_path: request.private_key_path.clone(),
-            passphrase_ref,
-            remark: request.remark.clone(),
-        }
-    }
-
     proptest! {
         /// **验证: 需求 1.1, 1.5**
         ///
@@ -368,121 +242,6 @@ mod tests {
             // 验证敏感字段引用与原始一致（引用键本身应被正确持久化）
             prop_assert_eq!(&loaded_host.password_ref, &host.password_ref, "password_ref 应一致");
             prop_assert_eq!(&loaded_host.passphrase_ref, &host.passphrase_ref, "passphrase_ref 应一致");
-        }
-
-        /// **验证: 需求 1.1, 2.1, 3.1**
-        ///
-        /// Property 3: hosts.json 不含明文凭据（密码认证模式）
-        ///
-        /// 使用 proptest 生成含非空明文密码的 SaveHostRequest，模拟 save_host 落盘逻辑后，
-        /// 读取 hosts.json 原始文件内容（字符串形式），断言：
-        /// 1. 文件内容中不包含原始明文密码字符串
-        #[test]
-        fn prop_hosts_json_no_plaintext_password(request in arb_password_save_request()) {
-            // 提取明文密码，用于后续断言
-            let plaintext_password = request.password.clone().unwrap();
-
-            // 模拟 save_host 的凭据剥离逻辑：构建不含明文的 HostConfig
-            let host_config = build_host_config_without_plaintext(&request);
-
-            // 使用临时文件路径隔离测试，避免测试间干扰
-            let file_path = temp_hosts_file();
-            let store = HostStore::from_file_path(file_path.clone());
-
-            // 将不含明文的 HostConfig 写入 hosts.json
-            store.save(&[host_config]).expect("save 应成功");
-
-            // 读取 hosts.json 原始文件内容（字符串形式）
-            let raw_content = fs::read_to_string(&file_path)
-                .expect("hosts.json 应可读取");
-
-            // 断言：文件原始内容中不得包含明文密码字符串
-            prop_assert!(
-                !raw_content.contains(&plaintext_password),
-                "hosts.json 不得包含明文密码，密码: {:?}，文件内容: {}",
-                plaintext_password,
-                raw_content
-            );
-        }
-
-        /// **验证: 需求 1.1, 2.1, 3.1**
-        ///
-        /// Property 3: hosts.json 不含明文凭据（私钥口令模式）
-        ///
-        /// 使用 proptest 生成含非空明文口令的 SaveHostRequest，模拟 save_host 落盘逻辑后，
-        /// 读取 hosts.json 原始文件内容（字符串形式），断言：
-        /// 1. 文件内容中不包含原始明文口令字符串
-        #[test]
-        fn prop_hosts_json_no_plaintext_passphrase(request in arb_passphrase_save_request()) {
-            // 提取明文口令，用于后续断言
-            let plaintext_passphrase = request.passphrase.clone().unwrap();
-
-            // 模拟 save_host 的凭据剥离逻辑：构建不含明文的 HostConfig
-            let host_config = build_host_config_without_plaintext(&request);
-
-            // 使用临时文件路径隔离测试，避免测试间干扰
-            let file_path = temp_hosts_file();
-            let store = HostStore::from_file_path(file_path.clone());
-
-            // 将不含明文的 HostConfig 写入 hosts.json
-            store.save(&[host_config]).expect("save 应成功");
-
-            // 读取 hosts.json 原始文件内容（字符串形式）
-            let raw_content = fs::read_to_string(&file_path)
-                .expect("hosts.json 应可读取");
-
-            // 断言：文件原始内容中不得包含明文口令字符串
-            prop_assert!(
-                !raw_content.contains(&plaintext_passphrase),
-                "hosts.json 不得包含明文口令，口令: {:?}，文件内容: {}",
-                plaintext_passphrase,
-                raw_content
-            );
-        }
-
-        /// **验证: 需求 1.1, 2.1, 3.1**
-        ///
-        /// Property 3: hosts.json 不含明文凭据（密码与口令同时存在）
-        ///
-        /// 使用 proptest 生成同时含明文密码和口令的 SaveHostRequest，模拟 save_host 落盘逻辑后，
-        /// 读取 hosts.json 原始文件内容（字符串形式），断言：
-        /// 1. 文件内容中不包含原始明文密码字符串
-        /// 2. 文件内容中不包含原始明文口令字符串
-        #[test]
-        fn prop_hosts_json_no_plaintext_both_credentials(request in arb_both_credentials_save_request()) {
-            // 提取明文密码和口令，用于后续断言
-            let plaintext_password = request.password.clone().unwrap();
-            let plaintext_passphrase = request.passphrase.clone().unwrap();
-
-            // 模拟 save_host 的凭据剥离逻辑：构建不含明文的 HostConfig
-            let host_config = build_host_config_without_plaintext(&request);
-
-            // 使用临时文件路径隔离测试，避免测试间干扰
-            let file_path = temp_hosts_file();
-            let store = HostStore::from_file_path(file_path.clone());
-
-            // 将不含明文的 HostConfig 写入 hosts.json
-            store.save(&[host_config]).expect("save 应成功");
-
-            // 读取 hosts.json 原始文件内容（字符串形式）
-            let raw_content = fs::read_to_string(&file_path)
-                .expect("hosts.json 应可读取");
-
-            // 断言：文件原始内容中不得包含明文密码字符串
-            prop_assert!(
-                !raw_content.contains(&plaintext_password),
-                "hosts.json 不得包含明文密码，密码: {:?}，文件内容: {}",
-                plaintext_password,
-                raw_content
-            );
-
-            // 断言：文件原始内容中不得包含明文口令字符串
-            prop_assert!(
-                !raw_content.contains(&plaintext_passphrase),
-                "hosts.json 不得包含明文口令，口令: {:?}，文件内容: {}",
-                plaintext_passphrase,
-                raw_content
-            );
         }
     }
 }
