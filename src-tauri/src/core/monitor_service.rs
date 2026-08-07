@@ -1,7 +1,9 @@
 use crate::core::monitor_worker;
-use crate::models::host::HostConfig;
+use crate::errors::app_error::AppError;
+use crate::models::host::{AuthType, HostConfig};
 use crate::models::monitor::{MonitorSnapshot, TaskInfo, TaskStatus};
 use crate::models::session::TaskStatusEvent;
+use crate::storage::secure_store;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +23,7 @@ pub(crate) struct MonitorTaskHandle {
 ///
 /// 负责管理所有监控任务的生命周期，包括启动、停止和状态查询。
 /// 通过 Arc<Mutex<...>> 保证多线程安全访问。
+#[derive(Clone)]
 pub struct MonitorService {
     /// 活跃监控任务的 HashMap，键为 task_id
     pub(crate) tasks: Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
@@ -45,20 +48,35 @@ impl MonitorService {
     /// # 参数
     /// - `session_id`: 关联的会话 ID
     /// - `host`: 主机配置（不含明文凭据）
-    /// - `password`: 运行时密码（Password 认证时必须提供）
-    /// - `passphrase`: 运行时私钥口令（PrivateKey 认证时可选）
     /// - `app`: Tauri 应用句柄，用于派发事件
     ///
     /// # 返回
-    /// 新建的 TaskInfo，包含 task_id 和初始状态
+    /// 成功返回新建的 TaskInfo；凭据读取失败时不创建任务
     pub fn start_monitoring<R: Runtime>(
         &self,
         session_id: String,
         host: HostConfig,
-        password: Option<String>,
-        passphrase: Option<String>,
         app: AppHandle<R>,
-    ) -> TaskInfo {
+    ) -> Result<TaskInfo, AppError> {
+        // 凭据读取必须先于任务注册，确保失败时不留下幽灵任务或事件。
+        let (password, passphrase) = match host.auth_type {
+            AuthType::Password => {
+                let password_ref = host
+                    .password_ref
+                    .as_deref()
+                    .ok_or_else(|| AppError::InvalidHostConfig("密码引用为空".to_string()))?;
+                (Some(secure_store::get_credential(password_ref)?), None)
+            }
+            AuthType::PrivateKey => {
+                let passphrase = host
+                    .passphrase_ref
+                    .as_deref()
+                    .map(secure_store::get_credential)
+                    .transpose()?;
+                (None, passphrase)
+            }
+        };
+
         // 生成唯一任务 ID
         let task_id = Uuid::new_v4().to_string();
 
@@ -148,7 +166,7 @@ impl MonitorService {
             emit_task_status(&app, &task_id, TaskStatus::Done, None);
         });
 
-        task_info
+        Ok(task_info)
     }
 
     /// 停止指定任务 ID 对应的监控任务
@@ -238,13 +256,42 @@ mod service_tests {
     /// 构造测试用 HostConfig
     fn make_host() -> HostConfig {
         HostConfig {
-            id: "h1".to_string(), name: "test".to_string(),
-            host: "127.0.0.1".to_string(), port: 22,
+            id: "h1".to_string(),
+            name: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
             username: "root".to_string(),
-            auth_type: AuthType::Password,
-            password_ref: Some("ref".to_string()),
-            private_key_path: None, passphrase_ref: None, remark: None,
+            auth_type: AuthType::PrivateKey,
+            password_ref: None,
+            private_key_path: Some("/tmp/test-key".to_string()),
+            passphrase_ref: None,
+            remark: None,
         }
+    }
+
+    /// 缺少密码引用时必须原子失败，不创建监控任务。
+    #[test]
+    fn start_monitoring_rejects_missing_password_before_task_creation() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = MonitorService::new();
+        let mut host = make_host();
+        host.auth_type = AuthType::Password;
+        host.password_ref = None;
+        let emitted_events = Arc::new(AtomicUsize::new(0));
+        let event_counter = emitted_events.clone();
+        app.listen("task:status", move |_| {
+            event_counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let result = service.start_monitoring("session-1".to_string(), host, app.handle().clone());
+
+        assert!(matches!(result, Err(AppError::InvalidHostConfig(_))));
+        assert!(service.tasks.lock().unwrap().is_empty());
+        assert_eq!(emitted_events.load(Ordering::Relaxed), 0);
     }
 
     /// start_monitoring 返回的 TaskInfo 初始状态为 Pending，task_id 非空
@@ -253,13 +300,9 @@ mod service_tests {
         use tauri::test::mock_app;
         let app = mock_app();
         let service = MonitorService::new();
-        let task = service.start_monitoring(
-            "session-1".to_string(),
-            make_host(),
-            Some("pw".to_string()),
-            None,
-            app.handle().clone(),
-        );
+        let task = service
+            .start_monitoring("session-1".to_string(), make_host(), app.handle().clone())
+            .unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
         assert!(!task.task_id.is_empty());
         assert_eq!(task.session_id, Some("session-1".to_string()));
@@ -271,13 +314,9 @@ mod service_tests {
         use tauri::test::mock_app;
         let app = mock_app();
         let service = MonitorService::new();
-        let task = service.start_monitoring(
-            "session-1".to_string(),
-            make_host(),
-            Some("pw".to_string()),
-            None,
-            app.handle().clone(),
-        );
+        let task = service
+            .start_monitoring("session-1".to_string(), make_host(), app.handle().clone())
+            .unwrap();
         service.stop_monitoring(&task.task_id);
         // 任务已从 HashMap 移除
         let tasks = service.tasks.lock().unwrap();

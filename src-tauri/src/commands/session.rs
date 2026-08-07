@@ -1,7 +1,6 @@
 use crate::core::session_manager::SessionManager;
 use crate::models::session::SessionInfo;
 use crate::storage::host_store::HostStore;
-use std::sync::Mutex;
 use tauri::{AppHandle, State};
 
 /// 打开新的 SSH 会话
@@ -17,7 +16,7 @@ use tauri::{AppHandle, State};
 pub fn open_session(
     app: AppHandle,
     host_id: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<SessionInfo, String> {
     // 从持久化存储加载主机配置
     let store = HostStore::new(&app)?;
@@ -29,8 +28,6 @@ pub fn open_session(
 
     // 路由到 session_manager 协调层，由其启动 terminal_service
     session_manager
-        .lock()
-        .map_err(|error| error.to_string())?
         .open_session(app, host)
         .map_err(String::from)
 }
@@ -43,11 +40,9 @@ pub fn open_session(
 pub fn close_session(
     app: AppHandle,
     session_id: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
     session_manager
-        .lock()
-        .map_err(|error| error.to_string())?
         .close_session(&session_id, &app)
         .map_err(String::from)
 }
@@ -59,11 +54,9 @@ pub fn close_session(
 pub fn write_terminal(
     session_id: String,
     data: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
     session_manager
-        .lock()
-        .map_err(|error| error.to_string())?
         .write_terminal(&session_id, data)
         .map_err(String::from)
 }
@@ -77,11 +70,9 @@ pub fn resize_terminal(
     session_id: String,
     cols: u32,
     rows: u32,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
     session_manager
-        .lock()
-        .map_err(|error| error.to_string())?
         .resize_terminal(&session_id, cols, rows)
         .map_err(String::from)
 }
@@ -92,10 +83,7 @@ pub fn resize_terminal(
 /// 状态字段直接来自后端运行时，不依赖前端回写。
 #[tauri::command]
 pub fn list_sessions(
-    session_manager: State<'_, Mutex<SessionManager>>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<Vec<SessionInfo>, String> {
-    Ok(session_manager
-        .lock()
-        .map_err(|error| error.to_string())?
-        .list_sessions())
+    Ok(session_manager.list_sessions())
 }

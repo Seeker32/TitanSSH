@@ -1,6 +1,6 @@
-use crate::core::session_manager::SessionManager;
+use crate::core::sftp_service::SftpService;
 use crate::models::sftp::{RemoteEntry, TransferTask};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 
 /// 列举远程目录内容，按目录优先、名称排序
@@ -12,12 +12,12 @@ use tauri::{AppHandle, State};
 pub fn sftp_list_dir(
     session_id: String,
     path: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
 ) -> Result<Vec<RemoteEntry>, String> {
-    session_manager
+    sftp_service
         .lock()
         .map_err(|e| e.to_string())?
-        .sftp_list_dir(&session_id, &path)
+        .list_dir(&session_id, &path)
         .map_err(|e| e.to_string())
 }
 
@@ -33,12 +33,12 @@ pub fn sftp_download(
     session_id: String,
     remote_path: String,
     local_path: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
 ) -> Result<TransferTask, String> {
-    session_manager
+    sftp_service
         .lock()
         .map_err(|e| e.to_string())?
-        .sftp_download(session_id, remote_path, local_path, app)
+        .enqueue_download(session_id, remote_path, local_path, app)
         .map_err(|e| e.to_string())
 }
 
@@ -54,12 +54,12 @@ pub fn sftp_upload(
     session_id: String,
     local_path: String,
     remote_path: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
 ) -> Result<TransferTask, String> {
-    session_manager
+    sftp_service
         .lock()
         .map_err(|e| e.to_string())?
-        .sftp_upload(session_id, local_path, remote_path, app)
+        .enqueue_upload(session_id, local_path, remote_path, app)
         .map_err(|e| e.to_string())
 }
 
@@ -70,11 +70,11 @@ pub fn sftp_upload(
 #[tauri::command]
 pub fn sftp_cancel_task(
     task_id: String,
-    session_manager: State<'_, Mutex<SessionManager>>,
+    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
 ) -> Result<(), String> {
-    session_manager
+    sftp_service
         .lock()
         .map_err(|e| e.to_string())?
-        .sftp_cancel_task(&task_id);
+        .cancel_task(&task_id);
     Ok(())
 }
