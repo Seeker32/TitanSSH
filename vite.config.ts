@@ -1,65 +1,24 @@
 import { defineConfig } from 'vite';
-import vue from '@vitejs/plugin-vue';
-import path from 'path';
-import AutoImport from 'unplugin-auto-import/vite';
-import Components from 'unplugin-vue-components/vite';
-import { NaiveUiResolver } from 'unplugin-vue-components/resolvers';
+import react from '@vitejs/plugin-react';
+import path from 'node:path';
 
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
-  plugins: [
-    vue(),
-    AutoImport({
-      imports: [
-        'vue',
-        {
-          'naive-ui': ['useDialog', 'useMessage', 'useNotification', 'useLoadingBar'],
-        },
-      ],
-    }),
-    Components({
-      resolvers: [NaiveUiResolver()],
-    }),
-  ],
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
-    },
-  },
-  // prevent vite from obscuring rust errors
+  plugins: [react()],
+  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
   clearScreen: false,
   server: {
-    // make sure this port matches the devUrl port in tauri.conf.json file
     port: 5173,
-    // Tauri expects a fixed port, fail if that port is not available
     strictPort: true,
-    // if the host Tauri is expecting is set, use it
     host: host || false,
-    hmr: host
-      ? {
-          protocol: 'ws',
-          host,
-          port: 1421,
-        }
-      : undefined,
-
-    watch: {
-      // tell vite to ignore watching `src-tauri`
-      ignored: ['**/src-tauri/**'],
-    },
+    hmr: host ? { protocol: 'ws', host, port: 1421 } : undefined,
+    watch: { ignored: ['**/src-tauri/**'] },
   },
-  // Env variables starting with the item of `envPrefix` will be exposed in tauri's source code through `import.meta.env`.
   envPrefix: ['VITE_', 'TAURI_ENV_*'],
   build: {
-    // Tauri uses Chromium on Windows and WebKit on macOS and Linux
-    target:
-      process.env.TAURI_ENV_PLATFORM == 'windows'
-        ? 'chrome105'
-        : 'safari13',
-    // don't minify for debug builds
+    target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
-    // produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
 });

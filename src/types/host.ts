@@ -4,12 +4,12 @@ export interface HostConfig {
   host: string;
   port: number;
   username: string;
-  auth_type: AuthType;
+  authType: AuthType;
   /** 密码在安全存储中的引用键，不含明文 */
-  password_ref?: string;
-  private_key_path?: string;
+  passwordRef?: string;
+  privateKeyPath?: string;
   /** 私钥口令在安全存储中的引用键，不含明文 */
-  passphrase_ref?: string;
+  passphraseRef?: string;
   remark?: string;
 }
 
@@ -20,9 +20,9 @@ export interface SaveHostRequest {
   host: string;
   port: number;
   username: string;
-  auth_type: AuthType;
+  authType: AuthType;
   password?: string;
-  private_key_path?: string;
+  privateKeyPath?: string;
   passphrase?: string;
   remark?: string;
 }

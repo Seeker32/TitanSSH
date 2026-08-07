@@ -1,12 +1,12 @@
 export interface SessionInfo {
-  session_id: string;
-  host_id: string;
+  sessionId: string;
+  hostId: string;
   host: string;
   port: number;
   username: string;
   status: SessionStatus;
   /** Unix 毫秒时间戳 */
-  created_at: number;
+  createdAt: number;
 }
 
 export enum ConnectionPhase {

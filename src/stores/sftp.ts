@@ -1,165 +1,157 @@
-import { defineStore } from 'pinia';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { ref, computed } from 'vue';
+import { create } from 'zustand';
 import type {
-  SftpSessionState, RemoteEntry, TransferTask,
-  SftpProgressEvent, SftpTaskStatusEvent,
+  RemoteEntry,
+  SftpProgressEvent,
+  SftpSessionState,
+  SftpTaskStatusEvent,
+  TransferTask,
 } from '@/types/sftp';
-import { useSessionStore } from './session';
 
-export const useSftpStore = defineStore('sftp', () => {
-  /** 按 session_id 索引的 per-session 状态 */
-  const sessionStates = ref(new Map<string, SftpSessionState>());
+interface SftpState {
+  sessionStates: Map<string, SftpSessionState>;
+  getState: (sessionId: string) => SftpSessionState | undefined;
+  ensureState: (sessionId: string) => SftpSessionState;
+  listDir: (sessionId: string, path: string) => Promise<void>;
+  download: (sessionId: string, remotePath: string, localPath: string) => Promise<void>;
+  upload: (sessionId: string, localPath: string, remotePath: string) => Promise<void>;
+  cancelTask: (taskId: string) => Promise<void>;
+  toggleSelect: (sessionId: string, path: string) => void;
+  clearSession: (sessionId: string) => void;
+  applyProgress: (event: SftpProgressEvent) => void;
+  applyTaskStatus: (event: SftpTaskStatusEvent) => void;
+  initListeners: () => Promise<() => void>;
+}
 
-  /** 当前激活 session 的 SFTP 状态，首页激活时返回 null */
-  const activeState = computed(() => {
-    const sessionStore = useSessionStore();
-    if (sessionStore.activeView === 'home') return null;
-    return sessionStates.value.get(sessionStore.activeView) ?? null;
+/** 创建指定会话的空 SFTP 状态。 */
+function emptySessionState(): SftpSessionState {
+  return {
+    currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null, tasks: new Map(),
+  };
+}
+
+/** 不可变更新指定会话状态，确保 Zustand 能通知订阅者。 */
+function updateSession(
+  set: (updater: (state: SftpState) => Partial<SftpState>) => void,
+  sessionId: string,
+  update: (state: SftpSessionState) => SftpSessionState,
+) {
+  set((state) => {
+    const current = state.sessionStates.get(sessionId) ?? emptySessionState();
+    return { sessionStates: new Map(state.sessionStates).set(sessionId, update(current)) };
   });
+}
 
-  /** 懒初始化指定 session 的状态，若已存在则直接返回 */
-  function ensureState(sessionId: string): SftpSessionState {
-    if (!sessionStates.value.has(sessionId)) {
-      sessionStates.value = new Map(sessionStates.value).set(sessionId, {
-        currentPath: '/',
-        entries: [],
-        selectedPaths: new Set(),
-        loading: false,
-        error: null,
-        tasks: new Map(),
-      });
-    }
-    return sessionStates.value.get(sessionId)!;
-  }
+export const useSftpStore = create<SftpState>((set, get) => ({
+  sessionStates: new Map(),
 
-  /** 获取指定 session 的状态，不存在时返回 undefined */
-  function getState(sessionId: string): SftpSessionState | undefined {
-    return sessionStates.value.get(sessionId);
-  }
+  /** 获取指定会话状态；不存在时返回 undefined。 */
+  getState(sessionId) {
+    return get().sessionStates.get(sessionId);
+  },
 
-  /** 列举远程目录内容，更新 entries 和 currentPath */
-  async function listDir(sessionId: string, path: string): Promise<void> {
-    const state = ensureState(sessionId);
-    state.loading = true;
-    state.error = null;
+  /** 懒初始化并返回指定会话状态。 */
+  ensureState(sessionId) {
+    const existing = get().sessionStates.get(sessionId);
+    if (existing) return existing;
+    const created = emptySessionState();
+    set((state) => ({ sessionStates: new Map(state.sessionStates).set(sessionId, created) }));
+    return created;
+  },
+
+  /** 列举远程目录并更新当前路径、条目与错误状态。 */
+  async listDir(sessionId, path) {
+    updateSession(set, sessionId, (state) => ({ ...state, loading: true, error: null }));
     try {
       const entries = await invoke<RemoteEntry[]>('sftp_list_dir', { sessionId, path });
-      state.entries = Array.isArray(entries) ? entries : [];
-      state.currentPath = path;
-      state.selectedPaths = new Set();
-    } catch (e) {
-      state.error = e instanceof Error ? e.message : String(e);
+      updateSession(set, sessionId, (state) => ({
+        ...state, entries: Array.isArray(entries) ? entries : [], currentPath: path, selectedPaths: new Set(),
+      }));
+    } catch (error) {
+      updateSession(set, sessionId, (state) => ({
+        ...state, error: error instanceof Error ? error.message : String(error),
+      }));
     } finally {
-      state.loading = false;
+      updateSession(set, sessionId, (state) => ({ ...state, loading: false }));
     }
-  }
+  },
 
-  /** 发起下载任务，将返回的 TransferTask 写入 tasks */
-  async function download(sessionId: string, remotePath: string, localPath: string): Promise<void> {
-    const state = ensureState(sessionId);
+  /** 发起下载任务并写入对应会话的任务队列。 */
+  async download(sessionId, remotePath, localPath) {
     const task = await invoke<TransferTask>('sftp_download', { sessionId, remotePath, localPath });
-    state.tasks = new Map(state.tasks).set(task.task_id, task);
-  }
+    updateSession(set, sessionId, (state) => ({ ...state, tasks: new Map(state.tasks).set(task.taskId, task) }));
+  },
 
-  /** 发起上传任务，将返回的 TransferTask 写入 tasks */
-  async function upload(sessionId: string, localPath: string, remotePath: string): Promise<void> {
-    const state = ensureState(sessionId);
+  /** 发起上传任务并写入对应会话的任务队列。 */
+  async upload(sessionId, localPath, remotePath) {
     const task = await invoke<TransferTask>('sftp_upload', { sessionId, localPath, remotePath });
-    state.tasks = new Map(state.tasks).set(task.task_id, task);
-  }
+    updateSession(set, sessionId, (state) => ({ ...state, tasks: new Map(state.tasks).set(task.taskId, task) }));
+  },
 
-  /** 取消指定传输任务 */
-  async function cancelTask(taskId: string): Promise<void> {
+  /** 取消指定传输任务。 */
+  async cancelTask(taskId) {
     await invoke('sftp_cancel_task', { taskId });
-  }
+  },
 
-  /** 切换文件选中状态 */
-  function toggleSelect(sessionId: string, path: string): void {
-    const state = ensureState(sessionId);
-    const next = new Set(state.selectedPaths);
-    if (next.has(path)) {
-      next.delete(path);
-    } else {
-      next.add(path);
-    }
-    state.selectedPaths = next;
-  }
-
-  /** 会话关闭时清理对应 session 的所有状态 */
-  function clearSession(sessionId: string): void {
-    const next = new Map(sessionStates.value);
-    next.delete(sessionId);
-    sessionStates.value = next;
-  }
-
-  /** 处理 sftp:progress 事件，终态任务忽略 */
-  function applyProgress(event: SftpProgressEvent): void {
-    const state = sessionStates.value.get(event.session_id);
-    if (!state) return;
-    const task = state.tasks.get(event.task_id);
-    if (!task) return;
-    const terminal = ['Done', 'Failed', 'Cancelled'] as const;
-    if ((terminal as readonly string[]).includes(task.status)) return;
-    state.tasks = new Map(state.tasks).set(event.task_id, {
-      ...task,
-      transferred_bytes: event.transferred_bytes,
-      speed_bps: event.speed_bps,
+  /** 切换指定远程路径的选中状态。 */
+  toggleSelect(sessionId, path) {
+    updateSession(set, sessionId, (state) => {
+      const selectedPaths = new Set(state.selectedPaths);
+      selectedPaths.has(path) ? selectedPaths.delete(path) : selectedPaths.add(path);
+      return { ...state, selectedPaths };
     });
-  }
+  },
 
-  /** 处理 sftp:task_status 事件；Done 时强制 transferred_bytes = total_bytes */
-  function applyTaskStatus(event: SftpTaskStatusEvent): void {
-    const state = sessionStates.value.get(event.session_id);
-    if (!state) return;
-    const task = state.tasks.get(event.task_id);
-    if (!task) return;
-    const updated: TransferTask = {
-      ...task,
-      status: event.status,
-      error_message: event.error_message,
-    };
-    if (event.status === 'Done') {
-      updated.transferred_bytes = task.total_bytes;
-    }
-    state.tasks = new Map(state.tasks).set(event.task_id, updated);
-  }
-
-  /** 测试辅助：直接注入任务到指定 session（仅测试使用） */
-  function _injectTask(sessionId: string, task: TransferTask): void {
-    const state = ensureState(sessionId);
-    state.tasks = new Map(state.tasks).set(task.task_id, task);
-  }
-
-  /** 注册 sftp:progress 和 sftp:task_status 事件监听器，返回清理函数 */
-  async function initListeners(): Promise<() => void> {
-    const unlistenProgress = await listen<SftpProgressEvent>('sftp:progress', (e) => {
-      applyProgress(e.payload);
+  /** 清理已关闭会话的全部 SFTP 状态。 */
+  clearSession(sessionId) {
+    set((state) => {
+      const sessionStates = new Map(state.sessionStates);
+      sessionStates.delete(sessionId);
+      return { sessionStates };
     });
-    const unlistenStatus = await listen<SftpTaskStatusEvent>('sftp:task_status', (e) => {
-      applyTaskStatus(e.payload);
+  },
+
+  /** 应用传输进度；终态任务不允许进度回退。 */
+  applyProgress(event) {
+    const state = get().sessionStates.get(event.sessionId);
+    const task = state?.tasks.get(event.taskId);
+    if (!state || !task || ['Done', 'Failed', 'Cancelled'].includes(task.status)) return;
+    updateSession(set, event.sessionId, (current) => ({
+      ...current,
+      tasks: new Map(current.tasks).set(event.taskId, {
+        ...task, transferredBytes: event.transferredBytes, speedBps: event.speedBps,
+      }),
+    }));
+  },
+
+  /** 应用传输任务终态；完成时强制进度为总大小。 */
+  applyTaskStatus(event) {
+    const state = get().sessionStates.get(event.sessionId);
+    const task = state?.tasks.get(event.taskId);
+    if (!state || !task) return;
+    updateSession(set, event.sessionId, (current) => ({
+      ...current,
+      tasks: new Map(current.tasks).set(event.taskId, {
+        ...task,
+        status: event.status,
+        errorMessage: event.errorMessage,
+        transferredBytes: event.status === 'Done' ? task.totalBytes : task.transferredBytes,
+      }),
+    }));
+  },
+
+  /** 注册 SFTP 进度和任务状态事件，返回清理函数。 */
+  async initListeners() {
+    const unlistenProgress = await listen<SftpProgressEvent>('sftp:progress', (event) => {
+      get().applyProgress(event.payload);
+    });
+    const unlistenStatus = await listen<SftpTaskStatusEvent>('sftp:task_status', (event) => {
+      get().applyTaskStatus(event.payload);
     });
     return () => {
       unlistenProgress();
       unlistenStatus();
     };
-  }
-
-  return {
-    sessionStates,
-    activeState,
-    getState,
-    ensureState,
-    listDir,
-    download,
-    upload,
-    cancelTask,
-    toggleSelect,
-    clearSession,
-    applyProgress,
-    applyTaskStatus,
-    initListeners,
-    _injectTask,
-  };
-});
+  },
+}));

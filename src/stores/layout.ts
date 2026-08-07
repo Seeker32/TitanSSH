@@ -1,36 +1,32 @@
-import { computed, ref } from 'vue';
-import { defineStore } from 'pinia';
+import { create } from 'zustand';
 
 export const DEFAULT_SIDEBAR_WIDTH = 300;
 export const MIN_SIDEBAR_WIDTH = 220;
 export const MAX_SIDEBAR_WIDTH = 520;
 export const MIN_MAIN_PANEL_WIDTH = 480;
 
-/** 根据视口宽度计算并限制侧栏宽度，确保主内容区保留最小可用空间。 */
-function clampSidebarWidth(width: number, viewportWidth: number) {
-  const maxAllowedWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, viewportWidth - MIN_MAIN_PANEL_WIDTH));
-  return Math.min(Math.max(width, MIN_SIDEBAR_WIDTH), maxAllowedWidth);
+/** 根据视口宽度限制侧栏宽度，确保主内容区可用。 */
+export function clampSidebarWidth(width: number, viewportWidth: number) {
+  const max = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, viewportWidth - MIN_MAIN_PANEL_WIDTH));
+  return Math.min(Math.max(width, MIN_SIDEBAR_WIDTH), max);
 }
 
-export const useLayoutStore = defineStore('layout', () => {
-  const sidebarWidth = ref(DEFAULT_SIDEBAR_WIDTH);
+interface LayoutState {
+  sidebarWidth: number;
+  setSidebarWidth: (width: number) => void;
+  syncSidebarWidthForViewport: (viewportWidth: number) => void;
+}
 
-  const sidebarMaxWidth = computed(() => clampSidebarWidth(MAX_SIDEBAR_WIDTH, window.innerWidth));
+export const useLayoutStore = create<LayoutState>((set, get) => ({
+  sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
 
-  /** 设置左侧栏宽度，并根据当前视口宽度限制最小值与最大值。 */
-  function setSidebarWidth(width: number) {
-    sidebarWidth.value = clampSidebarWidth(width, window.innerWidth);
-  }
+  /** 设置侧栏宽度，并按当前视口限制范围。 */
+  setSidebarWidth(width) {
+    set({ sidebarWidth: clampSidebarWidth(width, window.innerWidth) });
+  },
 
-  /** 在窗口尺寸变化后重新同步左侧栏宽度，避免主内容区被挤压。 */
-  function syncSidebarWidthForViewport(viewportWidth: number) {
-    sidebarWidth.value = clampSidebarWidth(sidebarWidth.value, viewportWidth);
-  }
-
-  return {
-    sidebarWidth,
-    sidebarMaxWidth,
-    setSidebarWidth,
-    syncSidebarWidthForViewport,
-  };
-});
+  /** 窗口变化后重新限制当前侧栏宽度。 */
+  syncSidebarWidthForViewport(viewportWidth) {
+    set({ sidebarWidth: clampSidebarWidth(get().sidebarWidth, viewportWidth) });
+  },
+}));
