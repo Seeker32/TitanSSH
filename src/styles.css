@@ -1,18 +1,16 @@
 :root {
+  /* slate 平铺调色板（light）：去渐变光晕与玻璃拟态，高密度低阴影 */
   --color-bg-primary: #f8fafc;
   --color-bg-secondary: #e2e8f0;
-  --color-bg-gradient: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
-  --color-glow-1: rgba(99, 102, 241, 0.1);
-  --color-glow-2: rgba(16, 185, 129, 0.08);
   --color-text-primary: #0f172a;
-  --color-text-secondary: #64748b;
+  --color-text-secondary: #475569;
   --color-text-tertiary: #94a3b8;
   --color-accent: #059669;
   --color-accent-light: #10b981;
-  --color-card-bg: rgba(255, 255, 255, 0.6);
-  --color-card-bg-hover: rgba(255, 255, 255, 0.8);
-  --color-panel-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0.5));
-  --color-border: rgba(148, 163, 184, 0.25);
+  --color-card-bg: #ffffff;
+  --color-card-bg-hover: #f1f5f9;
+  --color-panel-bg: #ffffff;
+  --color-border: rgba(100, 116, 139, 0.25);
   --color-border-focus: rgba(5, 150, 105, 0.4);
   --color-status-connecting: #f59e0b;
   --color-status-connected: #10b981;
@@ -25,21 +23,19 @@
 }
 
 [data-theme="dark"] {
+  /* slate 平铺调色板（dark） */
   --color-bg-primary: #0f172a;
   --color-bg-secondary: #020617;
-  --color-bg-gradient: linear-gradient(180deg, #0f172a 0%, #020617 100%);
-  --color-glow-1: rgba(56, 189, 248, 0.15);
-  --color-glow-2: rgba(16, 185, 129, 0.1);
   --color-text-primary: #f1f5f9;
   --color-text-secondary: #94a3b8;
   --color-text-tertiary: #64748b;
   --color-accent: #10b981;
   --color-accent-light: #6ee7b7;
-  --color-card-bg: rgba(255, 255, 255, 0.03);
-  --color-card-bg-hover: rgba(255, 255, 255, 0.05);
-  --color-panel-bg: linear-gradient(180deg, rgba(20, 30, 42, 0.92), rgba(11, 17, 24, 0.96));
-  --color-border: rgba(148, 163, 184, 0.15);
-  --color-border-focus: rgba(16, 185, 129, 0.4);
+  --color-card-bg: #1e293b;
+  --color-card-bg-hover: #293548;
+  --color-panel-bg: #131c2c;
+  --color-border: rgba(148, 163, 184, 0.16);
+  --color-border-focus: rgba(16, 185, 129, 0.45);
   --color-status-connecting: #f3c467;
   --color-status-connected: #7de0ac;
   --color-danger: #f39b9b;
@@ -49,8 +45,7 @@
 html, body, #app { margin: 0; min-height: 100%; }
 body {
   color: var(--color-text-primary);
-  background: radial-gradient(circle at top left, var(--color-glow-1), transparent 28%),
-    radial-gradient(circle at top right, var(--color-glow-2), transparent 24%), var(--color-bg-gradient);
+  background-color: var(--color-bg-primary);
 }
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }

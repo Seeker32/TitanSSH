@@ -790,6 +790,7 @@ mod tests {
             private_key_path: None,
             passphrase_ref: None,
             remark: None,
+            group: String::new(),
         }
     }
 
@@ -889,6 +890,7 @@ mod tests {
                 private_key_path,
                 passphrase_ref: passphrase.as_ref().map(|_| "env-passphrase".to_string()),
                 remark: None,
+                group: String::new(),
             },
             password,
             passphrase,

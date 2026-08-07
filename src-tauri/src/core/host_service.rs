@@ -134,6 +134,7 @@ impl HostConfigService {
                 private_key_path: request.private_key_path.clone(),
                 passphrase_ref,
                 remark: request.remark.clone(),
+                group: request.group.clone(),
             };
 
             // 复用已加载的主机列表,避免重复读取文件
@@ -363,6 +364,7 @@ mod tests {
             private_key_path: None,
             passphrase: None,
             remark: None,
+            group: String::new(),
         }
     }
 
@@ -797,6 +799,7 @@ mod tests {
                     private_key_path: None,
                     passphrase: None,
                     remark: None,
+                    group: String::new(),
                 },
             )
     }
@@ -824,6 +827,7 @@ mod tests {
                     private_key_path: Some(private_key_path),
                     passphrase: Some(passphrase),
                     remark: None,
+                    group: String::new(),
                 },
             )
     }
@@ -853,6 +857,7 @@ mod tests {
                         private_key_path: Some(private_key_path),
                         passphrase: Some(passphrase),
                         remark: None,
+                        group: String::new(),
                     }
                 },
             )
@@ -939,6 +944,7 @@ mod tests {
                     private_key_path: None,
                     passphrase: None,
                     remark: None,
+                    group: String::new(),
                 };
                 let (_, service) = test_service();
                 prop_assert!(

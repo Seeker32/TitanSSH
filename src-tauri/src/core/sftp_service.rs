@@ -601,7 +601,9 @@ impl SftpService {
     ) {
         let semaphore = get_semaphore();
         let service = self.clone();
-        tokio::spawn(async move {
+        // 用 tauri 的 async_runtime 而非裸 tokio::spawn：同步 Tauri command 线程没有
+        // reactor 上下文，裸 spawn 会 panic；async_runtime 无全局 runtime 时自动回退到独立线程 runtime
+        tauri::async_runtime::spawn(async move {
             // 等待信号量 permit（全局最多 5 个并发）
             let _permit = semaphore.acquire().await.unwrap();
 
@@ -883,6 +885,7 @@ mod tests {
             private_key_path: None,
             passphrase_ref: None,
             remark: None,
+            group: String::new(),
         }
     }
 
@@ -1553,6 +1556,34 @@ mod tests {
         assert_eq!(
             wait_for_terminal(&service, &task.task_id),
             SftpTaskStatus::Failed
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 同步上下文（无 tokio runtime，模拟同步 Tauri command 线程）发起上传：
+    /// 不得 panic，且任务最终由 worker 迁移到 Done。
+    #[test]
+    fn sync_context_enqueue_upload_completes_without_runtime() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![1u8, 2, 3])));
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path = std::env::temp_dir().join(format!("titan-sync-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
         );
         let _ = std::fs::remove_file(&local_path);
     }

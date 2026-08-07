@@ -1,3 +1,4 @@
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
@@ -130,6 +131,38 @@ describe('React components', () => {
     expect(password).toHaveValue('');
     await user.type(password, 'new-secret');
     await user.click(screen.getByText('保存连接'));
-    expect(save).toHaveBeenCalledWith(expect.objectContaining({ authType: AuthType.Password, password: 'new-secret', privateKeyPath: undefined }));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ authType: AuthType.Password, password: 'new-secret', privateKeyPath: undefined, group: 'production' }));
+  });
+
+  it('私钥模式通过系统选择器选择私钥路径并回填保存', async () => {
+    const user = userEvent.setup();
+    const save = vi.fn();
+    vi.mocked(openFileDialog).mockResolvedValueOnce('/Users/me/.ssh/id_ed25519');
+    render(<HostEditorDialog open editingHost={makeHost()} onClose={vi.fn()} onSave={save} />);
+    expect(screen.queryByRole('button', { name: /浏览/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('combobox'));
+    await user.click(await screen.findByText('私钥'));
+    await user.click(screen.getByRole('button', { name: /浏览/ }));
+    expect(await screen.findByDisplayValue('/Users/me/.ssh/id_ed25519')).toBeInTheDocument();
+    await user.click(screen.getByText('保存连接'));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ authType: AuthType.PrivateKey, privateKeyPath: '/Users/me/.ssh/id_ed25519' }));
+    expect(openFileDialog).toHaveBeenCalledWith({ multiple: false, directory: false, title: '选择私钥文件' });
+  });
+
+  it('取消选择器时保持私钥路径为空并拦截保存', async () => {
+    const user = userEvent.setup();
+    const save = vi.fn();
+    vi.mocked(openFileDialog).mockResolvedValueOnce(null);
+    render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} onClose={vi.fn()} onSave={save} />);
+    await user.click(screen.getByRole('button', { name: /浏览/ }));
+    expect(screen.getByPlaceholderText('点击浏览选择私钥文件')).toHaveValue('');
+    fireEvent.click(screen.getByText('保存连接'));
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('私钥路径为空时禁用保存并显示引导文案', () => {
+    render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(screen.getByText('请先选择私钥文件')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /保存连接/ })).toBeDisabled();
   });
 });

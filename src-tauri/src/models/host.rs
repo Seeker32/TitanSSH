@@ -20,6 +20,9 @@ pub struct HostConfig {
     #[serde(alias = "passphrase_ref")]
     pub passphrase_ref: Option<String>,
     pub remark: Option<String>,
+    /// 分组名，空串表示"未分组"
+    #[serde(default)]
+    pub group: String,
 }
 
 /// 保存主机请求，仅用于接收前端提交的明文凭据，后端落盘前必须清除明文字段
@@ -40,6 +43,9 @@ pub struct SaveHostRequest {
     /// 明文私钥口令，仅在请求中存在，不得落盘
     pub passphrase: Option<String>,
     pub remark: Option<String>,
+    /// 分组名，空串表示"未分组"
+    #[serde(default)]
+    pub group: String,
 }
 
 /// 认证类型枚举

@@ -307,6 +307,7 @@ mod loop_tests {
             private_key_path: None,
             passphrase_ref: None,
             remark: None,
+            group: String::new(),
         }
     }
 

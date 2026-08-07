@@ -7,7 +7,7 @@ test.beforeEach(async ({ page }) => {
     const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
     let callbackId = 0;
     let listenerId = 0;
-    const host = { id: 'host-1', name: 'prod', host: '10.0.0.8', port: 22, username: 'root', authType: 'Password', passwordRef: 'secret-ref', remark: 'primary' };
+    const host = { id: 'host-1', name: 'prod', host: '10.0.0.8', port: 22, username: 'root', authType: 'Password', passwordRef: 'secret-ref', remark: 'primary', group: '' };
     const session = { sessionId: 'session-1', hostId: 'host-1', host: '10.0.0.8', port: 22, username: 'root', status: 'Connecting', createdAt: Date.now() };
     const task = { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: 'Pending', createdAt: Date.now() };
     const transfer = { taskId: 'transfer-1', sessionId: 'session-1', transferType: 'Download', remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'syslog', totalBytes: 100, transferredBytes: 0, speedBps: 0, status: 'Pending', errorMessage: null, createdAt: Date.now() };
@@ -53,6 +53,21 @@ test.beforeEach(async ({ page }) => {
       },
     });
   });
+});
+
+test('视觉基础：平铺 slate 背景且主题切换即时生效', async ({ page }) => {
+  await page.goto('/');
+  const style = await page.evaluate(() => {
+    const body = document.body;
+    return { bgImage: getComputedStyle(body).backgroundImage, theme: document.documentElement.dataset.theme };
+  });
+  expect(style.bgImage).toBe('none');
+  const before = style.theme;
+  await page.getByTestId('theme-toggle').click();
+  const after = await page.evaluate(() => document.documentElement.dataset.theme);
+  expect(after).not.toBe(before);
+  const stillFlat = await page.evaluate(() => getComputedStyle(document.body).backgroundImage);
+  expect(stillFlat).toBe('none');
 });
 
 test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) => {

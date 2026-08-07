@@ -1,5 +1,6 @@
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useEffect, useState } from 'react';
-import { Form, Input, InputNumber, Modal, Select } from 'antd';
+import { Button, Form, Input, InputNumber, Modal, Select } from 'antd';
 import { AuthType, type HostConfig, type SaveHostRequest } from '@/types/host';
 
 interface Props {
@@ -22,6 +23,7 @@ function formFromHost(host: HostConfig | null): SaveHostRequest {
     privateKeyPath: host?.privateKeyPath ?? '',
     passphrase: '',
     remark: host?.remark ?? '',
+    group: host?.group ?? '',
   };
 }
 
@@ -38,6 +40,12 @@ export default function HostEditorDialog({ open, editingHost, onClose, onSave }:
     setForm((current) => ({ ...current, [key]: value }));
   }
 
+  /** 打开系统文件选择器选择私钥文件；取消选择时保持原值不变。 */
+  async function pickPrivateKey() {
+    const path = await openFileDialog({ multiple: false, directory: false, title: '选择私钥文件' });
+    if (typeof path === 'string') update('privateKeyPath', path);
+  }
+
   /** 提交表单并清除当前认证方式不使用的凭据字段。 */
   function submit() {
     onSave({
@@ -51,7 +59,8 @@ export default function HostEditorDialog({ open, editingHost, onClose, onSave }:
 
   const textProps = { autoCapitalize: 'none', autoComplete: 'off', spellCheck: false };
   return <Modal open={open} title={editingHost ? '编辑连接' : '新建连接'} onCancel={onClose}
-    onOk={submit} okText="保存连接" cancelText="取消" width={720} destroyOnHidden>
+    onOk={submit} okText="保存连接" cancelText="取消" width={720} destroyOnHidden
+    okButtonProps={{ disabled: form.authType === AuthType.PrivateKey && !form.privateKeyPath }}>
     <Form layout="vertical" className="host-form">
       <div className="form-grid">
         <Form.Item label="名称"><Input {...textProps} value={form.name} placeholder="生产服务器" onChange={(event) => update('name', event.target.value)} /></Form.Item>
@@ -62,8 +71,8 @@ export default function HostEditorDialog({ open, editingHost, onClose, onSave }:
           options={[{ label: '密码', value: AuthType.Password }, { label: '私钥', value: AuthType.PrivateKey }]} /></Form.Item>
         {form.authType === AuthType.Password ? <Form.Item label="密码"><Input.Password {...textProps} value={form.password}
           placeholder="留空则保持原密码不变" onChange={(event) => update('password', event.target.value)} /></Form.Item>
-          : <Form.Item label="私钥路径"><Input {...textProps} value={form.privateKeyPath}
-            placeholder="~/.ssh/id_rsa" onChange={(event) => update('privateKeyPath', event.target.value)} /></Form.Item>}
+          : <Form.Item label="私钥路径" help={!form.privateKeyPath ? '请先选择私钥文件' : undefined}><Input {...textProps} readOnly value={form.privateKeyPath}
+            placeholder="点击浏览选择私钥文件" addonAfter={<Button onClick={pickPrivateKey}>浏览…</Button>} /></Form.Item>}
         {form.authType === AuthType.PrivateKey && <Form.Item label="私钥口令"><Input.Password {...textProps}
           value={form.passphrase} placeholder="留空则保持原口令不变" onChange={(event) => update('passphrase', event.target.value)} /></Form.Item>}
         <Form.Item label="备注" className="form-full"><Input.TextArea {...textProps} rows={3} value={form.remark}

@@ -807,6 +807,7 @@ mod integration_tests {
             private_key_path: None,
             passphrase_ref: None,
             remark: None,
+            group: String::new(),
         }
     }
 
@@ -823,6 +824,7 @@ mod integration_tests {
             private_key_path: key_path.map(|s| s.to_string()),
             passphrase_ref: passphrase_ref.map(|s| s.to_string()),
             remark: None,
+            group: String::new(),
         }
     }
 

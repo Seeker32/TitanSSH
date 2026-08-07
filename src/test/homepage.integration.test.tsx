@@ -69,6 +69,17 @@ describe('HomePage integration', () => {
     expect(eventNames.filter((name) => name === 'terminal:data')).toHaveLength(0);
   });
 
+  it('主题切换按钮使用 lucide 图标并可切换主题', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));
+    const toggle = document.querySelector('[data-testid="theme-toggle"]')!;
+    expect(toggle.querySelector('svg')).not.toBeNull();
+    const before = document.documentElement.dataset.theme;
+    await user.click(toggle);
+    expect(document.documentElement.dataset.theme).not.toBe(before);
+  });
+
   it('拖动侧栏时更新并限制宽度', async () => {
     const { container } = render(<HomePage />);
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));

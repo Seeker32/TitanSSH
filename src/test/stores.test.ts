@@ -36,6 +36,7 @@ describe('Zustand stores', () => {
     await useHostStore.getState().saveHost({ ...host, authType: host.authType, password: 'secret' });
     await useHostStore.getState().deleteHost(host.id);
     expect(mockInvoke).toHaveBeenNthCalledWith(1, 'list_hosts');
+    expect(mockInvoke).toHaveBeenNthCalledWith(2, 'save_host', { request: expect.objectContaining({ group: 'production' }) });
     expect(mockInvoke).toHaveBeenNthCalledWith(3, 'delete_host', { hostId: host.id });
     expect(useHostStore.getState().hosts).toEqual([]);
   });

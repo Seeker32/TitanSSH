@@ -15,6 +15,7 @@ export function makeHost(overrides: Partial<HostConfig> = {}): HostConfig {
     authType: AuthType.Password,
     passwordRef: 'titanssh-host-1-password',
     remark: 'primary',
+    group: 'production',
     ...overrides,
   };
 }
@@ -30,6 +31,7 @@ export function makeSaveHostRequest(overrides: Partial<SaveHostRequest> = {}): S
     authType: AuthType.Password,
     password: 'secret',
     remark: 'primary',
+    group: 'production',
     ...overrides,
   };
 }

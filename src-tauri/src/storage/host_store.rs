@@ -106,6 +106,7 @@ mod tests {
             private_key_path: None,
             passphrase_ref: None,
             remark: Some("primary".to_string()),
+            group: "production".to_string(),
         }
     }
 
@@ -160,9 +161,10 @@ mod tests {
             arb_auth_type(),                             // auth_type
             proptest::option::of(arb_nonempty_string()), // private_key_path
             proptest::option::of(arb_nonempty_string()), // remark
+            arb_nonempty_string(),                       // group
         )
             .prop_map(
-                |(id, name, host, port, username, auth_type, private_key_path, remark)| {
+                |(id, name, host, port, username, auth_type, private_key_path, remark, group)| {
                     // 敏感字段仅以引用键形式存在，格式为 titanssh-<id>-<field>
                     let password_ref = if auth_type == AuthType::Password {
                         Some(format!("titanssh-{}-password", id))
@@ -185,6 +187,7 @@ mod tests {
                         private_key_path,
                         passphrase_ref,
                         remark,
+                        group,
                     }
                 },
             )
@@ -220,6 +223,7 @@ mod tests {
             prop_assert_eq!(&loaded_host.auth_type, &host.auth_type, "auth_type 应一致");
             prop_assert_eq!(&loaded_host.private_key_path, &host.private_key_path, "private_key_path 应一致");
             prop_assert_eq!(&loaded_host.remark, &host.remark, "remark 应一致");
+            prop_assert_eq!(&loaded_host.group, &host.group, "group 应一致");
 
             // 验证敏感字段仅以引用形式存在（不含明文密码或口令）
             // password_ref 若存在，必须是引用键格式（以 "titanssh-" 开头），不得是明文密码

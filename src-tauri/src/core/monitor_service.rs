@@ -288,6 +288,7 @@ mod service_tests {
             private_key_path: Some("/tmp/test-key".to_string()),
             passphrase_ref: None,
             remark: None,
+            group: String::new(),
         }
     }
 

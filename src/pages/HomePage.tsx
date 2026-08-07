@@ -1,3 +1,4 @@
+import { Moon, Sun } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Typography } from 'antd';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
@@ -140,7 +141,8 @@ export default function HomePage() {
     <aside className="sidebar" style={{ width: sidebarWidth }}>
       <div className="sidebar-header">
         <Typography.Text type="secondary" className="brand">Titan SSH</Typography.Text>
-        <Button type="text" size="small" onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? '🌙' : '☀️'}</Button>
+        <Button type="text" size="small" data-testid="theme-toggle" aria-label="切换主题"
+          onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}</Button>
       </div>
       <ServerStatusPanel snapshot={snapshot} />
     </aside>

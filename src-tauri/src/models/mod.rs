@@ -95,4 +95,17 @@ mod tests {
         assert_eq!(host.auth_type, AuthType::Password);
         assert_eq!(host.password_ref.as_deref(), Some("password-key"));
     }
+
+    /// 验证旧版本写入的主机配置缺少 group 字段时仍可读取，并补默认空串（"未分组"）。
+    #[test]
+    fn host_config_defaults_missing_group_field() {
+        let host: HostConfig = serde_json::from_value(json!({
+            "id": "host-1", "name": "prod", "host": "127.0.0.1", "port": 22, "username": "root",
+            "authType": "Password", "passwordRef": null, "privateKeyPath": null,
+            "passphraseRef": null, "remark": null
+        }))
+        .unwrap();
+
+        assert_eq!(host.group, "");
+    }
 }
