@@ -38,27 +38,13 @@ pub struct SessionManager {
     sessions: Mutex<HashMap<String, SessionHandle>>,
     /// 独立监控服务，负责管理所有监控任务的生命周期（单一实现）
     monitor_service: MonitorService,
-    /// SFTP 服务，Arc<Mutex> 包装以支持跨线程注册 session
-    sftp_service: Arc<Mutex<SftpService>>,
-}
-
-/// 仅为仍处于活动状态的 Session 注册 SSH 连接；关闭标志与 SFTP 锁共同阻止迟到注册。
-fn register_sftp_session_if_active(
-    sftp_service: &Arc<Mutex<SftpService>>,
-    session_id: String,
-    ssh_session: Arc<Mutex<ssh2::Session>>,
-    shutdown: &AtomicBool,
-) {
-    if let Ok(mut service) = sftp_service.lock()
-        && !shutdown.load(Ordering::Acquire)
-    {
-        service.register_session(session_id, ssh_session);
-    }
+    /// File Transfer module，共享 clone 只复制内部 registry 引用。
+    sftp_service: SftpService,
 }
 
 impl SessionManager {
     /// 使用共享 Monitoring 与 File Transfer 状态创建会话管理器实例
-    pub fn new(monitor_service: MonitorService, sftp_service: Arc<Mutex<SftpService>>) -> Self {
+    pub fn new(monitor_service: MonitorService, sftp_service: SftpService) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             monitor_service,
@@ -78,7 +64,11 @@ impl SessionManager {
     ///
     /// # 返回
     /// 成功返回 SessionInfo，失败返回 AppError
-    pub fn open_session(&self, app: AppHandle, host: HostConfig) -> Result<SessionInfo, AppError> {
+    pub fn open_session<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        host: HostConfig,
+    ) -> Result<SessionInfo, AppError> {
         // 生成唯一会话 ID
         let session_id = Uuid::new_v4().to_string();
 
@@ -118,9 +108,11 @@ impl SessionManager {
                 },
             );
 
-        // 启动 terminal_service 工作线程（SSH 连接、PTY、终端 IO）
-        // 创建 SSH session 回传通道，连接成功后将 Arc<Mutex<Session>> 注册到 sftp_service
-        let (ssh_tx, ssh_rx) = std::sync::mpsc::sync_channel::<Arc<Mutex<ssh2::Session>>>(1);
+        // 与 Terminal 并行启动独立 SFTP 连接；registry 在返回前已可等待连接结果。
+        self.sftp_service
+            .register_session(session_id.clone(), host.clone());
+
+        // 启动 terminal_service 工作线程（独立 SSH 连接、PTY、终端 IO）
         terminal_service::start_terminal_session(
             app,
             host,
@@ -128,20 +120,7 @@ impl SessionManager {
             command_rx,
             shutdown.clone(),
             runtime_status,
-            Some(ssh_tx),
         );
-
-        // 在后台线程中等待 SSH session 回传，成功后注册到 sftp_service
-        // 使用独立线程避免阻塞 open_session 调用方
-        let sftp_service = self.sftp_service.clone();
-        let sid = session_id.clone();
-        std::thread::spawn(move || {
-            // 最多等待 30s（SSH 连接超时时间内）
-            if let Ok(ssh_session) = ssh_rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                // SSH 连接成功且 Session 仍活动时注册，关闭后的迟到结果直接丢弃
-                register_sftp_session_if_active(&sftp_service, sid, ssh_session, &shutdown);
-            }
-        });
 
         Ok(session_info)
     }
@@ -206,9 +185,7 @@ impl SessionManager {
         // 停止该会话的全部监控任务，teardown 不再依赖前端调用顺序
         self.monitor_service.stop_session(session_id);
         // 清理 SFTP 状态，取消所有 Pending/Running 任务并推送 sftp:task_status = Cancelled
-        if let Ok(mut svc) = self.sftp_service.lock() {
-            svc.cleanup_session(session_id, app);
-        }
+        self.sftp_service.cleanup_session(session_id, app);
         Ok(())
     }
 
@@ -247,41 +224,10 @@ impl SessionManager {
 mod tests {
     use super::*;
     use crate::models::host::{AuthType, HostConfig};
-    use tauri::Manager;
 
     /// 创建共享运行时状态一致的 SessionManager。
     fn make_manager() -> SessionManager {
-        SessionManager::new(
-            MonitorService::new(),
-            Arc::new(Mutex::new(SftpService::new())),
-        )
-    }
-
-    /// File Transfer 持锁时，Terminal 命令仍可通过独立 Session 运行时状态立即执行。
-    #[test]
-    fn file_transfer_lock_does_not_block_terminal_commands() {
-        use tauri::test::mock_app;
-
-        let app = mock_app();
-        let monitor_service = MonitorService::new();
-        let sftp_service = Arc::new(Mutex::new(SftpService::new()));
-        app.manage(SessionManager::new(
-            monitor_service.clone(),
-            sftp_service.clone(),
-        ));
-        app.manage(monitor_service);
-        app.manage(sftp_service);
-
-        let file_transfer = app.state::<Arc<Mutex<SftpService>>>();
-        let _file_transfer_guard = file_transfer.lock().unwrap();
-        let result = app
-            .state::<SessionManager>()
-            .write_terminal("missing-session", "input".to_string());
-
-        assert!(matches!(
-            result,
-            Err(AppError::SessionNotFound(session_id)) if session_id == "missing-session"
-        ));
+        SessionManager::new(MonitorService::new(), SftpService::new())
     }
 
     /// 构造测试用 HostConfig
@@ -344,6 +290,26 @@ mod tests {
         assert_eq!(sessions[0].status, SessionStatus::Connected);
     }
 
+    /// Session 打开返回前必须注册 SFTP 状态槽，真实连接在后台并行进行。
+    #[test]
+    fn open_session_registers_sftp_connection_slot() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let sftp_service = SftpService::with_connector(|_| {
+            Err(AppError::SshConnectionError(
+                "expected test failure".to_string(),
+            ))
+        });
+        let manager = SessionManager::new(MonitorService::new(), sftp_service.clone());
+
+        let session = manager
+            .open_session(app.handle().clone(), make_host("host-1"))
+            .unwrap();
+
+        assert!(sftp_service.has_session(&session.session_id));
+    }
+
     /// close_session 必须在后端一次性停止 Terminal、Monitoring 并清理 File Transfer。
     #[test]
     fn close_session_tears_down_all_backend_work() {
@@ -353,7 +319,11 @@ mod tests {
 
         let app = mock_app();
         let monitor_service = MonitorService::new();
-        let sftp_service = Arc::new(Mutex::new(SftpService::new()));
+        let sftp_service = SftpService::with_connector(|_| {
+            Err(AppError::SshConnectionError(
+                "expected test failure".to_string(),
+            ))
+        });
         let manager = SessionManager::new(monitor_service.clone(), sftp_service.clone());
         let session_id = "session-close-all".to_string();
         let terminal_shutdown = Arc::new(AtomicBool::new(false));
@@ -391,10 +361,7 @@ mod tests {
                 shutdown: monitor_shutdown.clone(),
             },
         );
-        sftp_service.lock().unwrap().register_session(
-            session_id.clone(),
-            Arc::new(Mutex::new(ssh2::Session::new().unwrap())),
-        );
+        sftp_service.register_session(session_id.clone(), make_host("host-1"));
 
         manager
             .close_session(&session_id, &app.handle().clone())
@@ -403,34 +370,6 @@ mod tests {
         assert!(terminal_shutdown.load(Ordering::Relaxed));
         assert!(monitor_shutdown.load(Ordering::Acquire));
         assert!(monitor_service.tasks.lock().unwrap().is_empty());
-        assert!(
-            !sftp_service
-                .lock()
-                .unwrap()
-                .handles
-                .contains_key(&session_id)
-        );
-    }
-
-    /// 已关闭 Session 的迟到 SSH 结果不得重新注册 File Transfer。
-    #[test]
-    fn closed_session_rejects_late_sftp_registration() {
-        let sftp_service = Arc::new(Mutex::new(SftpService::new()));
-        let shutdown = Arc::new(AtomicBool::new(true));
-
-        register_sftp_session_if_active(
-            &sftp_service,
-            "closed-session".to_string(),
-            Arc::new(Mutex::new(ssh2::Session::new().unwrap())),
-            &shutdown,
-        );
-
-        assert!(
-            !sftp_service
-                .lock()
-                .unwrap()
-                .handles
-                .contains_key("closed-session")
-        );
+        assert!(!sftp_service.has_session(&session_id));
     }
 }

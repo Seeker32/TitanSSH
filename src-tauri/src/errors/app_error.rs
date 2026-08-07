@@ -30,9 +30,9 @@ pub enum AppError {
     #[error("IO 错误: {0}")]
     IoError(#[from] std::io::Error),
 
-    /// ssh2 库底层错误（握手失败、通道错误等），由 ssh2::Error 自动转换
+    /// SSH 协议错误文本；第三方错误类型必须在 transport module 内转换
     #[error("SSH 协议错误: {0}")]
-    Ssh2Error(#[from] ssh2::Error),
+    SshProtocolError(String),
 
     /// OS 安全存储访问失败（Keychain / Credential Manager / Secret Service）
     #[error("安全存储错误: {0}")]
@@ -63,5 +63,18 @@ pub enum AppError {
 impl From<AppError> for String {
     fn from(error: AppError) -> Self {
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    /// SSH 协议错误只保存稳定文本，不向所属 module 外泄漏 ssh2 错误类型。
+    #[test]
+    fn ssh_protocol_error_contains_only_stable_text() {
+        let error = AppError::SshProtocolError("channel failed".to_string());
+
+        assert_eq!(error.to_string(), "SSH 协议错误: channel failed");
     }
 }

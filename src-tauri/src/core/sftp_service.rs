@@ -1,9 +1,13 @@
+use crate::core::ssh_transport::{self, SftpTransport};
 use crate::errors::app_error::AppError;
-use crate::models::sftp::{RemoteEntry, SftpProgressEvent, SftpTaskStatus, SftpTaskStatusEvent, TransferTask, TransferType};
-use ssh2::Session;
+use crate::models::host::{AuthType, HostConfig};
+use crate::models::sftp::{
+    RemoteEntry, SftpProgressEvent, SftpTaskStatus, SftpTaskStatusEvent, TransferTask, TransferType,
+};
+use crate::storage::secure_store;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -13,29 +17,9 @@ static TRANSFER_SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::Once
 
 /// 获取全局传输信号量
 fn get_semaphore() -> Arc<Semaphore> {
-    TRANSFER_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(5))).clone()
-}
-
-/// 在阻塞模式下执行 SFTP 操作，完成后恢复非阻塞模式
-///
-/// terminal_service 将 session 设为非阻塞以支持终端 IO 循环，
-/// 但 libssh2 的 SFTP 子通道建立和文件操作需要阻塞模式才能正常完成。
-/// 此函数在持有 Mutex 锁期间临时切换为阻塞模式，操作完成后恢复，
-/// 确保终端 IO 线程下次获取锁时 session 仍处于非阻塞状态。
-///
-/// # 参数
-/// - `ssh`: 已锁定的 SSH session MutexGuard
-/// - `f`: 在阻塞模式下执行的闭包，返回 Result<T, E>
-fn with_blocking_session<T, E, F>(ssh: &std::sync::MutexGuard<Session>, f: F) -> Result<T, E>
-where
-    F: FnOnce() -> Result<T, E>,
-{
-    // 切换为阻塞模式，确保 SFTP 子通道建立和 IO 操作不返回 WouldBlock
-    ssh.set_blocking(true);
-    let result = f();
-    // 无论成功或失败，恢复非阻塞模式供终端 IO 循环使用
-    ssh.set_blocking(false);
-    result
+    TRANSFER_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(5)))
+        .clone()
 }
 
 /// 取消令牌，用于通知传输任务退出
@@ -59,41 +43,198 @@ impl CancelToken {
     }
 }
 
-/// 单个 session 的 SFTP 句柄，包含 SSH session 引用和任务取消令牌集合
-pub struct SftpHandle {
-    /// SSH session（Arc<Mutex> 以支持多任务共享）
-    pub ssh_session: Arc<Mutex<Session>>,
-    /// 任务取消令牌集合，按 task_id 索引
-    pub cancel_tokens: HashMap<String, CancelToken>,
+type SftpConnector = Arc<dyn Fn(&HostConfig) -> Result<SftpTransport, AppError> + Send + Sync>;
+
+enum ConnectionState {
+    Idle,
+    Connecting,
+    Ready(Arc<Mutex<SftpTransport>>),
+    Failed(String),
+    Closed,
 }
 
-/// SFTP 服务，管理所有 session 的 SFTP 句柄
-pub struct SftpService {
-    /// 按 session_id 索引的 SFTP 句柄
-    pub handles: HashMap<String, SftpHandle>,
-    /// 所有传输任务，按 task_id 索引
-    pub tasks: HashMap<String, TransferTask>,
+/// 单个 Session 的 SFTP 连接状态；Condvar 让首个请求等待并行 eager 建连。
+struct SftpConnection {
+    host: HostConfig,
+    connector: SftpConnector,
+    state: Mutex<ConnectionState>,
+    ready: Condvar,
 }
 
-impl SftpService {
-    /// 创建新的 SFTP 服务实例
-    pub fn new() -> Self {
+impl SftpConnection {
+    /// 创建尚未开始连接的状态槽。
+    fn new(host: HostConfig, connector: SftpConnector) -> Self {
         Self {
-            handles: HashMap::new(),
-            tasks: HashMap::new(),
+            host,
+            connector,
+            state: Mutex::new(ConnectionState::Idle),
+            ready: Condvar::new(),
         }
     }
 
-    /// 注册 SSH session，供后续 SFTP 操作使用
-    ///
-    /// # 参数
-    /// - `session_id`: 会话 ID
-    /// - `ssh_session`: 已建立的 SSH session（Arc<Mutex> 包装）
-    pub fn register_session(&mut self, session_id: String, ssh_session: Arc<Mutex<Session>>) {
-        self.handles.insert(session_id, SftpHandle {
-            ssh_session,
-            cancel_tokens: HashMap::new(),
+    /// 在后台启动首次连接；Session 打开不会被远端 IO 阻塞。
+    fn connect_eager(self: &Arc<Self>) {
+        let should_start = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(*state, ConnectionState::Idle) {
+                *state = ConnectionState::Connecting;
+                true
+            } else {
+                false
+            }
+        };
+        if !should_start {
+            return;
+        }
+
+        let connection = self.clone();
+        std::thread::spawn(move || {
+            let result = (connection.connector)(&connection.host);
+            let mut state = connection
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !matches!(*state, ConnectionState::Closed) {
+                *state = match result {
+                    Ok(transport) => ConnectionState::Ready(Arc::new(Mutex::new(transport))),
+                    Err(error) => ConnectionState::Failed(error.to_string()),
+                };
+            }
+            connection.ready.notify_all();
         });
+    }
+
+    /// 获取可用连接；等待 eager 结果，并在已交付失败后的下一次调用同步重连。
+    fn get(&self) -> Result<Arc<Mutex<SftpTransport>>, AppError> {
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &*state {
+                ConnectionState::Ready(transport) => return Ok(transport.clone()),
+                ConnectionState::Connecting => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    drop(state);
+                }
+                ConnectionState::Failed(message) => {
+                    let message = message.clone();
+                    *state = ConnectionState::Idle;
+                    return Err(AppError::SftpChannelError(message));
+                }
+                ConnectionState::Closed => {
+                    return Err(AppError::SftpChannelError("session 已关闭".to_string()));
+                }
+                ConnectionState::Idle => {
+                    *state = ConnectionState::Connecting;
+                    drop(state);
+                    let result = (self.connector)(&self.host);
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if matches!(*state, ConnectionState::Closed) {
+                        self.ready.notify_all();
+                        return Err(AppError::SftpChannelError("session 已关闭".to_string()));
+                    }
+                    match result {
+                        Ok(transport) => {
+                            let transport = Arc::new(Mutex::new(transport));
+                            *state = ConnectionState::Ready(transport.clone());
+                            self.ready.notify_all();
+                            return Ok(transport);
+                        }
+                        Err(error) => {
+                            *state = ConnectionState::Idle;
+                            self.ready.notify_all();
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 关闭状态槽并丢弃任何迟到连接结果。
+    fn close(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ConnectionState::Closed;
+        self.ready.notify_all();
+    }
+}
+
+/// 单个 Session 的 SFTP 句柄，连接与取消令牌均局部串行化。
+struct SftpHandle {
+    connection: Arc<SftpConnection>,
+    cancel_tokens: Mutex<HashMap<String, CancelToken>>,
+}
+
+/// File Transfer module，registry 锁不会跨远程 IO seam。
+#[derive(Clone)]
+pub struct SftpService {
+    handles: Arc<Mutex<HashMap<String, Arc<SftpHandle>>>>,
+    tasks: Arc<Mutex<HashMap<String, TransferTask>>>,
+    connector: SftpConnector,
+}
+
+impl SftpService {
+    /// 创建使用真实 SSH transport adapter 的 File Transfer module。
+    pub fn new() -> Self {
+        Self::with_connector(connect_sftp_for_host)
+    }
+
+    /// 注入内部连接 adapter，供 transport contract 测试使用。
+    pub(crate) fn with_connector(
+        connector: impl Fn(&HostConfig) -> Result<SftpTransport, AppError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            connector: Arc::new(connector),
+        }
+    }
+
+    /// 注册 Session 并并行启动独立 SFTP 连接。
+    pub fn register_session(&self, session_id: String, host: HostConfig) {
+        let connection = Arc::new(SftpConnection::new(host, self.connector.clone()));
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                session_id,
+                Arc::new(SftpHandle {
+                    connection: connection.clone(),
+                    cancel_tokens: Mutex::new(HashMap::new()),
+                }),
+            );
+        connection.connect_eager();
+    }
+
+    /// 判断指定 Session 是否仍注册在 File Transfer module。
+    #[cfg(test)]
+    pub(crate) fn has_session(&self, session_id: &str) -> bool {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(session_id)
+    }
+
+    /// 读取 Session 句柄副本，随后立即释放 registry 锁。
+    fn handle(&self, session_id: &str) -> Result<Arc<SftpHandle>, AppError> {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| AppError::SftpChannelError(format!("session {} 不存在", session_id)))
     }
 
     /// 列举远程目录内容，按目录优先、名称排序
@@ -105,46 +246,33 @@ impl SftpService {
     /// # 返回
     /// 成功返回 RemoteEntry 列表，失败返回 AppError
     pub fn list_dir(&self, session_id: &str, path: &str) -> Result<Vec<RemoteEntry>, AppError> {
-        let handle = self.handles.get(session_id)
-            .ok_or_else(|| AppError::SftpChannelError(format!("session {} 不存在", session_id)))?;
-
-        let ssh = handle.ssh_session.lock()
-            .map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-
-        // 临时切换为阻塞模式，避免 SFTP 子通道建立时返回 WouldBlock
-        // sftp 对象的整个生命周期（sftp() + readdir()）都必须在阻塞模式下执行，
-        // 因为 sftp 对象持有对 session 的引用，readdir 也需要阻塞模式
-        let mut entries = with_blocking_session(&ssh, || {
-            let sftp = ssh.sftp().map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-            let entries_raw = sftp.readdir(Path::new(path))
-                .map_err(|e| {
-                    let msg = e.to_string();
-                    if msg.contains("No such file") || msg.contains("does not exist") {
-                        AppError::SftpPathNotFound(path.to_string())
-                    } else if msg.contains("Permission denied") {
-                        AppError::SftpPermissionDenied(path.to_string())
-                    } else {
-                        AppError::SftpChannelError(msg)
-                    }
-                })?;
-            let entries: Vec<RemoteEntry> = entries_raw.into_iter().map(|(pb, stat)| {
-                let name = pb.file_name()
+        let transport = self.handle(session_id)?.connection.get()?;
+        let mut entries: Vec<RemoteEntry> = transport
+            .lock()
+            .map_err(|error| AppError::SftpChannelError(error.to_string()))?
+            .list_dir(path)?
+            .into_iter()
+            .map(|entry| {
+                let name = Path::new(&entry.path)
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let full_path = pb.to_string_lossy().to_string();
-                let is_dir = stat.is_dir();
-                let size = if is_dir { 0 } else { stat.size.unwrap_or(0) };
-                let modified_at = stat.mtime.map(|t| t as i64 * 1000).unwrap_or(0);
-                let perm = stat.perm.map(|p| format_permissions(p)).unwrap_or_default();
-                RemoteEntry { name, path: full_path, is_dir, size, modified_at, permissions: perm }
-            }).collect();
-            Ok::<Vec<RemoteEntry>, AppError>(entries)
-        })?;
+                RemoteEntry {
+                    name,
+                    path: entry.path,
+                    is_dir: entry.is_dir,
+                    size: entry.size,
+                    modified_at: entry.modified_at,
+                    permissions: entry
+                        .permissions
+                        .map(format_permissions)
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
 
         // 目录优先，同类按名称排序
-        entries.sort_by(|a, b| {
-            b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name))
-        });
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
 
         Ok(entries)
     }
@@ -157,37 +285,35 @@ impl SftpService {
     /// - `local_path`: 本地保存路径（父目录必须存在）
     /// - `app`: Tauri 应用句柄，用于推送事件
     pub fn enqueue_download<R: Runtime>(
-        &mut self,
+        &self,
         session_id: String,
         remote_path: String,
         local_path: String,
         app: AppHandle<R>,
     ) -> Result<TransferTask, AppError> {
         // 验证本地路径父目录可写
-        let parent = Path::new(&local_path).parent()
+        let parent = Path::new(&local_path)
+            .parent()
             .ok_or_else(|| AppError::SftpTransferError("本地路径无效".to_string()))?;
         if !parent.exists() {
-            return Err(AppError::SftpTransferError(format!("本地目录不存在: {}", parent.display())));
+            return Err(AppError::SftpTransferError(format!(
+                "本地目录不存在: {}",
+                parent.display()
+            )));
         }
 
-        let handle = self.handles.get(&session_id)
-            .ok_or_else(|| AppError::SftpChannelError(format!("session {} 不存在", session_id)))?;
+        let handle = self.handle(&session_id)?;
 
         let file_name = Path::new(&remote_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| remote_path.clone());
 
-        // 先获取文件大小，临时切换阻塞模式避免 WouldBlock
-        let ssh = handle.ssh_session.lock()
-            .map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-        let total_bytes = with_blocking_session(&ssh, || {
-            let sftp = ssh.sftp().map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-            let stat = sftp.stat(Path::new(&remote_path))
-                .map_err(|e| AppError::SftpPathNotFound(e.to_string()))?;
-            Ok::<u64, AppError>(stat.size.unwrap_or(0))
-        })?;
-        drop(ssh);
+        let transport = handle.connection.get()?;
+        let total_bytes = transport
+            .lock()
+            .map_err(|error| AppError::SftpChannelError(error.to_string()))?
+            .file_size(&remote_path)?;
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -206,21 +332,26 @@ impl SftpService {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
-        self.tasks.insert(task_id.clone(), task.clone());
-        if let Some(h) = self.handles.get_mut(&session_id) {
-            h.cancel_tokens.insert(task_id.clone(), cancel_token.clone());
-        }
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), task.clone());
+        handle
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), cancel_token.clone());
 
-        // 启动后台传输任务
-        let ssh_session = if let Some(h) = self.handles.get(&session_id) {
-            h.ssh_session.clone()
-        } else {
-            return Err(AppError::SftpChannelError(format!("session {} 不存在", session_id)));
-        };
         spawn_transfer_task(
-            task_id, session_id, remote_path, local_path,
-            total_bytes, TransferType::Download,
-            ssh_session, cancel_token, app,
+            task_id,
+            session_id,
+            remote_path,
+            local_path,
+            total_bytes,
+            TransferType::Download,
+            transport,
+            cancel_token,
+            app,
         );
 
         Ok(task)
@@ -234,7 +365,7 @@ impl SftpService {
     /// - `remote_path`: 远程目标目录路径（后端自动拼接文件名）
     /// - `app`: Tauri 应用句柄，用于推送事件
     pub fn enqueue_upload<R: Runtime>(
-        &mut self,
+        &self,
         session_id: String,
         local_path: String,
         remote_path: String,
@@ -242,7 +373,10 @@ impl SftpService {
     ) -> Result<TransferTask, AppError> {
         // 验证本地文件存在
         if !Path::new(&local_path).exists() {
-            return Err(AppError::SftpTransferError(format!("本地文件不存在: {}", local_path)));
+            return Err(AppError::SftpTransferError(format!(
+                "本地文件不存在: {}",
+                local_path
+            )));
         }
 
         let file_name = Path::new(&local_path)
@@ -257,14 +391,10 @@ impl SftpService {
             format!("{}/{}", remote_path, file_name)
         };
 
-        let total_bytes = std::fs::metadata(&local_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let total_bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
 
-        // 先克隆 ssh_session，避免后续可变借用冲突
-        let ssh_session = self.handles.get(&session_id)
-            .ok_or_else(|| AppError::SftpChannelError(format!("session {} 不存在", session_id)))
-            .map(|h| h.ssh_session.clone())?;
+        let handle = self.handle(&session_id)?;
+        let transport = handle.connection.get()?;
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -283,14 +413,25 @@ impl SftpService {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
-        self.tasks.insert(task_id.clone(), task.clone());
-        if let Some(h) = self.handles.get_mut(&session_id) {
-            h.cancel_tokens.insert(task_id.clone(), cancel_token.clone());
-        }
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), task.clone());
+        handle
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), cancel_token.clone());
         spawn_transfer_task(
-            task_id, session_id, full_remote_path, local_path,
-            total_bytes, TransferType::Upload,
-            ssh_session, cancel_token, app,
+            task_id,
+            session_id,
+            full_remote_path,
+            local_path,
+            total_bytes,
+            TransferType::Upload,
+            transport,
+            cancel_token,
+            app,
         );
 
         Ok(task)
@@ -300,10 +441,22 @@ impl SftpService {
     ///
     /// # 参数
     /// - `task_id`: 要取消的任务 ID
-    pub fn cancel_task(&mut self, task_id: &str) {
+    pub fn cancel_task(&self, task_id: &str) {
         // 找到对应 session 的取消令牌并触发取消
-        for handle in self.handles.values_mut() {
-            if let Some(token) = handle.cancel_tokens.get(task_id) {
+        let handles: Vec<_> = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for handle in handles {
+            if let Some(token) = handle
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(task_id)
+            {
                 token.cancel();
                 return;
             }
@@ -314,12 +467,28 @@ impl SftpService {
     /// 清理指定 session 的所有任务（session 关闭时调用）
     ///
     /// 取消所有 Pending/Running 任务，推送 sftp:task_status = Cancelled
-    pub fn cleanup_session<R: Runtime>(&mut self, session_id: &str, app: &AppHandle<R>) {
-        if let Some(handle) = self.handles.remove(session_id) {
-            for (task_id, token) in &handle.cancel_tokens {
+    pub fn cleanup_session<R: Runtime>(&self, session_id: &str, app: &AppHandle<R>) {
+        let handle = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+        if let Some(handle) = handle {
+            handle.connection.close();
+            let cancel_tokens = handle
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (task_id, token) in cancel_tokens.iter() {
                 token.cancel();
-                if let Some(task) = self.tasks.get_mut(task_id) {
-                    if task.status == SftpTaskStatus::Pending || task.status == SftpTaskStatus::Running {
+                if let Some(task) = tasks.get_mut(task_id) {
+                    if task.status == SftpTaskStatus::Pending
+                        || task.status == SftpTaskStatus::Running
+                    {
                         task.status = SftpTaskStatus::Cancelled;
                         let event = SftpTaskStatusEvent {
                             task_id: task_id.clone(),
@@ -335,6 +504,28 @@ impl SftpService {
     }
 }
 
+/// 从 secure storage 读取运行时凭据并建立独立 SFTP transport。
+fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
+    let (password, passphrase) = match host.auth_type {
+        AuthType::Password => {
+            let password_ref = host
+                .password_ref
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidHostConfig("密码引用为空".to_string()))?;
+            (Some(secure_store::get_credential(password_ref)?), None)
+        }
+        AuthType::PrivateKey => {
+            let passphrase = host
+                .passphrase_ref
+                .as_deref()
+                .map(secure_store::get_credential)
+                .transpose()?;
+            (None, passphrase)
+        }
+    };
+    ssh_transport::connect_sftp(host, password.as_deref(), passphrase.as_deref())
+}
+
 /// 在独立 tokio task 中执行传输，等待信号量 permit，推送状态事件
 ///
 /// # 参数
@@ -344,7 +535,7 @@ impl SftpService {
 /// - `local_path`: 本地文件路径
 /// - `total_bytes`: 文件总大小
 /// - `transfer_type`: 传输方向
-/// - `ssh_session`: SSH session Arc
+/// - `transport`: Session 专属 SFTP capability
 /// - `cancel_token`: 取消令牌
 /// - `app`: Tauri 应用句柄
 fn spawn_transfer_task<R: Runtime + 'static>(
@@ -354,7 +545,7 @@ fn spawn_transfer_task<R: Runtime + 'static>(
     local_path: String,
     total_bytes: u64,
     transfer_type: TransferType,
-    ssh_session: Arc<Mutex<Session>>,
+    transport: Arc<Mutex<SftpTransport>>,
     cancel_token: CancelToken,
     app: AppHandle<R>,
 ) {
@@ -364,17 +555,28 @@ fn spawn_transfer_task<R: Runtime + 'static>(
         let _permit = semaphore.acquire().await.unwrap();
 
         if cancel_token.is_cancelled() {
-            let _ = app.emit("sftp:task_status", SftpTaskStatusEvent {
-                task_id, session_id, status: SftpTaskStatus::Cancelled, error_message: None,
-            });
+            let _ = app.emit(
+                "sftp:task_status",
+                SftpTaskStatusEvent {
+                    task_id,
+                    session_id,
+                    status: SftpTaskStatus::Cancelled,
+                    error_message: None,
+                },
+            );
             return;
         }
 
         // 通知 Running
-        let _ = app.emit("sftp:task_status", SftpTaskStatusEvent {
-            task_id: task_id.clone(), session_id: session_id.clone(),
-            status: SftpTaskStatus::Running, error_message: None,
-        });
+        let _ = app.emit(
+            "sftp:task_status",
+            SftpTaskStatusEvent {
+                task_id: task_id.clone(),
+                session_id: session_id.clone(),
+                status: SftpTaskStatus::Running,
+                error_message: None,
+            },
+        );
 
         let task_id_clone = task_id.clone();
         let session_id_clone = session_id.clone();
@@ -383,33 +585,63 @@ fn spawn_transfer_task<R: Runtime + 'static>(
 
         let result = tokio::task::spawn_blocking(move || {
             run_transfer_blocking(
-                &task_id_clone, &session_id_clone, &remote_path, &local_path,
-                total_bytes, &transfer_type, &ssh_session, &cancel_token_clone, &app_clone,
+                &task_id_clone,
+                &session_id_clone,
+                &remote_path,
+                &local_path,
+                total_bytes,
+                &transfer_type,
+                &transport,
+                &cancel_token_clone,
+                &app_clone,
             )
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(())) => {
-                let _ = app.emit("sftp:task_status", SftpTaskStatusEvent {
-                    task_id, session_id, status: SftpTaskStatus::Done, error_message: None,
-                });
+                let _ = app.emit(
+                    "sftp:task_status",
+                    SftpTaskStatusEvent {
+                        task_id,
+                        session_id,
+                        status: SftpTaskStatus::Done,
+                        error_message: None,
+                    },
+                );
             }
             Ok(Err(true)) => {
-                let _ = app.emit("sftp:task_status", SftpTaskStatusEvent {
-                    task_id, session_id, status: SftpTaskStatus::Cancelled, error_message: None,
-                });
+                let _ = app.emit(
+                    "sftp:task_status",
+                    SftpTaskStatusEvent {
+                        task_id,
+                        session_id,
+                        status: SftpTaskStatus::Cancelled,
+                        error_message: None,
+                    },
+                );
             }
             Ok(Err(false)) => {
-                let _ = app.emit("sftp:task_status", SftpTaskStatusEvent {
-                    task_id, session_id, status: SftpTaskStatus::Failed,
-                    error_message: Some("传输中断".to_string()),
-                });
+                let _ = app.emit(
+                    "sftp:task_status",
+                    SftpTaskStatusEvent {
+                        task_id,
+                        session_id,
+                        status: SftpTaskStatus::Failed,
+                        error_message: Some("传输中断".to_string()),
+                    },
+                );
             }
             Err(e) => {
-                let _ = app.emit("sftp:task_status", SftpTaskStatusEvent {
-                    task_id, session_id, status: SftpTaskStatus::Failed,
-                    error_message: Some(e.to_string()),
-                });
+                let _ = app.emit(
+                    "sftp:task_status",
+                    SftpTaskStatusEvent {
+                        task_id,
+                        session_id,
+                        status: SftpTaskStatus::Failed,
+                        error_message: Some(e.to_string()),
+                    },
+                );
             }
         }
     });
@@ -428,25 +660,14 @@ fn run_transfer_blocking<R: Runtime>(
     local_path: &str,
     total_bytes: u64,
     transfer_type: &TransferType,
-    ssh_session: &Arc<Mutex<Session>>,
+    transport: &Arc<Mutex<SftpTransport>>,
     cancel_token: &CancelToken,
     app: &AppHandle<R>,
 ) -> Result<(), bool> {
     use std::io::{Read, Write};
     use std::time::Instant;
 
-    let ssh = ssh_session.lock().map_err(|_| false)?;
-    // 切换为阻塞模式，SFTP 子通道建立和文件 IO 均需阻塞模式
-    // run_transfer_blocking 本身在 spawn_blocking 线程中执行，不影响终端 IO 循环
-    ssh.set_blocking(true);
-    let sftp = ssh.sftp().map_err(|_| false)?;
-
-    // RAII guard：函数任意路径退出时自动恢复非阻塞模式，供终端 IO 循环使用
-    struct RestoreNonBlocking<'a>(&'a std::sync::MutexGuard<'a, Session>);
-    impl Drop for RestoreNonBlocking<'_> {
-        fn drop(&mut self) { self.0.set_blocking(false); }
-    }
-    let _restore = RestoreNonBlocking(&ssh);
+    let mut sftp = transport.lock().map_err(|_| false)?;
 
     const CHUNK: usize = 32 * 1024; // 32KB chunks
     let mut transferred: u64 = 0;
@@ -459,13 +680,16 @@ fn run_transfer_blocking<R: Runtime>(
             if last_report.elapsed().as_millis() >= 500 {
                 let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
                 let speed = ((transferred - last_transferred) as f64 / elapsed) as u64;
-                let _ = app.emit("sftp:progress", SftpProgressEvent {
-                    task_id: task_id.to_string(),
-                    session_id: session_id.to_string(),
-                    transferred_bytes: transferred,
-                    total_bytes,
-                    speed_bps: speed,
-                });
+                let _ = app.emit(
+                    "sftp:progress",
+                    SftpProgressEvent {
+                        task_id: task_id.to_string(),
+                        session_id: session_id.to_string(),
+                        transferred_bytes: transferred,
+                        total_bytes,
+                        speed_bps: speed,
+                    },
+                );
                 last_transferred = transferred;
                 last_report = Instant::now();
             }
@@ -474,7 +698,7 @@ fn run_transfer_blocking<R: Runtime>(
 
     match transfer_type {
         TransferType::Download => {
-            let mut remote_file = sftp.open(std::path::Path::new(remote_path)).map_err(|_| false)?;
+            let mut remote_file = sftp.open_read(remote_path).map_err(|_| false)?;
             // 创建本地文件；失败或取消时通过 cleanup_local 删除残留
             let mut local_file = std::fs::File::create(local_path).map_err(|_| false)?;
             let mut buf = vec![0u8; CHUNK];
@@ -501,7 +725,9 @@ fn run_transfer_blocking<R: Runtime>(
                         return Err(false);
                     }
                 };
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 if local_file.write_all(&buf[..n]).is_err() {
                     cleanup_local!();
                     return Err(false);
@@ -513,14 +739,14 @@ fn run_transfer_blocking<R: Runtime>(
         TransferType::Upload => {
             let mut local_file = std::fs::File::open(local_path).map_err(|_| false)?;
             // 创建远端文件；失败或取消时通过 cleanup_remote 删除残留
-            let mut remote_file = sftp.create(std::path::Path::new(remote_path)).map_err(|_| false)?;
+            let mut remote_file = sftp.create(remote_path).map_err(|_| false)?;
             let mut buf = vec![0u8; CHUNK];
 
             /// 关闭远端文件句柄并删除残留文件（取消或 IO 失败时调用）
             macro_rules! cleanup_remote {
                 () => {{
                     drop(remote_file);
-                    let _ = sftp.unlink(std::path::Path::new(remote_path));
+                    let _ = sftp.unlink(remote_path);
                 }};
             }
 
@@ -537,7 +763,9 @@ fn run_transfer_blocking<R: Runtime>(
                         return Err(false);
                     }
                 };
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 if remote_file.write_all(&buf[..n]).is_err() {
                     cleanup_remote!();
                     return Err(false);
@@ -569,11 +797,122 @@ fn format_permissions(perm: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use crate::core::ssh_transport::test_support::{blocking_sftp, drop_signal_sftp, empty_sftp};
+    use crate::models::host::{AuthType, HostConfig};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
-    /// 构造一个最小化的 mock SSH Session（仅用于注册，不实际连接）
-    fn mock_ssh_session() -> Arc<Mutex<Session>> {
-        Arc::new(Mutex::new(ssh2::Session::new().unwrap()))
+    /// 构造不含明文凭据的测试主机。
+    fn make_host() -> HostConfig {
+        HostConfig {
+            id: "host-1".to_string(),
+            name: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_type: AuthType::Password,
+            password_ref: Some("ref".to_string()),
+            private_key_path: None,
+            passphrase_ref: None,
+            remark: None,
+        }
+    }
+
+    /// 后台 eager 失败只交付一次，下一次操作必须触发重连。
+    #[test]
+    fn eager_failure_is_reported_once_then_next_operation_retries() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let service = SftpService::with_connector(move |_| {
+            if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(AppError::SshConnectionError("first failure".to_string()))
+            } else {
+                Ok(empty_sftp())
+            }
+        });
+
+        service.register_session("session-1".to_string(), make_host());
+        let first = service.list_dir("session-1", "/");
+        let second = service.list_dir("session-1", "/");
+
+        assert!(first.unwrap_err().to_string().contains("first failure"));
+        assert!(second.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// 一个 Session 的慢目录读取不得持有其他 Session 所需的 registry 锁。
+    #[test]
+    fn slow_directory_read_does_not_block_another_session() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let connector_started = started.clone();
+        let connector_release = release.clone();
+        let service = SftpService::with_connector(move |host| {
+            if host.id == "slow" {
+                Ok(blocking_sftp(
+                    connector_started.clone(),
+                    connector_release.clone(),
+                ))
+            } else {
+                Ok(empty_sftp())
+            }
+        });
+        let mut slow_host = make_host();
+        slow_host.id = "slow".to_string();
+        let mut fast_host = make_host();
+        fast_host.id = "fast".to_string();
+        service.register_session("slow-session".to_string(), slow_host);
+        service.register_session("fast-session".to_string(), fast_host);
+
+        let slow_service = service.clone();
+        let slow = std::thread::spawn(move || slow_service.list_dir("slow-session", "/"));
+        started.wait();
+
+        let fast_service = service.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(fast_service.list_dir("fast-session", "/"));
+        });
+        let fast_result = done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("其他 Session 不应被慢目录读取阻塞");
+        release.wait();
+
+        assert!(fast_result.is_ok());
+        assert!(slow.join().unwrap().is_ok());
+    }
+
+    /// Session 关闭后，阻塞建连的迟到结果必须被释放且不得重新注册。
+    #[test]
+    fn closed_session_discards_late_sftp_connection() {
+        use tauri::test::mock_app;
+
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let started_for_connector = started.clone();
+        let release_for_connector = release.clone();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let service = SftpService::with_connector(move |_| {
+            started_for_connector.wait();
+            release_for_connector.wait();
+            Ok(drop_signal_sftp(dropped_tx.clone()))
+        });
+        service.register_session("session-1".to_string(), make_host());
+        started.wait();
+
+        let app = mock_app();
+        service.cleanup_session("session-1", &app.handle().clone());
+        release.wait();
+
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("迟到 transport 应立即释放");
+        assert!(!service.has_session("session-1"));
+    }
+
+    /// 构造使用内存 SFTP adapter 的测试 module。
+    fn make_service() -> SftpService {
+        SftpService::with_connector(|_| Ok(empty_sftp()))
     }
 
     // ─── 基础结构测试 ───────────────────────────────────────────────────────
@@ -581,15 +920,15 @@ mod tests {
     /// 验证 register_session 后 handles 中存在对应条目
     #[test]
     fn register_session_stores_handle() {
-        let mut service = SftpService::new();
-        service.register_session("session-1".to_string(), mock_ssh_session());
-        assert!(service.handles.contains_key("session-1"));
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        assert!(service.has_session("session-1"));
     }
 
     /// 验证 cancel_task 对不存在的 task_id 静默成功（不 panic）
     #[test]
     fn cancel_nonexistent_task_is_silent() {
-        let mut service = SftpService::new();
+        let service = SftpService::new();
         service.cancel_task("nonexistent-task-id"); // 不应 panic
     }
 
@@ -598,11 +937,11 @@ mod tests {
     fn cleanup_session_removes_handle() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let mut service = SftpService::new();
-        service.register_session("session-1".to_string(), mock_ssh_session());
-        assert!(service.handles.contains_key("session-1"));
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        assert!(service.has_session("session-1"));
         service.cleanup_session("session-1", &app.handle().clone());
-        assert!(!service.handles.contains_key("session-1"));
+        assert!(!service.has_session("session-1"));
     }
 
     /// 验证 list_dir 对未注册 session 返回 SftpChannelError，且错误消息包含 session_id
@@ -703,34 +1042,45 @@ mod tests {
     fn cleanup_session_cancels_pending_task_tokens() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let mut service = SftpService::new();
-        service.register_session("session-1".to_string(), mock_ssh_session());
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
 
         let task_id = "task-pending-1".to_string();
         let cancel_token = CancelToken::new();
         let cloned_token = cancel_token.clone();
 
-        service.handles.get_mut("session-1").unwrap()
-            .cancel_tokens.insert(task_id.clone(), cancel_token);
+        service
+            .handle("session-1")
+            .unwrap()
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), cancel_token);
 
-        service.tasks.insert(task_id.clone(), TransferTask {
-            task_id: task_id.clone(),
-            session_id: "session-1".to_string(),
-            transfer_type: TransferType::Download,
-            remote_path: "/tmp/file".to_string(),
-            local_path: "/local/file".to_string(),
-            file_name: "file".to_string(),
-            total_bytes: 1024,
-            transferred_bytes: 0,
-            speed_bps: 0,
-            status: SftpTaskStatus::Pending,
-            error_message: None,
-            created_at: 0,
-        });
+        service.tasks.lock().unwrap().insert(
+            task_id.clone(),
+            TransferTask {
+                task_id: task_id.clone(),
+                session_id: "session-1".to_string(),
+                transfer_type: TransferType::Download,
+                remote_path: "/tmp/file".to_string(),
+                local_path: "/local/file".to_string(),
+                file_name: "file".to_string(),
+                total_bytes: 1024,
+                transferred_bytes: 0,
+                speed_bps: 0,
+                status: SftpTaskStatus::Pending,
+                error_message: None,
+                created_at: 0,
+            },
+        );
 
         service.cleanup_session("session-1", &app.handle().clone());
 
-        assert!(cloned_token.is_cancelled(), "cleanup_session 应触发 Pending 任务的取消令牌");
+        assert!(
+            cloned_token.is_cancelled(),
+            "cleanup_session 应触发 Pending 任务的取消令牌"
+        );
     }
 
     /// 验证 cleanup_session 将 Running 任务的取消令牌触发
@@ -738,58 +1088,77 @@ mod tests {
     fn cleanup_session_cancels_running_task_tokens() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let mut service = SftpService::new();
-        service.register_session("session-1".to_string(), mock_ssh_session());
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
 
         let task_id = "task-running-1".to_string();
         let cancel_token = CancelToken::new();
         let cloned_token = cancel_token.clone();
 
-        service.handles.get_mut("session-1").unwrap()
-            .cancel_tokens.insert(task_id.clone(), cancel_token);
+        service
+            .handle("session-1")
+            .unwrap()
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), cancel_token);
 
-        service.tasks.insert(task_id.clone(), TransferTask {
-            task_id: task_id.clone(),
-            session_id: "session-1".to_string(),
-            transfer_type: TransferType::Upload,
-            remote_path: "/remote/file".to_string(),
-            local_path: "/local/file".to_string(),
-            file_name: "file".to_string(),
-            total_bytes: 2048,
-            transferred_bytes: 512,
-            speed_bps: 1024,
-            status: SftpTaskStatus::Running,
-            error_message: None,
-            created_at: 0,
-        });
+        service.tasks.lock().unwrap().insert(
+            task_id.clone(),
+            TransferTask {
+                task_id: task_id.clone(),
+                session_id: "session-1".to_string(),
+                transfer_type: TransferType::Upload,
+                remote_path: "/remote/file".to_string(),
+                local_path: "/local/file".to_string(),
+                file_name: "file".to_string(),
+                total_bytes: 2048,
+                transferred_bytes: 512,
+                speed_bps: 1024,
+                status: SftpTaskStatus::Running,
+                error_message: None,
+                created_at: 0,
+            },
+        );
 
         service.cleanup_session("session-1", &app.handle().clone());
 
-        assert!(cloned_token.is_cancelled(), "cleanup_session 应触发 Running 任务的取消令牌");
+        assert!(
+            cloned_token.is_cancelled(),
+            "cleanup_session 应触发 Running 任务的取消令牌"
+        );
     }
 
     /// 验证 cancel_task 触发对应任务的取消令牌
     #[test]
     fn cancel_task_triggers_cancel_token() {
-        let mut service = SftpService::new();
-        service.register_session("session-1".to_string(), mock_ssh_session());
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
 
         let task_id = "task-1".to_string();
         let cancel_token = CancelToken::new();
         let cloned_token = cancel_token.clone();
 
-        service.handles.get_mut("session-1").unwrap()
-            .cancel_tokens.insert(task_id.clone(), cancel_token);
+        service
+            .handle("session-1")
+            .unwrap()
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), cancel_token);
 
         service.cancel_task(&task_id);
 
-        assert!(cloned_token.is_cancelled(), "cancel_task 应触发对应任务的取消令牌");
+        assert!(
+            cloned_token.is_cancelled(),
+            "cancel_task 应触发对应任务的取消令牌"
+        );
     }
 
     /// 验证终态任务调用 cancel_task 静默成功（令牌已不在 handles 中）
     #[test]
     fn cancel_task_on_completed_task_is_silent() {
-        let mut service = SftpService::new();
+        let service = SftpService::new();
         service.cancel_task("task-already-done");
         // 不 panic 即通过
     }

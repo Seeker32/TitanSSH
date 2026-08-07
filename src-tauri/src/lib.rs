@@ -7,7 +7,6 @@ mod storage;
 use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
 use crate::core::sftp_service::SftpService;
-use std::sync::{Arc, Mutex};
 
 /// 初始化并启动 Tauri 应用
 ///
@@ -15,7 +14,7 @@ use std::sync::{Arc, Mutex};
 /// 然后进入 Tauri 事件循环直到应用退出。
 pub fn run() {
     let monitor_service = MonitorService::new();
-    let sftp_service = Arc::new(Mutex::new(SftpService::new()));
+    let sftp_service = SftpService::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

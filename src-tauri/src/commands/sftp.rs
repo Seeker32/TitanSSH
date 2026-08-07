@@ -1,6 +1,5 @@
 use crate::core::sftp_service::SftpService;
 use crate::models::sftp::{RemoteEntry, TransferTask};
-use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 
 /// 列举远程目录内容，按目录优先、名称排序
@@ -12,11 +11,9 @@ use tauri::{AppHandle, State};
 pub fn sftp_list_dir(
     session_id: String,
     path: String,
-    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
+    sftp_service: State<'_, SftpService>,
 ) -> Result<Vec<RemoteEntry>, String> {
     sftp_service
-        .lock()
-        .map_err(|e| e.to_string())?
         .list_dir(&session_id, &path)
         .map_err(|e| e.to_string())
 }
@@ -33,11 +30,9 @@ pub fn sftp_download(
     session_id: String,
     remote_path: String,
     local_path: String,
-    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
+    sftp_service: State<'_, SftpService>,
 ) -> Result<TransferTask, String> {
     sftp_service
-        .lock()
-        .map_err(|e| e.to_string())?
         .enqueue_download(session_id, remote_path, local_path, app)
         .map_err(|e| e.to_string())
 }
@@ -54,11 +49,9 @@ pub fn sftp_upload(
     session_id: String,
     local_path: String,
     remote_path: String,
-    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
+    sftp_service: State<'_, SftpService>,
 ) -> Result<TransferTask, String> {
     sftp_service
-        .lock()
-        .map_err(|e| e.to_string())?
         .enqueue_upload(session_id, local_path, remote_path, app)
         .map_err(|e| e.to_string())
 }
@@ -70,11 +63,8 @@ pub fn sftp_upload(
 #[tauri::command]
 pub fn sftp_cancel_task(
     task_id: String,
-    sftp_service: State<'_, Arc<Mutex<SftpService>>>,
+    sftp_service: State<'_, SftpService>,
 ) -> Result<(), String> {
-    sftp_service
-        .lock()
-        .map_err(|e| e.to_string())?
-        .cancel_task(&task_id);
+    sftp_service.cancel_task(&task_id);
     Ok(())
 }

@@ -1,25 +1,21 @@
-use crate::core::{ssh_client, terminal_bridge};
-use crate::core::ssh_client::ConnectPhase;
+use crate::core::ssh_transport;
+use crate::core::ssh_transport::{ConnectPhase, TerminalTransport};
 use crate::errors::app_error::AppError;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::session::{SessionStatus, SessionStatusEvent, TerminalDataEvent};
 use crate::storage::secure_store;
 use serde::Serialize;
-use ssh2::Session;
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// 凭据读取阶段超时时间，避免系统钥匙串卡住导致 UI 长期停留在“连接中”
 const CREDENTIAL_LOAD_TIMEOUT_SECS: u64 = 5;
 /// SSH 连接阶段总超时时间（含 TCP、握手、认证），作为 libssh2 阻塞场景的外层兜底
 const CONNECT_TOTAL_TIMEOUT_SECS: u64 = 15;
-/// 通道初始化阶段超时时间（打开 Channel / 请求 PTY / 启动 Shell）
-const CHANNEL_SETUP_TIMEOUT_MS: u32 = 5_000;
 
 /// 连接阶段枚举，用于向前端与控制台报告当前卡点
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,8 +61,6 @@ pub enum TerminalCommand {
 ///
 /// 负责从安全存储读取凭据、建立 SSH 连接、请求 PTY、启动 Shell，
 /// 并进入非阻塞 IO 循环处理终端数据读写，派发 terminal:data 和 session:status 事件。
-/// SSH 连接成功后，通过 session_tx 将 Arc<Mutex<Session>> 回传给 SessionManager，
-/// 供 sftp_service 复用同一 SSH 连接，避免重复建立连接。
 ///
 /// # 参数
 /// - `app`: Tauri 应用句柄，用于派发事件到前端
@@ -75,43 +69,60 @@ pub enum TerminalCommand {
 /// - `command_rx`: 命令接收端，接收来自协调层的终端命令
 /// - `shutdown`: 关闭标志，设置为 true 时工作线程退出
 /// - `runtime_status`: 后端权威会话状态，事件发出前先更新
-/// - `session_tx`: 可选的 SSH session 回传通道，连接成功后发送 Arc<Mutex<Session>>
-pub fn start_terminal_session(
-    app: AppHandle,
+pub fn start_terminal_session<R: Runtime>(
+    app: AppHandle<R>,
     host: HostConfig,
     session_id: String,
     command_rx: Receiver<TerminalCommand>,
     shutdown: Arc<AtomicBool>,
     runtime_status: Arc<Mutex<SessionStatus>>,
-    session_tx: Option<std::sync::mpsc::SyncSender<Arc<Mutex<Session>>>>,
 ) {
     thread::spawn(move || {
         // 从安全存储读取运行时凭据，并对钥匙串阻塞设置独立超时
         emit_connection_progress(&app, &session_id, ConnectionPhase::LoadingCredentials);
-        eprintln!("[session:{}][diagnostic] Starting credential load with {}s timeout", session_id, CREDENTIAL_LOAD_TIMEOUT_SECS);
+        eprintln!(
+            "[session:{}][diagnostic] Starting credential load with {}s timeout",
+            session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
+        );
         let host_for_credentials = host.clone();
         let credentials = match run_phase_with_timeout(
             Duration::from_secs(CREDENTIAL_LOAD_TIMEOUT_SECS),
             move || {
-                eprintln!("[session:{}][diagnostic] Credential thread started", host_for_credentials.id);
+                eprintln!(
+                    "[session:{}][diagnostic] Credential thread started",
+                    host_for_credentials.id
+                );
                 let result = load_credentials(&host_for_credentials);
-                eprintln!("[session:{}][diagnostic] Credential thread completed: {:?}", host_for_credentials.id, result.is_ok());
+                eprintln!(
+                    "[session:{}][diagnostic] Credential thread completed: {:?}",
+                    host_for_credentials.id,
+                    result.is_ok()
+                );
                 result
             },
         ) {
             PhaseOutcome::Completed(Ok(creds)) => {
-                eprintln!("[session:{}][diagnostic] Credentials loaded successfully", session_id);
+                eprintln!(
+                    "[session:{}][diagnostic] Credentials loaded successfully",
+                    session_id
+                );
                 creds
             }
             PhaseOutcome::Completed(Err(error)) => {
-                eprintln!("[session:{}][diagnostic] Credentials error: {}", session_id, error);
+                eprintln!(
+                    "[session:{}][diagnostic] Credentials error: {}",
+                    session_id, error
+                );
                 let (status, message) =
                     map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
                 emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
                 return;
             }
             PhaseOutcome::TimedOut => {
-                eprintln!("[session:{}][diagnostic] Credentials timed out after {}s", session_id, CREDENTIAL_LOAD_TIMEOUT_SECS);
+                eprintln!(
+                    "[session:{}][diagnostic] Credentials timed out after {}s",
+                    session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
+                );
                 emit_session_status(
                     &app,
                     &session_id,
@@ -128,7 +139,7 @@ pub fn start_terminal_session(
         // 将 SSH 连接（TCP握手 + SSH握手 + 认证）放到独立线程执行，
         // 外层通过 channel + recv_timeout 实现真正的连接阶段超时。
         // libssh2 的 set_timeout 对 userauth_password 不生效，必须用此方案。
-        let (conn_tx, conn_rx) = mpsc::channel::<Result<Session, AppError>>();
+        let (conn_tx, conn_rx) = mpsc::channel::<Result<TerminalTransport, AppError>>();
         let host_clone = host.clone();
         let password_owned = password.map(|s| s.to_string());
         let passphrase_owned = passphrase.map(|s| s.to_string());
@@ -138,14 +149,18 @@ pub fn start_terminal_session(
         let current_phase_for_connect = current_phase.clone();
 
         thread::spawn(move || {
-            let result = ssh_client::connect(
+            let result = ssh_transport::connect_terminal(
                 &host_clone,
                 password_owned.as_deref(),
                 passphrase_owned.as_deref(),
                 |phase| {
                     let mapped_phase = map_connect_phase(phase);
                     update_current_phase(&current_phase_for_connect, mapped_phase.clone());
-                    emit_connection_progress(&app_for_connect, &session_id_for_connect, mapped_phase);
+                    emit_connection_progress(
+                        &app_for_connect,
+                        &session_id_for_connect,
+                        mapped_phase,
+                    );
                 },
             );
             // 若外层已超时，send 会失败，直接忽略
@@ -153,81 +168,37 @@ pub fn start_terminal_session(
         });
 
         // 等待连接结果，超时则派发 Timeout 状态并退出
-        let session = match conn_rx.recv_timeout(Duration::from_secs(CONNECT_TOTAL_TIMEOUT_SECS)) {
-            Ok(Ok(session)) => session,
-            Ok(Err(error)) => {
-                let active_phase = current_phase_value(&current_phase);
-                let (status, message) = map_phase_error_to_status(&active_phase, &error);
-                emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
-                return;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // recv_timeout 超时：连接线程仍在阻塞，直接放弃并上报超时
-                emit_session_status(
-                    &app,
-                    &session_id,
-                    &runtime_status,
-                    SessionStatus::Timeout,
-                    Some(phase_timeout_message(&current_phase_value(&current_phase))),
-                );
-                return;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                emit_session_status(
-                    &app,
-                    &session_id,
-                    &runtime_status,
-                    SessionStatus::Error,
-                    Some("连接线程异常退出".to_string()),
-                );
-                return;
-            }
-        };
-
-        // 将 SSH session 包装为 Arc<Mutex> 以支持 sftp_service 复用同一连接
-        // 连接成功后通过 session_tx 回传给 SessionManager，供 sftp_service 注册使用
-        let session = Arc::new(Mutex::new(session));
-        if let Some(ref tx) = session_tx {
-            // send 失败（接收端已丢弃）时静默忽略，不影响终端功能
-            let _ = tx.send(session.clone());
-        }
-        session.lock().unwrap().set_timeout(CHANNEL_SETUP_TIMEOUT_MS);
-
-        // 创建 SSH 通道
-        emit_connection_progress(&app, &session_id, ConnectionPhase::OpeningChannel);
-        let mut channel = match session.lock().unwrap().channel_session() {
-            Ok(channel) => channel,
-            Err(error) => {
-                let error = AppError::Ssh2Error(error);
-                let (status, message) =
-                    map_phase_error_to_status(&ConnectionPhase::OpeningChannel, &error);
-                emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
-                return;
-            }
-        };
-
-        // 请求 PTY（伪终端），类型为 xterm
-        emit_connection_progress(&app, &session_id, ConnectionPhase::RequestingPty);
-        if let Err(error) = channel.request_pty("xterm", None, Some((120, 32, 0, 0))) {
-            let error = AppError::Ssh2Error(error);
-            let (status, message) =
-                map_phase_error_to_status(&ConnectionPhase::RequestingPty, &error);
-            emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
-            return;
-        }
-
-        // 启动 Shell
-        emit_connection_progress(&app, &session_id, ConnectionPhase::StartingShell);
-        if let Err(error) = channel.shell() {
-            let error = AppError::Ssh2Error(error);
-            let (status, message) =
-                map_phase_error_to_status(&ConnectionPhase::StartingShell, &error);
-            emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
-            return;
-        }
-
-        // 进入流式 IO 前切回非阻塞模式，避免读取 stdout 阻塞命令处理
-        session.lock().unwrap().set_blocking(false);
+        let mut terminal =
+            match conn_rx.recv_timeout(Duration::from_secs(CONNECT_TOTAL_TIMEOUT_SECS)) {
+                Ok(Ok(terminal)) => terminal,
+                Ok(Err(error)) => {
+                    let active_phase = current_phase_value(&current_phase);
+                    let (status, message) = map_phase_error_to_status(&active_phase, &error);
+                    emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // recv_timeout 超时：连接线程仍在阻塞，直接放弃并上报超时
+                    emit_session_status(
+                        &app,
+                        &session_id,
+                        &runtime_status,
+                        SessionStatus::Timeout,
+                        Some(phase_timeout_message(&current_phase_value(&current_phase))),
+                    );
+                    return;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    emit_session_status(
+                        &app,
+                        &session_id,
+                        &runtime_status,
+                        SessionStatus::Error,
+                        Some("连接线程异常退出".to_string()),
+                    );
+                    return;
+                }
+            };
 
         // 派发"已连接"状态事件
         emit_session_status(
@@ -244,7 +215,7 @@ pub fn start_terminal_session(
         // 主循环：非阻塞读取终端输出并处理命令队列
         while !shutdown.load(Ordering::Relaxed) {
             // 读取 SSH Channel 的 stdout 输出
-            match channel.read(&mut buffer) {
+            match terminal.read(&mut buffer) {
                 Ok(size) if size > 0 => {
                     // 使用 UTF-8 解码，确保中文等多字节字符正确显示
                     let data = String::from_utf8_lossy(&buffer[..size]).to_string();
@@ -276,7 +247,7 @@ pub fn start_terminal_session(
             while let Ok(command) = command_rx.try_recv() {
                 match command {
                     TerminalCommand::Write(data) => {
-                        if let Err(error) = terminal_bridge::write_channel(&mut channel, &data) {
+                        if let Err(error) = terminal.write(&data) {
                             emit_session_status(
                                 &app,
                                 &session_id,
@@ -287,9 +258,7 @@ pub fn start_terminal_session(
                         }
                     }
                     TerminalCommand::Resize { cols, rows } => {
-                        if let Err(error) =
-                            terminal_bridge::resize_channel(&mut channel, cols, rows)
-                        {
+                        if let Err(error) = terminal.resize(cols, rows) {
                             emit_session_status(
                                 &app,
                                 &session_id,
@@ -301,7 +270,7 @@ pub fn start_terminal_session(
                     }
                     TerminalCommand::Close => {
                         // 主动关闭：关闭通道并派发断开状态
-                        let _ = channel.close();
+                        let _ = terminal.close();
                         emit_session_status(
                             &app,
                             &session_id,
@@ -315,7 +284,7 @@ pub fn start_terminal_session(
             }
 
             // 检测 EOF（远程端主动断开连接），派发"连接已断开"消息
-            if channel.eof() {
+            if terminal.eof() {
                 emit_session_status(
                     &app,
                     &session_id,
@@ -331,7 +300,7 @@ pub fn start_terminal_session(
         }
 
         // 退出循环后关闭通道，释放资源
-        let _ = channel.close();
+        let _ = terminal.close();
     });
 }
 
@@ -345,7 +314,10 @@ pub fn start_terminal_session(
 /// `(password, passphrase)` 元组，均为 Option<String>
 fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>), AppError> {
     eprintln!("[diagnostic] load_credentials called for host: {}", host.id);
-    eprintln!("[diagnostic] auth_type: {:?}, password_ref: {:?}", host.auth_type, host.password_ref);
+    eprintln!(
+        "[diagnostic] auth_type: {:?}, password_ref: {:?}",
+        host.auth_type, host.password_ref
+    );
 
     match host.auth_type {
         AuthType::Password => {
@@ -371,7 +343,10 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
             }
             // 私钥口令为可选项，若有引用键则读取
             let passphrase = if let Some(ref passphrase_ref) = host.passphrase_ref {
-                eprintln!("[diagnostic] Loading passphrase with ref: {}", passphrase_ref);
+                eprintln!(
+                    "[diagnostic] Loading passphrase with ref: {}",
+                    passphrase_ref
+                );
                 Some(secure_store::get_credential(passphrase_ref)?)
             } else {
                 None
@@ -391,7 +366,10 @@ where
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
-    eprintln!("[diagnostic] Spawning timeout thread with timeout {:?}", timeout);
+    eprintln!(
+        "[diagnostic] Spawning timeout thread with timeout {:?}",
+        timeout
+    );
     thread::spawn(move || {
         eprintln!("[diagnostic] Timeout thread spawned, running operation");
         let result = operation();
@@ -424,6 +402,9 @@ fn map_connect_phase(phase: ConnectPhase) -> ConnectionPhase {
         ConnectPhase::ConnectingTcp => ConnectionPhase::ConnectingTcp,
         ConnectPhase::SshHandshake => ConnectionPhase::SshHandshake,
         ConnectPhase::Authenticating => ConnectionPhase::Authenticating,
+        ConnectPhase::OpeningChannel => ConnectionPhase::OpeningChannel,
+        ConnectPhase::RequestingPty => ConnectionPhase::RequestingPty,
+        ConnectPhase::StartingShell => ConnectionPhase::StartingShell,
     }
 }
 
@@ -440,7 +421,8 @@ fn update_current_phase(state: &Arc<Mutex<ConnectionPhase>>, phase: ConnectionPh
 ///
 /// 若互斥锁不可用，则回退到 `ConnectingTcp`，保证超时文案始终可生成。
 fn current_phase_value(state: &Arc<Mutex<ConnectionPhase>>) -> ConnectionPhase {
-    state.lock()
+    state
+        .lock()
         .map(|current| current.clone())
         .unwrap_or(ConnectionPhase::ConnectingTcp)
 }
@@ -488,10 +470,13 @@ fn map_phase_error_to_status(phase: &ConnectionPhase, error: &AppError) -> (Sess
             (SessionStatus::Timeout, phase_timeout_message(phase))
         }
         AppError::SshConnectionError(msg) => (SessionStatus::Error, format!("网络连接失败: {msg}")),
-        AppError::Ssh2Error(err) if is_timeout_message(&err.to_string()) => {
+        AppError::SshProtocolError(err) if is_timeout_message(&err.to_string()) => {
             (SessionStatus::Timeout, phase_timeout_message(phase))
         }
-        AppError::Ssh2Error(err) => (SessionStatus::Error, format!("{}: {err}", phase_message(phase))),
+        AppError::SshProtocolError(err) => (
+            SessionStatus::Error,
+            format!("{}: {err}", phase_message(phase)),
+        ),
         AppError::SecureStoreError(msg) if is_timeout_message(msg) => {
             (SessionStatus::Timeout, phase_timeout_message(phase))
         }
@@ -519,15 +504,14 @@ fn is_timeout_message(message: &str) -> bool {
 /// 派发连接阶段进度事件，并在控制台打印结构化日志
 ///
 /// 控制台日志用于 `pnpm tauri dev` 诊断，前端事件用于状态栏显示当前卡点。
-fn emit_connection_progress(app: &AppHandle, session_id: &str, phase: ConnectionPhase) {
+fn emit_connection_progress<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: &str,
+    phase: ConnectionPhase,
+) {
     let message = phase_message(&phase).to_string();
     let timestamp = chrono::Utc::now().timestamp_millis();
-    eprintln!(
-        "[session:{}][phase:{:?}] {}",
-        session_id,
-        phase,
-        message
-    );
+    eprintln!("[session:{}][phase:{:?}] {}", session_id, phase, message);
     let _ = app.emit(
         "session:progress",
         ConnectionProgressEvent {
@@ -553,7 +537,10 @@ fn emit_session_status<R: tauri::Runtime>(
     status: SessionStatus,
     message: Option<String>,
 ) {
-    eprintln!("[session:{}][diagnostic] emit_session_status: {:?}, message: {:?}", session_id, status, message);
+    eprintln!(
+        "[session:{}][diagnostic] emit_session_status: {:?}, message: {:?}",
+        session_id, status, message
+    );
     *runtime_status
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = status.clone();
@@ -566,9 +553,15 @@ fn emit_session_status<R: tauri::Runtime>(
         },
     );
     if let Err(ref e) = result {
-        eprintln!("[session:{}][diagnostic] emit_session_status FAILED: {}", session_id, e);
+        eprintln!(
+            "[session:{}][diagnostic] emit_session_status FAILED: {}",
+            session_id, e
+        );
     } else {
-        eprintln!("[session:{}][diagnostic] emit_session_status SUCCESS", session_id);
+        eprintln!(
+            "[session:{}][diagnostic] emit_session_status SUCCESS",
+            session_id
+        );
     }
 }
 
@@ -944,10 +937,10 @@ mod integration_tests {
         );
     }
 
-    /// 验证 SSH 握手错误映射：Ssh2Error → SessionStatus::Error
+    /// 验证 SSH 协议错误映射为 SessionStatus::Error。
     #[test]
-    fn ssh2_error_maps_to_error_status() {
-        // 使用 StorageError 模拟 Ssh2Error 的 Error 映射路径（避免构造 ssh2::Error）
+    fn ssh_protocol_error_maps_to_error_status() {
+        // 使用 StorageError 模拟其他协议错误的映射路径。
         let error = AppError::StorageError("handshake failed".to_string());
         let (status, _message) = map_phase_error_to_status(&ConnectionPhase::SshHandshake, &error);
         assert_eq!(status, SessionStatus::Error, "其他错误应映射为 Error");
@@ -966,8 +959,7 @@ mod integration_tests {
         assert_eq!(status2, SessionStatus::Timeout);
 
         let chinese_err = AppError::SshConnectionError("网络连接超时".to_string());
-        let (status3, _) =
-            map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &chinese_err);
+        let (status3, _) = map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &chinese_err);
         assert_eq!(status3, SessionStatus::Timeout);
     }
 
@@ -999,6 +991,15 @@ mod integration_tests {
                 "message": "正在读取凭据...",
                 "timestamp": 1_710_000_000_111_i64,
             })
+        );
+    }
+
+    /// Transport 的 channel 初始化阶段必须保持现有 Terminal 诊断事件语义。
+    #[test]
+    fn transport_channel_phase_maps_to_terminal_progress() {
+        assert_eq!(
+            map_connect_phase(crate::core::ssh_transport::ConnectPhase::OpeningChannel),
+            ConnectionPhase::OpeningChannel
         );
     }
 
@@ -1080,10 +1081,9 @@ mod integration_tests {
         use std::time::{Duration, Instant};
 
         let start = Instant::now();
-        let result = run_phase_with_timeout(
-            Duration::from_secs(5),
-            || Ok::<_, AppError>("success result"),
-        );
+        let result = run_phase_with_timeout(Duration::from_secs(5), || {
+            Ok::<_, AppError>("success result")
+        });
         let elapsed = start.elapsed();
 
         // Should return Completed with the result

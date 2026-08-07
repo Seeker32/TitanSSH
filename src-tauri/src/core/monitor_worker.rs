@@ -1,11 +1,10 @@
-use crate::core::ssh_client;
+use crate::core::ssh_transport;
+use crate::core::ssh_transport::ExecTransport;
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
 use crate::models::monitor::MonitorSnapshot;
-use ssh2::Session;
-use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -45,7 +44,7 @@ pub fn run_monitor_loop_with<ConnFn>(
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) where
-    ConnFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<Session, AppError>,
+    ConnFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<ExecTransport, AppError>,
 {
     // 保存上一轮 CPU 原始计数，用于根据 /proc/stat 增量计算使用率
     let mut previous_cpu_sample = None;
@@ -56,8 +55,8 @@ pub fn run_monitor_loop_with<ConnFn>(
     }
 
     // 建立独立 SSH 连接
-    let session = match connect_fn(&host, password.as_deref(), passphrase.as_deref()) {
-        Ok(s) => s,
+    let mut transport = match connect_fn(&host, password.as_deref(), passphrase.as_deref()) {
+        Ok(transport) => transport,
         Err(err) => {
             on_error(err);
             return;
@@ -66,7 +65,7 @@ pub fn run_monitor_loop_with<ConnFn>(
 
     // 采集循环：每 2 秒开新 channel 执行脚本
     while !shutdown.load(Ordering::Relaxed) {
-        match collect_once(&session, &session_id, previous_cpu_sample) {
+        match collect_once(&mut transport, &session_id, previous_cpu_sample) {
             Ok((snapshot, current_cpu_sample)) => {
                 previous_cpu_sample = current_cpu_sample;
                 on_snapshot(snapshot);
@@ -100,7 +99,7 @@ pub fn run_monitor_loop(
     on_error: impl Fn(AppError) + Send + 'static,
 ) {
     run_monitor_loop_with(
-        |h, pw, pp| ssh_client::connect(h, pw, pp, |_| {}),
+        ssh_transport::connect_exec,
         host,
         password,
         passphrase,
@@ -116,16 +115,11 @@ pub fn run_monitor_loop(
 /// 每次调用开新 channel，执行采集脚本，读取输出后关闭 channel。
 /// channel 操作失败或 wait_close 失败均返回 AppError。
 fn collect_once(
-    session: &Session,
+    transport: &mut ExecTransport,
     session_id: &str,
     previous_cpu_sample: Option<CpuSample>,
 ) -> Result<(MonitorSnapshot, Option<CpuSample>), AppError> {
-    let mut channel = session.channel_session()?;
-    channel.exec(&format!("sh -c '{}'", STATUS_SCRIPT.replace('\'', "'\\''")))?;
-
-    let mut output = String::new();
-    channel.read_to_string(&mut output)?;
-    channel.wait_close()?;
+    let output = transport.execute(&format!("sh -c '{}'", STATUS_SCRIPT.replace('\'', "'\\''")))?;
 
     parse_snapshot(session_id, &output, previous_cpu_sample)
 }
@@ -191,10 +185,7 @@ pub fn parse_snapshot(
 /// 根据 /proc/stat 连续两次原始计数，计算 CPU 使用率百分比。
 ///
 /// 首轮无基线样本、计数未增长或字段缺失时统一返回 0.0。
-fn compute_cpu_usage(
-    previous_sample: Option<CpuSample>,
-    current_sample: Option<CpuSample>,
-) -> f64 {
+fn compute_cpu_usage(previous_sample: Option<CpuSample>, current_sample: Option<CpuSample>) -> f64 {
     let (previous_total, previous_idle) = match previous_sample {
         Some(sample) => sample,
         None => return 0.0,
@@ -218,7 +209,6 @@ fn compute_cpu_usage(
 ///
 /// MemTotal 缺失或非法时回退为 0.0；MemAvailable 超出总量时按 0 已用处理。
 fn resolve_memory_usage(total_kb: f64, available_kb: f64) -> f64 {
-
     if total_kb <= 0.0 {
         return 0.0;
     }
@@ -262,7 +252,8 @@ mod tests {
     #[test]
     fn parse_snapshot_computes_memory_usage_from_meminfo_fields() {
         let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=250\nDISK=65";
-        let (snap, _) = parse_snapshot("session-3", raw, None).expect("应能从 meminfo 字段推导内存占用");
+        let (snap, _) =
+            parse_snapshot("session-3", raw, None).expect("应能从 meminfo 字段推导内存占用");
         assert!((snap.memory_usage - 75.0).abs() < 0.01);
     }
 
@@ -270,8 +261,8 @@ mod tests {
     #[test]
     fn parse_snapshot_computes_cpu_usage_from_proc_stat_fields() {
         let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500";
-        let (snap, cpu_sample) =
-            parse_snapshot("session-4", raw, Some((100, 20))).expect("应能根据 /proc/stat 计数推导 CPU 占用");
+        let (snap, cpu_sample) = parse_snapshot("session-4", raw, Some((100, 20)))
+            .expect("应能根据 /proc/stat 计数推导 CPU 占用");
         assert!((snap.cpu_usage - 83.3).abs() < 0.01);
         assert_eq!(cpu_sample, Some((160, 30)));
     }
@@ -279,10 +270,7 @@ mod tests {
     /// 验证 CPU 使用率会根据两次 /proc/stat 计数增量进行计算
     #[test]
     fn compute_cpu_usage_uses_proc_stat_delta() {
-        let usage = compute_cpu_usage(
-            Some((100, 20)),
-            Some((160, 30)),
-        );
+        let usage = compute_cpu_usage(Some((100, 20)), Some((160, 30)));
         assert!((usage - 83.3).abs() < 0.01);
     }
 
@@ -298,22 +286,27 @@ mod tests {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
+    use crate::core::ssh_transport::ExecTransport;
+    use crate::core::ssh_transport::test_support::one_shot_exec;
     use crate::errors::app_error::AppError;
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::monitor::MonitorSnapshot;
-    use ssh2::Session;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     /// 构造测试用 HostConfig
     fn make_host() -> HostConfig {
         HostConfig {
-            id: "h1".to_string(), name: "test".to_string(),
-            host: "127.0.0.1".to_string(), port: 22,
+            id: "h1".to_string(),
+            name: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
             username: "root".to_string(),
             auth_type: AuthType::Password,
             password_ref: Some("ref".to_string()),
-            private_key_path: None, passphrase_ref: None, remark: None,
+            private_key_path: None,
+            passphrase_ref: None,
+            remark: None,
         }
     }
 
@@ -328,7 +321,9 @@ mod loop_tests {
         let err_ref = Arc::clone(&errors);
 
         let connect_fn = |_host: &HostConfig, _pw: Option<&str>, _pp: Option<&str>| {
-            Err::<Session, AppError>(AppError::SshConnectionError("mock 连接失败".to_string()))
+            Err::<ExecTransport, AppError>(AppError::SshConnectionError(
+                "mock 连接失败".to_string(),
+            ))
         };
 
         run_monitor_loop_with(
@@ -338,12 +333,24 @@ mod loop_tests {
             None,
             "session-1".to_string(),
             shutdown,
-            move |snap| { snap_ref.lock().unwrap().push(snap); },
-            move |err| { err_ref.lock().unwrap().push(err.to_string()); },
+            move |snap| {
+                snap_ref.lock().unwrap().push(snap);
+            },
+            move |err| {
+                err_ref.lock().unwrap().push(err.to_string());
+            },
         );
 
-        assert_eq!(snapshots.lock().unwrap().len(), 0, "连接失败时不应调用 on_snapshot");
-        assert_eq!(errors.lock().unwrap().len(), 1, "连接失败时应调用一次 on_error");
+        assert_eq!(
+            snapshots.lock().unwrap().len(),
+            0,
+            "连接失败时不应调用 on_snapshot"
+        );
+        assert_eq!(
+            errors.lock().unwrap().len(),
+            1,
+            "连接失败时应调用一次 on_error"
+        );
         assert!(errors.lock().unwrap()[0].contains("mock 连接失败"));
     }
 
@@ -355,19 +362,56 @@ mod loop_tests {
 
         let err_ref = Arc::clone(&errors);
         let connect_fn = |_: &HostConfig, _: Option<&str>, _: Option<&str>| {
-            Err::<Session, AppError>(AppError::SshConnectionError("不应被调用".to_string()))
+            Err::<ExecTransport, AppError>(AppError::SshConnectionError("不应被调用".to_string()))
         };
 
         run_monitor_loop_with(
             connect_fn,
             make_host(),
-            None, None,
+            None,
+            None,
             "session-1".to_string(),
             shutdown,
             |_| {},
-            move |err| { err_ref.lock().unwrap().push(err.to_string()); },
+            move |err| {
+                err_ref.lock().unwrap().push(err.to_string());
+            },
         );
 
-        assert_eq!(errors.lock().unwrap().len(), 0, "shutdown=true 时不应调用 on_error");
+        assert_eq!(
+            errors.lock().unwrap().len(),
+            0,
+            "shutdown=true 时不应调用 on_error"
+        );
+    }
+
+    /// Monitoring 只通过 Exec capability 采集并发布结构化快照。
+    #[test]
+    fn exec_capability_produces_monitor_snapshot() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let snapshots_for_callback = snapshots.clone();
+        let shutdown_for_transport = shutdown.clone();
+
+        run_monitor_loop_with(
+            move |_, _, _| {
+                Ok(one_shot_exec(
+                    "CPU_TOTAL=100\nCPU_IDLE=20\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=25\nDISK_AVAIL=750\nDISK_TOTAL=1000".to_string(),
+                    shutdown_for_transport,
+                ))
+            },
+            make_host(),
+            Some("pw".to_string()),
+            None,
+            "session-1".to_string(),
+            shutdown,
+            move |snapshot| snapshots_for_callback.lock().unwrap().push(snapshot),
+            |_| panic!("采集成功时不应调用 on_error"),
+        );
+
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].session_id, "session-1");
+        assert_eq!(snapshots[0].disk_usage, 25.0);
     }
 }
