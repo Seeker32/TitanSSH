@@ -24,6 +24,9 @@ thiserror = "1.0"
 anyhow = "1.0"
 tauri-plugin-dialog = "2.6.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+
 [dev-dependencies]
 proptest = "1.4"
 mockall = "0.12"

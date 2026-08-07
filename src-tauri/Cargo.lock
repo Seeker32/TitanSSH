@@ -3513,6 +3513,7 @@ dependencies = [
  "keyring",
  "mockall",
  "proptest",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "ssh2",

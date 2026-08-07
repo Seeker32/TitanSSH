@@ -47,9 +47,47 @@ pub fn get_credential(key: &str) -> Result<String, AppError> {
     })
 }
 
-/// 从 OS 安全存储删除凭据
+/// 从 OS 安全存储删除凭据；macOS 直接按属性删除，避免 keyring 先读取密码触发授权弹窗
 /// - key: 凭据的唯一标识键
 /// - 若凭据不存在则静默成功，避免删除时报错影响主流程
+#[cfg(target_os = "macos")]
+pub fn delete_credential(key: &str) -> Result<(), AppError> {
+    delete_macos_credential_with(key, delete_macos_item)
+}
+
+/// 执行 macOS Keychain 直接删除查询；回调参数依次为 service 与 account
+#[cfg(target_os = "macos")]
+fn delete_macos_credential_with(
+    key: &str,
+    delete: impl FnOnce(&str, &str) -> security_framework::base::Result<()>,
+) -> Result<(), AppError> {
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+    match delete(SERVICE_NAME, key) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+        Err(error) => Err(AppError::SecureStoreError(error.to_string())),
+    }
+}
+
+/// 从用户默认 Keychain 直接删除匹配项，不读取其中的密码数据
+#[cfg(target_os = "macos")]
+fn delete_macos_item(service: &str, account: &str) -> security_framework::base::Result<()> {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+
+    let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)?;
+    let mut query = ItemSearchOptions::new();
+    query
+        .keychains(&[keychain])
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account);
+    query.delete()
+}
+
+/// 从非 macOS 的 OS 安全存储删除凭据；不存在时静默成功
+#[cfg(not(target_os = "macos"))]
 pub fn delete_credential(key: &str) -> Result<(), AppError> {
     let entry =
         Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
@@ -114,6 +152,40 @@ mod tests {
         // 不同主机的 key 不得相同
         assert_ne!(password_key("host-1"), password_key("host-2"));
         assert_ne!(passphrase_key("host-1"), passphrase_key("host-2"));
+    }
+
+    /// 验证 macOS 删除只提交 service/account 查询，不预读密码数据
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_delete_uses_direct_query_without_reading_password() {
+        // macOS 删除必须直接按 service/account 查询，不能先读取密码触发系统授权弹窗
+        let mut calls = Vec::new();
+        let result = delete_macos_credential_with("host-key", |service, account| {
+            calls.push((service.to_string(), account.to_string()));
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            calls,
+            vec![(SERVICE_NAME.to_string(), "host-key".to_string())]
+        );
+    }
+
+    /// 验证 macOS 删除仅忽略条目不存在错误，其他错误继续上抛
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_delete_only_ignores_missing_item_error() {
+        // 不存在条目应幂等成功，其他 Keychain 错误必须保留供上层诊断
+        let missing = delete_macos_credential_with("missing", |_, _| {
+            Err(security_framework::base::Error::from_code(-25300))
+        });
+        let invalid = delete_macos_credential_with("invalid", |_, _| {
+            Err(security_framework::base::Error::from_code(-50))
+        });
+
+        assert!(missing.is_ok());
+        assert!(matches!(invalid, Err(AppError::SecureStoreError(_))));
     }
 
     // --- OS keyring 集成测试（set / get / delete 完整链路）---
