@@ -11,6 +11,8 @@ import type {
 
 interface SftpState {
   sessionStates: Map<string, SftpSessionState>;
+  /** invoke 返回前到达的任务状态事件缓存，任务元数据到达后补投 */
+  pendingTaskEvents: Map<string, SftpTaskStatusEvent>;
   getState: (sessionId: string) => SftpSessionState | undefined;
   ensureState: (sessionId: string) => SftpSessionState;
   listDir: (sessionId: string, path: string) => Promise<void>;
@@ -21,6 +23,7 @@ interface SftpState {
   clearSession: (sessionId: string) => void;
   applyProgress: (event: SftpProgressEvent) => void;
   applyTaskStatus: (event: SftpTaskStatusEvent) => void;
+  applyBufferedTaskStatus: (taskId: string) => void;
   initListeners: () => Promise<() => void>;
 }
 
@@ -45,6 +48,7 @@ function updateSession(
 
 export const useSftpStore = create<SftpState>((set, get) => ({
   sessionStates: new Map(),
+  pendingTaskEvents: new Map(),
 
   /** 获取指定会话状态；不存在时返回 undefined。 */
   getState(sessionId) {
@@ -77,16 +81,18 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     }
   },
 
-  /** 发起下载任务并写入对应会话的任务队列。 */
+  /** 发起下载任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。 */
   async download(sessionId, remotePath, localPath) {
     const task = await invoke<TransferTask>('sftp_download', { sessionId, remotePath, localPath });
     updateSession(set, sessionId, (state) => ({ ...state, tasks: new Map(state.tasks).set(task.taskId, task) }));
+    get().applyBufferedTaskStatus(task.taskId);
   },
 
-  /** 发起上传任务并写入对应会话的任务队列。 */
+  /** 发起上传任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。 */
   async upload(sessionId, localPath, remotePath) {
     const task = await invoke<TransferTask>('sftp_upload', { sessionId, localPath, remotePath });
     updateSession(set, sessionId, (state) => ({ ...state, tasks: new Map(state.tasks).set(task.taskId, task) }));
+    get().applyBufferedTaskStatus(task.taskId);
   },
 
   /** 取消指定传输任务。 */
@@ -103,12 +109,16 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     });
   },
 
-  /** 清理已关闭会话的全部 SFTP 状态。 */
+  /** 清理已关闭会话的全部 SFTP 状态与同会话的缓存事件。 */
   clearSession(sessionId) {
     set((state) => {
       const sessionStates = new Map(state.sessionStates);
       sessionStates.delete(sessionId);
-      return { sessionStates };
+      const pendingTaskEvents = new Map(state.pendingTaskEvents);
+      for (const [taskId, event] of pendingTaskEvents) {
+        if (event.sessionId === sessionId) pendingTaskEvents.delete(taskId);
+      }
+      return { sessionStates, pendingTaskEvents };
     });
   },
 
@@ -125,11 +135,16 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     }));
   },
 
-  /** 应用传输任务终态；完成时强制进度为总大小。 */
+  /** 应用传输任务终态；完成时强制进度为总大小。未知任务缓存最新事件。 */
   applyTaskStatus(event) {
     const state = get().sessionStates.get(event.sessionId);
     const task = state?.tasks.get(event.taskId);
-    if (!state || !task) return;
+    if (!task) {
+      set((state) => ({
+        pendingTaskEvents: new Map(state.pendingTaskEvents).set(event.taskId, event),
+      }));
+      return;
+    }
     updateSession(set, event.sessionId, (current) => ({
       ...current,
       tasks: new Map(current.tasks).set(event.taskId, {
@@ -139,6 +154,18 @@ export const useSftpStore = create<SftpState>((set, get) => ({
         transferredBytes: event.status === 'Done' ? task.totalBytes : task.transferredBytes,
       }),
     }));
+  },
+
+  /** 任务元数据到达后补投缓存的状态事件；事件不再落回缓存。 */
+  applyBufferedTaskStatus(taskId: string) {
+    const buffered = get().pendingTaskEvents.get(taskId);
+    if (!buffered) return;
+    set((state) => {
+      const pendingTaskEvents = new Map(state.pendingTaskEvents);
+      pendingTaskEvents.delete(taskId);
+      return { pendingTaskEvents };
+    });
+    get().applyTaskStatus(buffered);
   },
 
   /** 注册 SFTP 进度和任务状态事件，返回清理函数。 */

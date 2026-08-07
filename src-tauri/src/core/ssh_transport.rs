@@ -554,6 +554,42 @@ pub(crate) mod test_support {
         dropped: std::sync::mpsc::Sender<()>,
     }
 
+    /// 内存 SFTP adapter：open_read 返回固定内容，create 接受写入后丢弃。
+    struct MemorySftp {
+        content: Vec<u8>,
+    }
+
+    impl SftpOps for MemorySftp {
+        /// 返回空目录。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Ok(Vec::new())
+        }
+
+        /// 返回固定内容的字节数。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Ok(self.content.len() as u64)
+        }
+
+        /// 返回固定内容的只读游标。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(std::io::Cursor::new(self.content.clone())),
+            })
+        }
+
+        /// 返回丢弃写入的空游标，使传输成功完成。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(std::io::Cursor::new(Vec::new())),
+            })
+        }
+
+        /// 删除操作直接成功。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
     impl Drop for DropSignalSftp {
         /// 通知测试 capability 已被释放。
         fn drop(&mut self) {
@@ -614,6 +650,11 @@ pub(crate) mod test_support {
     /// 创建在释放时发送信号的 SFTP 测试 capability。
     pub(crate) fn drop_signal_sftp(dropped: std::sync::mpsc::Sender<()>) -> SftpTransport {
         SftpTransport::from_backend(DropSignalSftp { dropped })
+    }
+
+    /// 创建支持内存读写（丢弃写入内容）的 SFTP 测试 capability，供 worker 全链路测试。
+    pub(crate) fn memory_sftp(content: Vec<u8>) -> SftpTransport {
+        SftpTransport::from_backend(MemorySftp { content })
     }
 }
 

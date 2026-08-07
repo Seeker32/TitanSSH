@@ -179,4 +179,42 @@ describe('Zustand stores', () => {
     useSftpStore.getState().clearSession('session-1');
     expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
   });
+
+  it('监控任务事件先于 invoke 返回时补投最新状态，终态不丢失', async () => {
+    let resolveInvoke!: (task: TaskInfo) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<TaskInfo>((resolve) => { resolveInvoke = resolve; }));
+    const startPromise = useMonitorStore.getState().startMonitoring('session-1');
+
+    // invoke 返回前到达的事件：Running 先到，Failed 后到，latest-wins
+    useMonitorStore.getState().applyTaskStatus({ taskId: 'task-1', status: TaskStatus.Running });
+    useMonitorStore.getState().applyTaskStatus({ taskId: 'task-1', status: TaskStatus.Failed, message: 'collect failed' });
+    resolveInvoke(makeTaskInfo());
+    await startPromise;
+
+    expect(useMonitorStore.getState().tasks.get('task-1')?.status).toBe(TaskStatus.Failed);
+    expect(useMonitorStore.getState().pendingTaskEvents.has('task-1')).toBe(false);
+  });
+
+  it('SFTP 终态事件先于 invoke 返回时补投，进度强制为总大小', async () => {
+    let resolveInvoke!: (task: TransferTask) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<TransferTask>((resolve) => { resolveInvoke = resolve; }));
+    const downloadPromise = useSftpStore.getState().download('session-1', '/var/log/syslog', '/tmp/syslog');
+
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-sftp-1', sessionId: 'session-1', status: 'Done', errorMessage: null });
+    resolveInvoke(makeTransferTask());
+    await downloadPromise;
+
+    const task = useSftpStore.getState().getState('session-1')?.tasks.get('task-sftp-1');
+    expect(task?.status).toBe('Done');
+    expect(task?.transferredBytes).toBe(makeTransferTask().totalBytes);
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-sftp-1')).toBe(false);
+  });
+
+  it('clearSession 清理同会话的缓存任务事件', () => {
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Running', errorMessage: null });
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-y', sessionId: 'session-2', status: 'Running', errorMessage: null });
+    useSftpStore.getState().clearSession('session-1');
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-y')).toBe(true);
+  });
 });

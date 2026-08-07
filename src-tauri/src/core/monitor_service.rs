@@ -113,9 +113,8 @@ impl MonitorService {
 
         // 启动后台监控工作线程
         thread::spawn(move || {
-            // 更新任务状态为 Running
-            update_task_status(&tasks_ref, &task_id, TaskStatus::Running);
-            emit_task_status(&app, &task_id, TaskStatus::Running, None);
+            // 迁移到 Running：registry 先行更新，事件随后发布
+            transition_task_status(&tasks_ref, &app, &task_id, TaskStatus::Running, None);
 
             let tasks_for_error = Arc::clone(&tasks_ref);
             let app_for_error = app.clone();
@@ -138,10 +137,10 @@ impl MonitorService {
                         let mut snapshots = snapshots_ref.lock().unwrap();
                         snapshots.insert(session_id_for_snap.clone(), snapshot.clone());
                     }
-                    // 推送事件到前端，失败则标记任务为 Failed
+                    // 推送事件到前端，失败则迁移任务为 Failed（Failed 为终态，只迁移一次）
                     if let Err(err) = app_for_snap.emit("monitor:snapshot", &snapshot) {
-                        update_task_status(&tasks_for_snap, &task_id_for_snap, TaskStatus::Failed);
-                        emit_task_status(
+                        transition_task_status(
+                            &tasks_for_snap,
                             &app_for_snap,
                             &task_id_for_snap,
                             TaskStatus::Failed,
@@ -150,9 +149,9 @@ impl MonitorService {
                     }
                 },
                 move |err| {
-                    // 采集失败：更新任务状态为 Failed 并派发事件
-                    update_task_status(&tasks_for_error, &task_id_for_error, TaskStatus::Failed);
-                    emit_task_status(
+                    // 采集失败：迁移任务为 Failed（终态，worker 返回后的 Done 会被拒绝）
+                    transition_task_status(
+                        &tasks_for_error,
                         &app_for_error,
                         &task_id_for_error,
                         TaskStatus::Failed,
@@ -161,9 +160,8 @@ impl MonitorService {
                 },
             );
 
-            // run_monitor_loop 正常退出（shutdown=true）时更新为 Done
-            update_task_status(&tasks_ref, &task_id, TaskStatus::Done);
-            emit_task_status(&app, &task_id, TaskStatus::Done, None);
+            // 循环退出时迁移为 Done；若已 Failed 或已被 stop 移除，迁移被拒绝且不发事件
+            transition_task_status(&tasks_ref, &app, &task_id, TaskStatus::Done, None);
         });
 
         Ok(task_info)
@@ -208,21 +206,45 @@ impl MonitorService {
     }
 }
 
-/// 更新任务 HashMap 中指定任务的状态
+/// 迁移任务状态：registry 先更新，再发布事件；任务不存在或迁移非法时拒绝。
+///
+/// 状态机：Pending → Running → {Done, Failed}；Failed / Done 为终态，
+/// 已停止（从 registry 移除）的任务拒绝一切后续迁移。
 ///
 /// # 参数
-/// - `tasks`: 任务 HashMap 的共享引用
-/// - `task_id`: 要更新的任务 ID
-/// - `status`: 新的任务状态
-fn update_task_status(
+/// - `tasks`: 任务 registry 的共享引用
+/// - `app`: Tauri 应用句柄（泛型，支持真实运行时和测试 MockRuntime）
+/// - `task_id`: 任务 ID
+/// - `status`: 目标状态
+/// - `message`: 可选的附加消息（如错误详情）
+///
+/// # 返回
+/// true 表示迁移成功且已发布事件；false 表示被拒绝（未知任务或非法迁移）
+fn transition_task_status<R: Runtime>(
     tasks: &Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
+    app: &AppHandle<R>,
     task_id: &str,
     status: TaskStatus,
-) {
+    message: Option<String>,
+) -> bool {
     let mut tasks = tasks.lock().unwrap();
-    if let Some(handle) = tasks.get_mut(task_id) {
-        handle.task_info.status = status;
+    let Some(handle) = tasks.get_mut(task_id) else {
+        return false;
+    };
+    let legal = matches!(
+        (&handle.task_info.status, &status),
+        (TaskStatus::Pending, TaskStatus::Running)
+            | (TaskStatus::Running, TaskStatus::Done)
+            | (TaskStatus::Running, TaskStatus::Failed)
+    );
+    if !legal {
+        return false;
     }
+    handle.task_info.status = status.clone();
+    drop(tasks);
+
+    emit_task_status(app, task_id, status, message);
+    true
 }
 
 /// 派发任务状态变更事件到前端
@@ -321,6 +343,196 @@ mod service_tests {
         // 任务已从 HashMap 移除
         let tasks = service.tasks.lock().unwrap();
         assert!(!tasks.contains_key(&task.task_id));
+    }
+
+    // ─── 任务状态迁移权威化测试 ──────────────────────────────────────────────
+
+    /// 构造已注册的测试任务句柄。
+    fn insert_task(service: &MonitorService, task_id: &str, session_id: &str, status: TaskStatus) {
+        service.tasks.lock().unwrap().insert(
+            task_id.to_string(),
+            MonitorTaskHandle {
+                task_info: TaskInfo {
+                    task_id: task_id.to_string(),
+                    task_type: "monitor".to_string(),
+                    session_id: Some(session_id.to_string()),
+                    status,
+                    created_at: 1_710_000_000_000,
+                },
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    /// 迁移必须先把 registry 更新到新状态，再发布一次事件。
+    #[test]
+    fn transition_updates_registry_then_emits_event() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = MonitorService::new();
+        insert_task(&service, "task-1", "session-1", TaskStatus::Pending);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("task:status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(transition_task_status(
+            &service.tasks,
+            &app.handle(),
+            "task-1",
+            TaskStatus::Running,
+            None
+        ));
+        assert_eq!(
+            service
+                .tasks
+                .lock()
+                .unwrap()
+                .get("task-1")
+                .unwrap()
+                .task_info
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+    }
+
+    /// Failed 为终态：worker 返回后再尝试转 Done 必须被拒绝，且不得再发事件。
+    #[test]
+    fn failed_task_never_transitions_to_done() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = MonitorService::new();
+        insert_task(&service, "task-1", "session-1", TaskStatus::Running);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("task:status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(transition_task_status(
+            &service.tasks,
+            &app.handle(),
+            "task-1",
+            TaskStatus::Failed,
+            Some("监控采集失败".to_string())
+        ));
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+
+        // 模拟 worker 返回后无条件补发 Done 的旧路径
+        assert!(!transition_task_status(
+            &service.tasks,
+            &app.handle(),
+            "task-1",
+            TaskStatus::Done,
+            None
+        ));
+        assert_eq!(
+            service
+                .tasks
+                .lock()
+                .unwrap()
+                .get("task-1")
+                .unwrap()
+                .task_info
+                .status,
+            TaskStatus::Failed,
+            "Failed 后 registry 不得被覆盖为 Done"
+        );
+        assert_eq!(
+            emitted.load(Ordering::Relaxed),
+            1,
+            "Failed 后不得再发 Done 事件"
+        );
+    }
+
+    /// registry 中不存在的任务（已被 stop 移除）迁移被拒绝且不发事件。
+    #[test]
+    fn transition_rejected_for_unknown_task_emits_nothing() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = MonitorService::new();
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("task:status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(!transition_task_status(
+            &service.tasks,
+            &app.handle(),
+            "ghost-task",
+            TaskStatus::Done,
+            None
+        ));
+        assert_eq!(emitted.load(Ordering::Relaxed), 0);
+    }
+
+    /// Pending 直接 Failed 不属于合法迁移：worker 必须先 Running 再失败。
+    #[test]
+    fn pending_to_failed_is_rejected() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = MonitorService::new();
+        insert_task(&service, "task-1", "session-1", TaskStatus::Pending);
+
+        assert!(!transition_task_status(
+            &service.tasks,
+            &app.handle(),
+            "task-1",
+            TaskStatus::Failed,
+            Some("不应直接失败".to_string())
+        ));
+        assert_eq!(
+            service
+                .tasks
+                .lock()
+                .unwrap()
+                .get("task-1")
+                .unwrap()
+                .task_info
+                .status,
+            TaskStatus::Pending
+        );
+    }
+
+    /// stop 后任务从 registry 移除：worker 迟到的 Done 迁移被拒绝且不发事件。
+    #[test]
+    fn stopped_task_suppresses_late_terminal_transition() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = MonitorService::new();
+        insert_task(&service, "task-1", "session-1", TaskStatus::Running);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("task:status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        service.stop_monitoring("task-1");
+
+        assert!(!transition_task_status(
+            &service.tasks,
+            &app.handle(),
+            "task-1",
+            TaskStatus::Done,
+            None
+        ));
+        assert_eq!(emitted.load(Ordering::Relaxed), 0);
     }
 
     /// stop_session 只清理目标 Session 的任务与快照，不影响其他 Session。

@@ -7,6 +7,8 @@ interface MonitorState {
   snapshots: Map<string, MonitorSnapshot>;
   tasks: Map<string, TaskInfo>;
   sessionTaskMap: Map<string, string>;
+  /** invoke 返回前到达的任务状态事件缓存，任务元数据到达后补投 */
+  pendingTaskEvents: Map<string, TaskStatusEvent>;
   getSessionTask: (sessionId: string) => TaskInfo | null;
   applySnapshot: (snapshot: MonitorSnapshot) => void;
   applyTaskStatus: (event: TaskStatusEvent) => void;
@@ -21,6 +23,7 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   snapshots: new Map(),
   tasks: new Map(),
   sessionTaskMap: new Map(),
+  pendingTaskEvents: new Map(),
 
   /** 获取指定会话关联的监控任务。 */
   getSessionTask(sessionId) {
@@ -33,10 +36,15 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     set((state) => ({ snapshots: new Map(state.snapshots).set(snapshot.sessionId, snapshot) }));
   },
 
-  /** 应用长任务状态事件；未知任务保持忽略。 */
+  /** 应用长任务状态事件；未知任务缓存最新事件，元数据到达后补投。 */
   applyTaskStatus(event) {
     const existing = get().tasks.get(event.taskId);
-    if (!existing) return;
+    if (!existing) {
+      set((state) => ({
+        pendingTaskEvents: new Map(state.pendingTaskEvents).set(event.taskId, event),
+      }));
+      return;
+    }
     set((state) => ({
       tasks: new Map(state.tasks).set(event.taskId, { ...existing, status: event.status }),
     }));
@@ -49,13 +57,19 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     return snapshot;
   },
 
-  /** 启动指定会话的监控长任务。 */
+  /** 启动指定会话的监控长任务；invoke 返回前到达的事件补投到任务状态。 */
   async startMonitoring(sessionId) {
     const task = await invoke<TaskInfo>('start_monitoring', { sessionId });
-    set((state) => ({
-      tasks: new Map(state.tasks).set(task.taskId, task),
-      sessionTaskMap: new Map(state.sessionTaskMap).set(sessionId, task.taskId),
-    }));
+    set((state) => {
+      const pendingTaskEvents = new Map(state.pendingTaskEvents);
+      const buffered = pendingTaskEvents.get(task.taskId);
+      pendingTaskEvents.delete(task.taskId);
+      return {
+        tasks: new Map(state.tasks).set(task.taskId, buffered ? { ...task, status: buffered.status } : task),
+        sessionTaskMap: new Map(state.sessionTaskMap).set(sessionId, task.taskId),
+        pendingTaskEvents,
+      };
+    });
     return task;
   },
 

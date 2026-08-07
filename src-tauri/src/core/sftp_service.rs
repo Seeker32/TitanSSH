@@ -342,7 +342,7 @@ impl SftpService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(task_id.clone(), cancel_token.clone());
 
-        spawn_transfer_task(
+        self.spawn_transfer_task(
             task_id,
             session_id,
             remote_path,
@@ -422,7 +422,7 @@ impl SftpService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(task_id.clone(), cancel_token.clone());
-        spawn_transfer_task(
+        self.spawn_transfer_task(
             task_id,
             session_id,
             full_remote_path,
@@ -464,9 +464,79 @@ impl SftpService {
         // 任务已为终态，静默成功
     }
 
+    /// 迁移任务状态：registry 先更新，再发布事件；任务不存在或迁移非法时拒绝。
+    ///
+    /// 状态机：Pending → {Running, Cancelled}，Running → {Done, Failed, Cancelled}；
+    /// Done / Failed / Cancelled 为终态。终态迁移时同步移除取消令牌，
+    /// 使 cancel_task 与 cleanup 不再触碰已结束的任务。
+    ///
+    /// # 参数
+    /// - `app`: Tauri 应用句柄，用于推送事件
+    /// - `task_id`: 任务 ID
+    /// - `session_id`: 关联会话 ID
+    /// - `status`: 目标状态
+    /// - `error_message`: 失败原因；Failed 时为具体错误描述，其余为 None
+    ///
+    /// # 返回
+    /// true 表示迁移成功且已发布事件；false 表示被拒绝（未知任务或非法迁移）
+    fn transition_task<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        task_id: &str,
+        session_id: &str,
+        status: SftpTaskStatus,
+        error_message: Option<String>,
+    ) -> bool {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        let legal = matches!(
+            (&task.status, &status),
+            (SftpTaskStatus::Pending, SftpTaskStatus::Running)
+                | (SftpTaskStatus::Pending, SftpTaskStatus::Cancelled)
+                | (SftpTaskStatus::Running, SftpTaskStatus::Done)
+                | (SftpTaskStatus::Running, SftpTaskStatus::Failed)
+                | (SftpTaskStatus::Running, SftpTaskStatus::Cancelled)
+        );
+        if !legal {
+            return false;
+        }
+        task.status = status.clone();
+        task.error_message = error_message.clone();
+        drop(tasks);
+
+        // 终态后移除取消令牌；session 已关闭时（cleanup 后）跳过
+        if is_terminal(&status) {
+            if let Ok(handle) = self.handle(session_id) {
+                handle
+                    .cancel_tokens
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(task_id);
+            }
+        }
+
+        let _ = app.emit(
+            "sftp:task_status",
+            SftpTaskStatusEvent {
+                task_id: task_id.to_string(),
+                session_id: session_id.to_string(),
+                status,
+                error_message,
+            },
+        );
+        true
+    }
+
     /// 清理指定 session 的所有任务（session 关闭时调用）
     ///
-    /// 取消所有 Pending/Running 任务，推送 sftp:task_status = Cancelled
+    /// 只取消并迁移尚未终态的任务（registry 为权威状态），推送一次
+    /// sftp:task_status = Cancelled；终态任务不再重复取消或发矛盾事件。
+    /// 清理完成后该 session 的任务从 registry 整体移除。
     pub fn cleanup_session<R: Runtime>(&self, session_id: &str, app: &AppHandle<R>) {
         let handle = self
             .handles
@@ -475,33 +545,149 @@ impl SftpService {
             .remove(session_id);
         if let Some(handle) = handle {
             handle.connection.close();
-            let cancel_tokens = handle
-                .cancel_tokens
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut tasks = self
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (task_id, token) in cancel_tokens.iter() {
+            // 收集该 session 尚未终态的任务（短暂持锁，不跨远程 IO）
+            let active: Vec<(String, CancelToken)> = {
+                let cancel_tokens = handle
+                    .cancel_tokens
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cancel_tokens
+                    .iter()
+                    .filter(|(task_id, _)| {
+                        matches!(tasks.get(*task_id), Some(task) if !is_terminal(&task.status))
+                    })
+                    .map(|(task_id, token)| (task_id.clone(), token.clone()))
+                    .collect()
+            };
+            for (task_id, token) in active {
                 token.cancel();
-                if let Some(task) = tasks.get_mut(task_id) {
-                    if task.status == SftpTaskStatus::Pending
-                        || task.status == SftpTaskStatus::Running
-                    {
-                        task.status = SftpTaskStatus::Cancelled;
-                        let event = SftpTaskStatusEvent {
-                            task_id: task_id.clone(),
-                            session_id: session_id.to_string(),
-                            status: SftpTaskStatus::Cancelled,
-                            error_message: None,
-                        };
-                        let _ = app.emit("sftp:task_status", event);
-                    }
-                }
+                self.transition_task(app, &task_id, session_id, SftpTaskStatus::Cancelled, None);
             }
+            // registry 只保留活任务：session 关闭后整体移除，迟到的 worker 迁移因任务不存在被拒绝
+            self.tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|_, task| task.session_id != session_id);
         }
     }
+
+    /// 在独立 tokio task 中执行传输，等待信号量 permit，通过 transition 更新 registry 并推送状态事件
+    ///
+    /// # 参数
+    /// - `task_id`: 任务唯一 ID
+    /// - `session_id`: 关联会话 ID
+    /// - `remote_path`: 远程文件路径
+    /// - `local_path`: 本地文件路径
+    /// - `total_bytes`: 文件总大小
+    /// - `transfer_type`: 传输方向
+    /// - `transport`: Session 专属 SFTP capability
+    /// - `cancel_token`: 取消令牌
+    /// - `app`: Tauri 应用句柄
+    fn spawn_transfer_task<R: Runtime + 'static>(
+        &self,
+        task_id: String,
+        session_id: String,
+        remote_path: String,
+        local_path: String,
+        total_bytes: u64,
+        transfer_type: TransferType,
+        transport: Arc<Mutex<SftpTransport>>,
+        cancel_token: CancelToken,
+        app: AppHandle<R>,
+    ) {
+        let semaphore = get_semaphore();
+        let service = self.clone();
+        tokio::spawn(async move {
+            // 等待信号量 permit（全局最多 5 个并发）
+            let _permit = semaphore.acquire().await.unwrap();
+
+            if cancel_token.is_cancelled() {
+                // 入队后即被取消：迁移到 Cancelled；若已由 cleanup 迁移则被拒绝
+                service.transition_task(
+                    &app,
+                    &task_id,
+                    &session_id,
+                    SftpTaskStatus::Cancelled,
+                    None,
+                );
+                return;
+            }
+
+            // 迁移到 Running
+            service.transition_task(&app, &task_id, &session_id, SftpTaskStatus::Running, None);
+
+            let task_id_clone = task_id.clone();
+            let session_id_clone = session_id.clone();
+            let app_clone = app.clone();
+            let cancel_token_clone = cancel_token.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                run_transfer_blocking(
+                    &task_id_clone,
+                    &session_id_clone,
+                    &remote_path,
+                    &local_path,
+                    total_bytes,
+                    &transfer_type,
+                    &transport,
+                    &cancel_token_clone,
+                    &app_clone,
+                )
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => {
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Done,
+                        None,
+                    );
+                }
+                Ok(Err(true)) => {
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Cancelled,
+                        None,
+                    );
+                }
+                Ok(Err(false)) => {
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Failed,
+                        Some("传输中断".to_string()),
+                    );
+                }
+                Err(e) => {
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Failed,
+                        Some(e.to_string()),
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// 判断任务状态是否为终态（不再接受任何迁移）
+fn is_terminal(status: &SftpTaskStatus) -> bool {
+    matches!(
+        status,
+        SftpTaskStatus::Done | SftpTaskStatus::Failed | SftpTaskStatus::Cancelled
+    )
 }
 
 /// 从 secure storage 读取运行时凭据并建立独立 SFTP transport。
@@ -524,127 +710,6 @@ fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
         }
     };
     ssh_transport::connect_sftp(host, password.as_deref(), passphrase.as_deref())
-}
-
-/// 在独立 tokio task 中执行传输，等待信号量 permit，推送状态事件
-///
-/// # 参数
-/// - `task_id`: 任务唯一 ID
-/// - `session_id`: 关联会话 ID
-/// - `remote_path`: 远程文件路径
-/// - `local_path`: 本地文件路径
-/// - `total_bytes`: 文件总大小
-/// - `transfer_type`: 传输方向
-/// - `transport`: Session 专属 SFTP capability
-/// - `cancel_token`: 取消令牌
-/// - `app`: Tauri 应用句柄
-fn spawn_transfer_task<R: Runtime + 'static>(
-    task_id: String,
-    session_id: String,
-    remote_path: String,
-    local_path: String,
-    total_bytes: u64,
-    transfer_type: TransferType,
-    transport: Arc<Mutex<SftpTransport>>,
-    cancel_token: CancelToken,
-    app: AppHandle<R>,
-) {
-    let semaphore = get_semaphore();
-    tokio::spawn(async move {
-        // 等待信号量 permit（全局最多 5 个并发）
-        let _permit = semaphore.acquire().await.unwrap();
-
-        if cancel_token.is_cancelled() {
-            let _ = app.emit(
-                "sftp:task_status",
-                SftpTaskStatusEvent {
-                    task_id,
-                    session_id,
-                    status: SftpTaskStatus::Cancelled,
-                    error_message: None,
-                },
-            );
-            return;
-        }
-
-        // 通知 Running
-        let _ = app.emit(
-            "sftp:task_status",
-            SftpTaskStatusEvent {
-                task_id: task_id.clone(),
-                session_id: session_id.clone(),
-                status: SftpTaskStatus::Running,
-                error_message: None,
-            },
-        );
-
-        let task_id_clone = task_id.clone();
-        let session_id_clone = session_id.clone();
-        let app_clone = app.clone();
-        let cancel_token_clone = cancel_token.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            run_transfer_blocking(
-                &task_id_clone,
-                &session_id_clone,
-                &remote_path,
-                &local_path,
-                total_bytes,
-                &transfer_type,
-                &transport,
-                &cancel_token_clone,
-                &app_clone,
-            )
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                let _ = app.emit(
-                    "sftp:task_status",
-                    SftpTaskStatusEvent {
-                        task_id,
-                        session_id,
-                        status: SftpTaskStatus::Done,
-                        error_message: None,
-                    },
-                );
-            }
-            Ok(Err(true)) => {
-                let _ = app.emit(
-                    "sftp:task_status",
-                    SftpTaskStatusEvent {
-                        task_id,
-                        session_id,
-                        status: SftpTaskStatus::Cancelled,
-                        error_message: None,
-                    },
-                );
-            }
-            Ok(Err(false)) => {
-                let _ = app.emit(
-                    "sftp:task_status",
-                    SftpTaskStatusEvent {
-                        task_id,
-                        session_id,
-                        status: SftpTaskStatus::Failed,
-                        error_message: Some("传输中断".to_string()),
-                    },
-                );
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "sftp:task_status",
-                    SftpTaskStatusEvent {
-                        task_id,
-                        session_id,
-                        status: SftpTaskStatus::Failed,
-                        error_message: Some(e.to_string()),
-                    },
-                );
-            }
-        }
-    });
 }
 
 /// 阻塞执行实际传输，每 500ms 推送进度
@@ -797,8 +862,11 @@ fn format_permissions(perm: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ssh_transport::test_support::{blocking_sftp, drop_signal_sftp, empty_sftp};
+    use crate::core::ssh_transport::test_support::{
+        blocking_sftp, drop_signal_sftp, empty_sftp, memory_sftp,
+    };
     use crate::models::host::{AuthType, HostConfig};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
@@ -1161,5 +1229,331 @@ mod tests {
         let service = SftpService::new();
         service.cancel_task("task-already-done");
         // 不 panic 即通过
+    }
+
+    // ─── 任务状态迁移权威化测试 ──────────────────────────────────────────────
+
+    /// 构造已注册的传输任务，同时注册取消令牌，返回令牌供断言。
+    fn insert_task(service: &SftpService, task_id: &str, status: SftpTaskStatus) -> CancelToken {
+        let token = CancelToken::new();
+        service
+            .handle("session-1")
+            .unwrap()
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert(task_id.to_string(), token.clone());
+        service.tasks.lock().unwrap().insert(
+            task_id.to_string(),
+            TransferTask {
+                task_id: task_id.to_string(),
+                session_id: "session-1".to_string(),
+                transfer_type: TransferType::Download,
+                remote_path: "/tmp/file".to_string(),
+                local_path: "/local/file".to_string(),
+                file_name: "file".to_string(),
+                total_bytes: 1024,
+                transferred_bytes: 0,
+                speed_bps: 0,
+                status,
+                error_message: None,
+                created_at: 0,
+            },
+        );
+        token
+    }
+
+    /// 轮询 registry 直到任务到达终态；超时 panic。
+    fn wait_for_terminal(service: &SftpService, task_id: &str) -> SftpTaskStatus {
+        for _ in 0..200 {
+            let status = service
+                .tasks
+                .lock()
+                .unwrap()
+                .get(task_id)
+                .map(|task| task.status.clone());
+            if let Some(status) = status {
+                if matches!(
+                    status,
+                    SftpTaskStatus::Done | SftpTaskStatus::Failed | SftpTaskStatus::Cancelled
+                ) {
+                    return status;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("任务 {} 未在 2 秒内到达终态", task_id);
+    }
+
+    /// 迁移必须先更新 registry 再发布事件；终态后取消令牌被移除。
+    #[test]
+    fn transition_updates_registry_emits_and_removes_token_on_terminal() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        let token = insert_task(&service, "task-1", SftpTaskStatus::Pending);
+
+        assert!(service.transition_task(
+            &app.handle(),
+            "task-1",
+            "session-1",
+            SftpTaskStatus::Running,
+            None
+        ));
+        assert_eq!(
+            service.tasks.lock().unwrap().get("task-1").unwrap().status,
+            SftpTaskStatus::Running
+        );
+
+        assert!(service.transition_task(
+            &app.handle(),
+            "task-1",
+            "session-1",
+            SftpTaskStatus::Done,
+            None
+        ));
+        let task = service.tasks.lock().unwrap().get("task-1").unwrap().clone();
+        assert_eq!(task.status, SftpTaskStatus::Done);
+        assert!(task.error_message.is_none());
+        assert!(
+            service
+                .handle("session-1")
+                .unwrap()
+                .cancel_tokens
+                .lock()
+                .unwrap()
+                .get("task-1")
+                .is_none(),
+            "终态后取消令牌应从 handles 移除"
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    /// 终态任务拒绝继续迁移，且不得再发事件。
+    #[test]
+    fn terminal_task_rejects_further_transitions() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        insert_task(&service, "task-1", SftpTaskStatus::Done);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("sftp:task_status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(!service.transition_task(
+            &app.handle(),
+            "task-1",
+            "session-1",
+            SftpTaskStatus::Running,
+            None
+        ));
+        assert_eq!(
+            service.tasks.lock().unwrap().get("task-1").unwrap().status,
+            SftpTaskStatus::Done
+        );
+        assert_eq!(emitted.load(Ordering::Relaxed), 0, "终态后不得再发事件");
+    }
+
+    /// registry 中不存在的任务迁移被拒绝且不发事件。
+    #[test]
+    fn transition_rejected_for_unknown_task_emits_nothing() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("sftp:task_status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(!service.transition_task(
+            &app.handle(),
+            "ghost-task",
+            "session-1",
+            SftpTaskStatus::Done,
+            None
+        ));
+        assert_eq!(emitted.load(Ordering::Relaxed), 0);
+    }
+
+    /// cleanup_session 不得重复取消已终态任务，也不得发矛盾事件；任务随后从 registry 移除。
+    #[test]
+    fn cleanup_session_skips_terminal_tasks() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        let token = insert_task(&service, "task-1", SftpTaskStatus::Done);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("sftp:task_status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        service.cleanup_session("session-1", &app.handle().clone());
+
+        assert!(
+            !token.is_cancelled(),
+            "终态任务的取消令牌不应被 cleanup 触发"
+        );
+        assert_eq!(
+            emitted.load(Ordering::Relaxed),
+            0,
+            "cleanup 不应为终态任务发 Cancelled 事件"
+        );
+        assert!(
+            !service.tasks.lock().unwrap().contains_key("task-1"),
+            "cleanup 应从 registry 移除该 session 的任务"
+        );
+    }
+
+    /// cleanup_session 对非终态任务：触发令牌、迁移到 Cancelled 并发事件。
+    #[test]
+    fn cleanup_session_cancels_active_task_with_event() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::Listener;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        let token = insert_task(&service, "task-1", SftpTaskStatus::Running);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_ref = emitted.clone();
+        app.listen("sftp:task_status", move |_| {
+            emitted_ref.fetch_add(1, Ordering::Relaxed);
+        });
+
+        service.cleanup_session("session-1", &app.handle().clone());
+
+        assert!(token.is_cancelled(), "非终态任务的令牌应被 cleanup 触发");
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+        assert!(
+            !service.tasks.lock().unwrap().contains_key("task-1"),
+            "cleanup 后 registry 不应保留该 session 的任务"
+        );
+    }
+
+    // ─── worker 更新 registry 的全链路测试 ─────────────────────────────────
+
+    /// 上传 worker 完成真实传输后，registry 由 worker 更新为 Done 并移除令牌。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_worker_updates_registry_to_done() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![1u8, 2, 3])));
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path = std::env::temp_dir().join(format!("titan-upload-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(registry_task.status, SftpTaskStatus::Done);
+        assert!(registry_task.error_message.is_none());
+        assert!(
+            service
+                .handle("session-1")
+                .unwrap()
+                .cancel_tokens
+                .lock()
+                .unwrap()
+                .get(&task.task_id)
+                .is_none(),
+            "worker 迁移到终态后应移除取消令牌"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 下载 worker 完成真实传输后，registry 由 worker 更新为 Done，内容写入本地。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_worker_updates_registry_to_done() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![7u8; 4096])));
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-download-{}.bin", Uuid::new_v4()));
+        let task = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            std::fs::metadata(&local_path).unwrap().len(),
+            4096,
+            "下载内容应写入本地文件"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 传输失败时 worker 把 registry 更新为 Failed。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failing_worker_updates_registry_to_failed() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service(); // empty_sftp：open_read/create 失败
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path = std::env::temp_dir().join(format!("titan-fail-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"x").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let _ = std::fs::remove_file(&local_path);
     }
 }
