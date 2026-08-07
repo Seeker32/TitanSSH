@@ -56,3 +56,13 @@ Must not: demo code, mix layers, skip TDD, break the event model
 Jump host, docker, plugins, cloud sync
 
 > Final rule: if it isn't tested, it doesn't exist.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
