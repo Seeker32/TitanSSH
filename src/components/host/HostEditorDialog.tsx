@@ -1,11 +1,13 @@
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useEffect, useState } from 'react';
-import { Button, Form, Input, InputNumber, Modal, Select } from 'antd';
+import { AutoComplete, Button, Form, Input, InputNumber, Modal, Select } from 'antd';
 import { AuthType, type HostConfig, type SaveHostRequest } from '@/types/host';
 
 interface Props {
   open: boolean;
   editingHost: HostConfig | null;
+  /** 已有分组名列表，供分组字段下拉复用 */
+  groups: string[];
   onClose: () => void;
   onSave: (request: SaveHostRequest) => void;
 }
@@ -28,7 +30,7 @@ function formFromHost(host: HostConfig | null): SaveHostRequest {
 }
 
 /** 渲染新建或编辑主机的安全凭据表单。 */
-export default function HostEditorDialog({ open, editingHost, onClose, onSave }: Props) {
+export default function HostEditorDialog({ open, editingHost, groups, onClose, onSave }: Props) {
   const [form, setForm] = useState<SaveHostRequest>(() => formFromHost(editingHost));
 
   useEffect(() => {
@@ -59,25 +61,26 @@ export default function HostEditorDialog({ open, editingHost, onClose, onSave }:
 
   const textProps = { autoCapitalize: 'none', autoComplete: 'off', spellCheck: false };
   return <Modal open={open} title={editingHost ? '编辑连接' : '新建连接'} onCancel={onClose}
-    onOk={submit} okText="保存连接" cancelText="取消" width={720} destroyOnHidden
+    onOk={submit} okText="保存连接" cancelText="取消" width={460} destroyOnHidden
     okButtonProps={{ disabled: form.authType === AuthType.PrivateKey && !form.privateKeyPath }}>
     <Form layout="vertical" className="host-form">
-      <div className="form-grid">
-        <Form.Item label="名称"><Input {...textProps} value={form.name} placeholder="生产服务器" onChange={(event) => update('name', event.target.value)} /></Form.Item>
-        <Form.Item label="地址"><Input {...textProps} value={form.host} placeholder="192.168.1.12" onChange={(event) => update('host', event.target.value)} /></Form.Item>
-        <Form.Item label="端口"><InputNumber min={1} max={65535} value={form.port} onChange={(value) => update('port', value ?? 22)} /></Form.Item>
-        <Form.Item label="用户名"><Input {...textProps} value={form.username} placeholder="root" onChange={(event) => update('username', event.target.value)} /></Form.Item>
-        <Form.Item label="认证方式"><Select value={form.authType} onChange={(value) => update('authType', value)}
-          options={[{ label: '密码', value: AuthType.Password }, { label: '私钥', value: AuthType.PrivateKey }]} /></Form.Item>
-        {form.authType === AuthType.Password ? <Form.Item label="密码"><Input.Password {...textProps} value={form.password}
-          placeholder="留空则保持原密码不变" onChange={(event) => update('password', event.target.value)} /></Form.Item>
-          : <Form.Item label="私钥路径" help={!form.privateKeyPath ? '请先选择私钥文件' : undefined}><Input {...textProps} readOnly value={form.privateKeyPath}
-            placeholder="点击浏览选择私钥文件" addonAfter={<Button onClick={pickPrivateKey}>浏览…</Button>} /></Form.Item>}
-        {form.authType === AuthType.PrivateKey && <Form.Item label="私钥口令"><Input.Password {...textProps}
-          value={form.passphrase} placeholder="留空则保持原口令不变" onChange={(event) => update('passphrase', event.target.value)} /></Form.Item>}
-        <Form.Item label="备注" className="form-full"><Input.TextArea {...textProps} rows={3} value={form.remark}
-          placeholder="业务说明 / 环境标签" onChange={(event) => update('remark', event.target.value)} /></Form.Item>
-      </div>
+      <Form.Item label="名称"><Input {...textProps} value={form.name} placeholder="生产服务器" onChange={(event) => update('name', event.target.value)} /></Form.Item>
+      <Form.Item label="地址"><Input {...textProps} value={form.host} placeholder="192.168.1.12" onChange={(event) => update('host', event.target.value)} /></Form.Item>
+      <Form.Item label="端口"><InputNumber min={1} max={65535} value={form.port} onChange={(value) => update('port', value ?? 22)} /></Form.Item>
+      <Form.Item label="用户名"><Input {...textProps} value={form.username} placeholder="root" onChange={(event) => update('username', event.target.value)} /></Form.Item>
+      <Form.Item label="认证方式"><Select aria-label="认证方式" value={form.authType} onChange={(value) => update('authType', value)}
+        options={[{ label: '密码', value: AuthType.Password }, { label: '私钥', value: AuthType.PrivateKey }]} /></Form.Item>
+      {form.authType === AuthType.Password ? <Form.Item label="密码"><Input.Password {...textProps} value={form.password}
+        placeholder="留空则保持原密码不变" onChange={(event) => update('password', event.target.value)} /></Form.Item>
+        : <Form.Item label="私钥路径" help={!form.privateKeyPath ? '请先选择私钥文件' : undefined}><Input {...textProps} readOnly value={form.privateKeyPath}
+          placeholder="点击浏览选择私钥文件" addonAfter={<Button onClick={pickPrivateKey}>浏览…</Button>} /></Form.Item>}
+      {form.authType === AuthType.PrivateKey && <Form.Item label="私钥口令"><Input.Password {...textProps}
+        value={form.passphrase} placeholder="留空则保持原口令不变" onChange={(event) => update('passphrase', event.target.value)} /></Form.Item>}
+      <Form.Item label="分组"><AutoComplete aria-label="分组" value={form.group} placeholder="分组（可输入新组名）"
+        options={groups.map((name) => ({ value: name }))} filterOption
+        onChange={(value) => update('group', value)} /></Form.Item>
+      <Form.Item label="备注"><Input.TextArea {...textProps} rows={3} value={form.remark}
+        placeholder="业务说明 / 环境标签" onChange={(event) => update('remark', event.target.value)} /></Form.Item>
     </Form>
   </Modal>;
 }

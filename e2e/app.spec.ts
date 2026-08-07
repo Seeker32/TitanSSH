@@ -34,6 +34,7 @@ test.beforeEach(async ({ page }) => {
         if (command === 'plugin:dialog|save') return '/tmp/syslog';
         if (command === 'plugin:dialog|open') return '/tmp/upload.txt';
         if (command === 'list_hosts') return [host];
+        if (command === 'save_host') return [{ ...host, name: args.request?.name ?? host.name, group: args.request?.group ?? '' }];
         if (command === 'open_session') return session;
         if (command === 'start_monitoring') return task;
         if (command === 'sftp_list_dir') return [{ name: 'syslog', path: '/syslog', isDir: false, size: 100, modifiedAt: Date.now(), permissions: 'rw-r--r--' }];
@@ -80,6 +81,18 @@ test('侧栏主机列表：双击打开会话，单击不连接', async ({ page 
   await sidebar.getByText('prod').dblclick();
   expect(await openCalls()).toBe(1);
   await expect(page.getByRole('tab', { name: /root@10.0.0.8/ })).toBeVisible();
+});
+
+test('新建主机携带分组保存', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('新建主机').click();
+  await page.getByPlaceholder('生产服务器').fill('web-1');
+  await page.getByPlaceholder('192.168.1.12').fill('10.0.0.10');
+  await page.getByRole('combobox', { name: '分组' }).fill('blue-team');
+  await page.getByRole('button', { name: '保存连接' }).click();
+  await expect(page.locator('.sidebar').getByText('web-1')).toBeVisible();
+  const saveCall = await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string; args: { request?: { group?: string } } }> } }).__TAURI_TEST__.calls.find((call) => call.command === 'save_host'));
+  expect(saveCall?.args?.request?.group).toBe('blue-team');
 });
 
 test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) => {

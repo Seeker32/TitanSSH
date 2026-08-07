@@ -171,6 +171,8 @@ export default function HomePage() {
           onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId)} onRetry={retry} />}
       </div>
     </section>
-    <HostEditorDialog open={editorOpen} editingHost={editingHost} onClose={() => setEditorOpen(false)} onSave={saveHost} />
+    <HostEditorDialog open={editorOpen} editingHost={editingHost} groups={useMemo(
+      () => [...new Set(hosts.map((host) => host.group).filter(Boolean))], [hosts])}
+      onClose={() => setEditorOpen(false)} onSave={saveHost} />
   </div>;
 }

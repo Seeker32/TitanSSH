@@ -160,7 +160,7 @@ describe('React components', () => {
   it('主机表单编辑时不回填密码，并按认证方式清理字段', async () => {
     const user = userEvent.setup();
     const save = vi.fn();
-    render(<HostEditorDialog open editingHost={makeHost()} onClose={vi.fn()} onSave={save} />);
+    render(<HostEditorDialog open editingHost={makeHost()} groups={[]} onClose={vi.fn()} onSave={save} />);
     expect(screen.getByDisplayValue('prod')).toBeInTheDocument();
     const password = screen.getByPlaceholderText('留空则保持原密码不变');
     expect(password).toHaveValue('');
@@ -169,13 +169,32 @@ describe('React components', () => {
     expect(save).toHaveBeenCalledWith(expect.objectContaining({ authType: AuthType.Password, password: 'new-secret', privateKeyPath: undefined, group: 'production' }));
   });
 
+  it('主机表单可输入新分组名并随保存提交', async () => {
+    const user = userEvent.setup();
+    const save = vi.fn();
+    render(<HostEditorDialog open editingHost={null} groups={['production']} onClose={vi.fn()} onSave={save} />);
+    await user.type(screen.getByRole('combobox', { name: '分组' }), 'blue-team');
+    await user.click(screen.getByText('保存连接'));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ group: 'blue-team' }));
+  });
+
+  it('主机表单可选择已有分组', async () => {
+    const user = userEvent.setup();
+    const save = vi.fn();
+    render(<HostEditorDialog open editingHost={null} groups={['production', 'staging']} onClose={vi.fn()} onSave={save} />);
+    await user.click(screen.getByRole('combobox', { name: '分组' }));
+    await user.click(await screen.findByText('staging'));
+    await user.click(screen.getByText('保存连接'));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ group: 'staging' }));
+  });
+
   it('私钥模式通过系统选择器选择私钥路径并回填保存', async () => {
     const user = userEvent.setup();
     const save = vi.fn();
     vi.mocked(openFileDialog).mockResolvedValueOnce('/Users/me/.ssh/id_ed25519');
-    render(<HostEditorDialog open editingHost={makeHost()} onClose={vi.fn()} onSave={save} />);
+    render(<HostEditorDialog open editingHost={makeHost()} groups={[]} onClose={vi.fn()} onSave={save} />);
     expect(screen.queryByRole('button', { name: /浏览/ })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('combobox'));
+    await user.click(screen.getByRole('combobox', { name: '认证方式' }));
     await user.click(await screen.findByText('私钥'));
     await user.click(screen.getByRole('button', { name: /浏览/ }));
     expect(await screen.findByDisplayValue('/Users/me/.ssh/id_ed25519')).toBeInTheDocument();
@@ -188,7 +207,7 @@ describe('React components', () => {
     const user = userEvent.setup();
     const save = vi.fn();
     vi.mocked(openFileDialog).mockResolvedValueOnce(null);
-    render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} onClose={vi.fn()} onSave={save} />);
+    render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} groups={[]} onClose={vi.fn()} onSave={save} />);
     await user.click(screen.getByRole('button', { name: /浏览/ }));
     expect(screen.getByPlaceholderText('点击浏览选择私钥文件')).toHaveValue('');
     fireEvent.click(screen.getByText('保存连接'));
@@ -196,7 +215,7 @@ describe('React components', () => {
   });
 
   it('私钥路径为空时禁用保存并显示引导文案', () => {
-    render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} onClose={vi.fn()} onSave={vi.fn()} />);
+    render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} groups={[]} onClose={vi.fn()} onSave={vi.fn()} />);
     expect(screen.getByText('请先选择私钥文件')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /保存连接/ })).toBeDisabled();
   });
