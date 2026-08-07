@@ -27,6 +27,7 @@ export default function HomePage() {
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
   const sftpStates = useSftpStore((state) => state.sessionStates);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
+  const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
   const theme = useThemeStore((state) => state.theme);
   const sessions = useMemo(() => [...sessionsMap.values()], [sessionsMap]);
   const snapshot = activeView === 'home' ? null : monitorSnapshots.get(activeView) ?? null;
@@ -148,6 +149,8 @@ export default function HomePage() {
           onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}</Button>
       </div>
       <HostListSidebar hosts={filterHosts(hosts, searchQuery)} searchQuery={searchQuery} selectedHostId={selectedHostId}
+        collapsedGroups={collapsedGroups}
+        onToggleGroup={(name) => useLayoutStore.getState().toggleGroupCollapsed(name)}
         onSearchChange={(query) => useHostStore.getState().setSearchQuery(query)}
         onSelect={(hostId) => useHostStore.getState().selectHost(hostId)}
         onOpen={openSession} onCreate={createHost} />

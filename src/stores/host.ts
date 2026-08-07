@@ -25,6 +25,29 @@ export function filterHosts(hosts: HostConfig[], query: string): HostConfig[] {
     host.name.toLowerCase().includes(keyword) || host.host.toLowerCase().includes(keyword));
 }
 
+/** 主机分组，name 为空串表示"未分组"。 */
+export interface HostGroup {
+  name: string;
+  hosts: HostConfig[];
+}
+
+/** 按分组名聚合主机：具名组按名称排序，未分组恒排最后，空组不出现。 */
+export function groupHosts(hosts: HostConfig[]): HostGroup[] {
+  const groups = new Map<string, HostConfig[]>();
+  for (const host of hosts) {
+    const list = groups.get(host.group) ?? [];
+    list.push(host);
+    groups.set(host.group, list);
+  }
+  const named = [...groups.entries()]
+    .filter(([name]) => name !== '')
+    .sort(([a], [b]) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .map(([name, list]) => ({ name, hosts: list }));
+  const ungrouped = groups.get('') ?? [];
+  if (ungrouped.length === 0) return named;
+  return [...named, { name: '', hosts: ungrouped }];
+}
+
 export const useHostStore = create<HostState>((set) => ({
   hosts: [],
   loading: false,

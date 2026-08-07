@@ -75,6 +75,15 @@ button { cursor: pointer; }
 .sidebar-create-btn { padding: 4px 14px; border: 1px solid var(--color-border); border-radius: 6px;
   background: var(--color-card-bg); color: var(--color-accent); font-size: 12px; }
 .sidebar-create-btn:hover { border-color: var(--color-border-focus); background: var(--color-card-bg-hover); }
+.host-group { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+.host-group-header { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 6px;
+  color: var(--color-text-tertiary); font-size: 11px; cursor: pointer; user-select: none; }
+.host-group-header:hover { background: var(--color-card-bg-hover); color: var(--color-text-secondary); }
+.host-group-chevron { transition: transform .15s; }
+.host-group-header--collapsed .host-group-chevron { transform: rotate(-90deg); }
+.host-group-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .04em; }
+.host-group-count { font-size: 10px; opacity: .7; }
+.host-group-body { display: flex; flex-direction: column; gap: 4px; padding-left: 4px; }
 .sidebar-resizer { position: relative; width: 8px; flex-shrink: 0; cursor: col-resize; }
 .sidebar-resizer::before { content: ''; position: absolute; inset: 0 auto 0 3px; width: 2px; border-radius: 99px; background: var(--color-border); }
 .sidebar-resizer:hover::before, .page-shell--resizing .sidebar-resizer::before { background: var(--color-accent); }

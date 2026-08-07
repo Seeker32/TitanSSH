@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
-import { filterHosts, useHostStore } from '@/stores/host';
-import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, useLayoutStore } from '@/stores/layout';
+import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
+import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
@@ -63,6 +63,37 @@ describe('Zustand stores', () => {
     expect(useHostStore.getState().selectedHostId).toBe('host-2');
     useHostStore.getState().selectHost(null);
     expect(useHostStore.getState().selectedHostId).toBeNull();
+  });
+
+  it('主机分组：组名排序、未分组排最后', () => {
+    const hosts = [
+      makeHost({ id: 'h1', group: '' }),
+      makeHost({ id: 'h2', name: 'b-host', group: 'beta' }),
+      makeHost({ id: 'h3', name: 'a-host', group: 'alpha' }),
+      makeHost({ id: 'h4', name: 'z-host', group: '' }),
+    ];
+    const groups = groupHosts(hosts);
+    expect(groups.map((group) => group.name)).toEqual(['alpha', 'beta', '']);
+    expect(groups[2].hosts.map((host) => host.id)).toEqual(['h1', 'h4']);
+    expect(groups[0].hosts[0].id).toBe('h3');
+  });
+
+  it('全部已分组时无未分组头', () => {
+    const groups = groupHosts([makeHost({ group: 'alpha' }), makeHost({ id: 'h2', group: 'beta' })]);
+    expect(groups.map((group) => group.name)).toEqual(['alpha', 'beta']);
+  });
+
+  it('分组折叠状态可切换并写入本地存储', () => {
+    localStorage.removeItem('collapsed-groups');
+    useLayoutStore.setState({ collapsedGroups: [] });
+    useLayoutStore.getState().toggleGroupCollapsed('alpha');
+    expect(useLayoutStore.getState().collapsedGroups).toEqual(['alpha']);
+    expect(readCollapsedGroups()).toEqual(['alpha']);
+    useLayoutStore.getState().toggleGroupCollapsed('alpha');
+    expect(useLayoutStore.getState().collapsedGroups).toEqual([]);
+    useLayoutStore.getState().toggleGroupCollapsed('beta');
+    useLayoutStore.getState().toggleGroupCollapsed('alpha');
+    expect(readCollapsedGroups()).toEqual(['beta', 'alpha']);
   });
 
   it('侧栏宽度使用默认值并限制最小值与主区域空间', () => {

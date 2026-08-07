@@ -6,6 +6,7 @@ import FileExplorer from '@/components/sftp/FileExplorer';
 import HomeQuickActions from '@/components/home/HomeQuickActions';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
+import { groupHosts } from '@/stores/host';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import SftpPanel from '@/components/sftp/SftpPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
@@ -42,7 +43,8 @@ describe('React components', () => {
   it('侧栏主机卡片渲染服务器图标，单击选中、双击连接', async () => {
     const user = userEvent.setup();
     const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
-    render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} {...handlers} />);
+    render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} collapsedGroups={[]}
+      onToggleGroup={vi.fn()} {...handlers} />);
     const card = screen.getByText('prod').closest('[role="button"]')!;
     expect(card.querySelector('svg')).not.toBeNull();
     await user.click(screen.getByText('prod'));
@@ -56,10 +58,12 @@ describe('React components', () => {
   it('侧栏搜索可过滤并按结果展示空态', async () => {
     const user = userEvent.setup();
     const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
-    const { rerender } = render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} {...handlers} />);
+    const { rerender } = render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} collapsedGroups={[]}
+      onToggleGroup={vi.fn()} {...handlers} />);
     await user.type(screen.getByPlaceholderText('搜索主机…'), 'prod');
     expect(handlers.onSearchChange).toHaveBeenCalledWith('p');
-    rerender(<HostListSidebar hosts={[]} searchQuery="prod" selectedHostId={null} {...handlers} />);
+    rerender(<HostListSidebar hosts={[]} searchQuery="prod" selectedHostId={null} collapsedGroups={[]}
+      onToggleGroup={vi.fn()} {...handlers} />);
     expect(screen.getByText('未找到匹配的主机')).toBeInTheDocument();
   });
 
@@ -71,6 +75,37 @@ describe('React components', () => {
     expect(screen.getByText(/暂无主机/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '新建第一个主机' }));
     expect(onCreate).toHaveBeenCalledOnce();
+  });
+
+  it('侧栏按分组渲染且未分组排最后，分组头折叠展开', async () => {
+    const user = userEvent.setup();
+    const onToggleGroup = vi.fn();
+    const hosts = [makeHost({ group: '' }), makeHost({ id: 'h2', name: 'staging', group: 'prod-env' })];
+    const { container, rerender } = render(<HostListSidebar hosts={hosts} searchQuery="" selectedHostId={null}
+      collapsedGroups={[]} onToggleGroup={onToggleGroup}
+      onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    const headers = container.querySelectorAll('.host-group-header');
+    expect(headers).toHaveLength(2);
+    expect(headers[0].textContent).toContain('prod-env');
+    expect(headers[1].textContent).toContain('未分组');
+    await user.click(screen.getByTestId('group-header-prod-env'));
+    expect(onToggleGroup).toHaveBeenCalledWith('prod-env');
+    rerender(<HostListSidebar hosts={hosts} searchQuery="" selectedHostId={null} collapsedGroups={['prod-env']}
+      onToggleGroup={onToggleGroup} onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    expect(screen.queryByText('staging')).not.toBeInTheDocument();
+    expect(screen.getByText('prod')).toBeInTheDocument();
+  });
+
+  it('搜索时以平铺列表展示，不显示分组头', () => {
+    render(<HostListSidebar hosts={[makeHost()]} searchQuery="prod" selectedHostId={null} collapsedGroups={[]}
+      onToggleGroup={vi.fn()} onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    expect(screen.queryByText('未分组')).not.toBeInTheDocument();
+    expect(screen.getByText('prod')).toBeInTheDocument();
+  });
+
+  it('分组函数：空分组不产生分组头', () => {
+    expect(groupHosts([])).toEqual([]);
+    expect(groupHosts([makeHost({ group: '' })])).toEqual([{ name: '', hosts: [makeHost({ group: '' })] }]);
   });
 
   it('终端标签保持首页并按会话状态渲染和关闭', async () => {

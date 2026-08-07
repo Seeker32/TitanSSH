@@ -8,6 +8,7 @@ test.beforeEach(async ({ page }) => {
     let callbackId = 0;
     let listenerId = 0;
     const host = { id: 'host-1', name: 'prod', host: '10.0.0.8', port: 22, username: 'root', authType: 'Password', passwordRef: 'secret-ref', remark: 'primary', group: '' };
+    const groupedHost = { ...host, id: 'host-2', name: 'staging', host: '10.0.0.9', username: 'deploy', group: 'prod-env' };
     const session = { sessionId: 'session-1', hostId: 'host-1', host: '10.0.0.8', port: 22, username: 'root', status: 'Connecting', createdAt: Date.now() };
     const task = { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: 'Pending', createdAt: Date.now() };
     const transfer = { taskId: 'transfer-1', sessionId: 'session-1', transferType: 'Download', remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'syslog', totalBytes: 100, transferredBytes: 0, speedBps: 0, status: 'Pending', errorMessage: null, createdAt: Date.now() };
@@ -33,7 +34,7 @@ test.beforeEach(async ({ page }) => {
         if (command === 'plugin:event|unlisten') return undefined;
         if (command === 'plugin:dialog|save') return '/tmp/syslog';
         if (command === 'plugin:dialog|open') return '/tmp/upload.txt';
-        if (command === 'list_hosts') return [host];
+        if (command === 'list_hosts') return [host, groupedHost];
         if (command === 'save_host') return [{ ...host, name: args.request?.name ?? host.name, group: args.request?.group ?? '' }];
         if (command === 'open_session') return session;
         if (command === 'start_monitoring') return task;
@@ -75,10 +76,10 @@ test('侧栏主机列表：双击打开会话，单击不连接', async ({ page 
   await page.goto('/');
   const openCalls = () => page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string }> } }).__TAURI_TEST__.calls.filter((call) => call.command === 'open_session').length);
   const sidebar = page.locator('.sidebar');
-  await expect(sidebar.getByText('prod')).toBeVisible();
-  await sidebar.getByText('prod').click();
+  await expect(sidebar.getByText('prod', { exact: true })).toBeVisible();
+  await sidebar.getByText('prod', { exact: true }).click();
   expect(await openCalls()).toBe(0);
-  await sidebar.getByText('prod').dblclick();
+  await sidebar.getByText('prod', { exact: true }).dblclick();
   expect(await openCalls()).toBe(1);
   await expect(page.getByRole('tab', { name: /root@10.0.0.8/ })).toBeVisible();
 });
@@ -93,6 +94,21 @@ test('新建主机携带分组保存', async ({ page }) => {
   await expect(page.locator('.sidebar').getByText('web-1')).toBeVisible();
   const saveCall = await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string; args: { request?: { group?: string } } }> } }).__TAURI_TEST__.calls.find((call) => call.command === 'save_host'));
   expect(saveCall?.args?.request?.group).toBe('blue-team');
+});
+
+test('侧栏分组渲染、折叠且刷新后保持', async ({ page }) => {
+  await page.goto('/');
+  const sidebar = page.locator('.sidebar');
+  await expect(sidebar.getByText('prod-env')).toBeVisible();
+  await expect(sidebar.getByText('未分组')).toBeVisible();
+  const headerNames = await sidebar.locator('.host-group-name').allTextContents();
+  expect(headerNames).toEqual(['prod-env', '未分组']);
+  await sidebar.getByText('prod-env').click();
+  await expect(sidebar.getByText('staging')).toBeHidden();
+  await page.reload();
+  await expect(sidebar.getByText('staging')).toBeHidden();
+  await sidebar.getByText('prod-env').click();
+  await expect(sidebar.getByText('staging')).toBeVisible();
 });
 
 test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) => {
