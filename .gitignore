@@ -1,6 +1,9 @@
 # Frontend
 node_modules/
 dist/
+.pnpm-store/
+test-results/
+playwright-report/
 
 # Backend
 src-tauri/target/

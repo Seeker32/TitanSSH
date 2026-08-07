@@ -1,15 +1,16 @@
 # SSH Terminal Manager
 
-A cross-platform desktop application for managing SSH server connections and terminal sessions, built with Tauri + Vue 3 + Rust.
+A cross-platform desktop application for managing SSH server connections and terminal sessions, built with Tauri + React + Rust.
 
 ## Tech Stack
 
 ### Frontend
-- **Framework**: Vue 3 + TypeScript
+- **Framework**: React 19 + TypeScript
 - **Build Tool**: Vite
-- **State Management**: Pinia
+- **State Management**: Zustand
 - **Terminal**: xterm.js + xterm-addon-fit
-- **Testing**: Vitest + @vue/test-utils + fast-check
+- **UI**: Ant Design 6
+- **Testing**: Vitest + React Testing Library + Playwright
 
 ### Backend
 - **Framework**: Tauri 2.x
@@ -23,13 +24,13 @@ A cross-platform desktop application for managing SSH server connections and ter
 
 ```
 ssh-terminal-manager/
-├── src/                   # Vue 3 frontend application
-│   ├── components/        # Vue components
+├── src/                   # React frontend application
+│   ├── components/        # React components
 │   │   ├── host/          # Server configuration UI
 │   │   ├── terminal/      # Terminal components
 │   │   ├── status/        # Status monitoring UI
 │   │   └── layout/        # Layout components
-│   ├── stores/            # Pinia stores
+│   ├── stores/            # Zustand stores
 │   ├── types/             # TypeScript type definitions
 │   ├── pages/             # Page components
 │   └── test/              # Test setup
@@ -57,7 +58,7 @@ ssh-terminal-manager/
 
 ### Prerequisites
 
-- **Node.js**: v18 or higher
+- **Node.js**: v22.13 or higher
 - **pnpm**: Latest version (or npm/yarn)
 - **Rust**: Latest stable (install via [rustup](https://rustup.rs/))
 - **System Dependencies**:
@@ -98,6 +99,8 @@ Run frontend tests:
 ```bash
 pnpm test              # Run once
 pnpm test:watch        # Watch mode
+pnpm exec playwright install chromium  # First-time E2E browser install
+pnpm test:e2e          # Browser-level mocked Tauri flow
 ```
 
 Run backend tests:
@@ -151,7 +154,7 @@ The built application will be in `src-tauri/target/release/bundle/`.
 ### Communication Flow
 
 ```
-Frontend (Vue 3)
+Frontend (React 19)
     ↓ Tauri Commands
 Backend (Rust)
     ↓ SSH Protocol
@@ -159,7 +162,7 @@ Remote Server
     ↑ PTY Output
 Backend (Rust)
     ↑ Tauri Events
-Frontend (Vue 3)
+Frontend (React 19)
 ```
 
 ### Key Components
@@ -168,12 +171,12 @@ Frontend (Vue 3)
 - **SshClient**: Handles SSH connections and authentication
 - **MonitorWorker**: Collects server status periodically
 - **HostStore**: Persists server configurations
-- **Pinia Stores**: Frontend state management
+- **Zustand Stores**: Frontend state management
 
 ## Development Guidelines
 
 ### Code Style
-- Frontend: Follow Vue 3 Composition API best practices
+- Frontend: Follow React Hooks and Zustand immutable update best practices
 - Backend: Follow Rust standard conventions
 - Use TypeScript strict mode
 - Write tests for critical functionality
@@ -211,4 +214,3 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please read the design document in `.kiro/specs/ssh-terminal-manager/` for detailed architecture information.
-
