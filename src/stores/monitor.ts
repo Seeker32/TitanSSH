@@ -13,6 +13,7 @@ interface MonitorState {
   fetchSnapshot: (sessionId: string) => Promise<MonitorSnapshot>;
   startMonitoring: (sessionId: string) => Promise<TaskInfo>;
   stopMonitoring: (sessionId: string) => Promise<void>;
+  clearSession: (sessionId: string) => void;
   initListeners: () => Promise<() => void>;
 }
 
@@ -67,6 +68,20 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
       const sessionTaskMap = new Map(state.sessionTaskMap);
       sessionTaskMap.delete(sessionId);
       return { sessionTaskMap };
+    });
+  },
+
+  /** 清理已由后端 teardown 的会话监控 projection，不再发送停止命令。 */
+  clearSession(sessionId) {
+    set((state) => {
+      const taskId = state.sessionTaskMap.get(sessionId);
+      const sessionTaskMap = new Map(state.sessionTaskMap);
+      const snapshots = new Map(state.snapshots);
+      const tasks = new Map(state.tasks);
+      sessionTaskMap.delete(sessionId);
+      snapshots.delete(sessionId);
+      if (taskId) tasks.delete(taskId);
+      return { sessionTaskMap, snapshots, tasks };
     });
   },
 

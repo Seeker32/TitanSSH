@@ -165,6 +165,18 @@ impl MonitorService {
         }
     }
 
+    /// 停止指定会话的全部监控任务；用于后端统一执行 Session teardown。
+    pub fn stop_session(&self, session_id: &str) {
+        self.tasks.lock().unwrap().retain(|_, handle| {
+            let keep = handle.task_info.session_id.as_deref() != Some(session_id);
+            if !keep {
+                handle.shutdown.store(true, Ordering::Release);
+            }
+            keep
+        });
+        self.snapshots.lock().unwrap().remove(session_id);
+    }
+
     /// 获取指定会话的最新监控快照
     ///
     /// # 参数
@@ -270,5 +282,52 @@ mod service_tests {
         // 任务已从 HashMap 移除
         let tasks = service.tasks.lock().unwrap();
         assert!(!tasks.contains_key(&task.task_id));
+    }
+
+    /// stop_session 只清理目标 Session 的任务与快照，不影响其他 Session。
+    #[test]
+    fn stop_session_cleans_only_matching_monitor_state() {
+        let service = MonitorService::new();
+        let target_shutdown = Arc::new(AtomicBool::new(false));
+        let other_shutdown = Arc::new(AtomicBool::new(false));
+
+        for (task_id, session_id, shutdown) in [
+            ("target-task", "target-session", target_shutdown.clone()),
+            ("other-task", "other-session", other_shutdown.clone()),
+        ] {
+            service.tasks.lock().unwrap().insert(
+                task_id.to_string(),
+                MonitorTaskHandle {
+                    task_info: TaskInfo {
+                        task_id: task_id.to_string(),
+                        task_type: "monitor".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        status: TaskStatus::Running,
+                        created_at: 1_710_000_000_000,
+                    },
+                    shutdown,
+                },
+            );
+            service.snapshots.lock().unwrap().insert(
+                session_id.to_string(),
+                MonitorSnapshot {
+                    session_id: session_id.to_string(),
+                    timestamp: 1_710_000_000_000,
+                    cpu_usage: 10.0,
+                    memory_usage: 20.0,
+                    disk_usage: 30.0,
+                    disk_available_bytes: 40,
+                    disk_total_bytes: 50,
+                },
+            );
+        }
+
+        service.stop_session("target-session");
+
+        assert!(target_shutdown.load(Ordering::Acquire));
+        assert!(!other_shutdown.load(Ordering::Acquire));
+        assert!(service.get_monitor_status("target-session").is_none());
+        assert!(service.get_monitor_status("other-session").is_some());
+        assert!(service.tasks.lock().unwrap().contains_key("other-task"));
     }
 }

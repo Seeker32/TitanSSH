@@ -83,22 +83,52 @@ describe('Zustand stores', () => {
     cleanup();
   });
 
-  it('连接 watchdog 将长期 Connecting 收敛为 Timeout', async () => {
+  it('会话状态只消费后端事实并在连接成功时初始化文件传输', async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') return makeSession();
+      if (command === 'start_monitoring') return makeTaskInfo();
+      if (command === 'sftp_list_dir') return [];
+      return undefined;
+    });
+    await useSessionStore.getState().openSession('host-1');
+    const cleanup = await useSessionStore.getState().initListeners();
+    mockInvoke.mockClear();
+
+    emitMockEvent('session:status', {
+      sessionId: 'session-1', status: SessionStatus.Connected, message: null,
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/' });
+    expect(mockInvoke).not.toHaveBeenCalledWith('sync_session_status', expect.anything());
+    cleanup();
+  });
+
+  it('前端不会用 watchdog 覆盖后端 Session 状态', async () => {
     vi.useFakeTimers();
     mockInvoke.mockImplementation(async (command) => command === 'open_session' ? makeSession() : makeTaskInfo());
     await useSessionStore.getState().openSession('host-1');
     vi.advanceTimersByTime(15_000);
-    expect(useSessionStore.getState().sessions.get('session-1')?.status).toBe(SessionStatus.Timeout);
+    expect(useSessionStore.getState().sessions.get('session-1')?.status).toBe(SessionStatus.Connecting);
     vi.useRealTimers();
   });
 
-  it('关闭活动会话停止监控并回到首页', async () => {
+  it('关闭活动会话只调用后端 teardown 并清理前端 projection', async () => {
+    const task = makeTaskInfo();
     useSessionStore.setState({ sessions: new Map([['session-1', makeSession()]]), activeView: 'session-1' });
-    useMonitorStore.setState({ sessionTaskMap: new Map([['session-1', 'task-1']]) });
+    useMonitorStore.setState({
+      sessionTaskMap: new Map([['session-1', task.taskId]]),
+      tasks: new Map([[task.taskId, task]]),
+      snapshots: new Map([['session-1', makeSnapshot()]]),
+    });
     mockInvoke.mockResolvedValue(undefined);
     await useSessionStore.getState().closeSession('session-1');
+
     expect(useSessionStore.getState().activeView).toBe('home');
-    expect(mockInvoke).toHaveBeenCalledWith('stop_monitoring', { taskId: 'task-1' });
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
+    expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
+    expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
+    expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
   });
 
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {

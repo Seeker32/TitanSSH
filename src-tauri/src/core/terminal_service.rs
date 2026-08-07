@@ -74,6 +74,7 @@ pub enum TerminalCommand {
 /// - `session_id`: 会话唯一标识符
 /// - `command_rx`: 命令接收端，接收来自协调层的终端命令
 /// - `shutdown`: 关闭标志，设置为 true 时工作线程退出
+/// - `runtime_status`: 后端权威会话状态，事件发出前先更新
 /// - `session_tx`: 可选的 SSH session 回传通道，连接成功后发送 Arc<Mutex<Session>>
 pub fn start_terminal_session(
     app: AppHandle,
@@ -81,6 +82,7 @@ pub fn start_terminal_session(
     session_id: String,
     command_rx: Receiver<TerminalCommand>,
     shutdown: Arc<AtomicBool>,
+    runtime_status: Arc<Mutex<SessionStatus>>,
     session_tx: Option<std::sync::mpsc::SyncSender<Arc<Mutex<Session>>>>,
 ) {
     thread::spawn(move || {
@@ -105,7 +107,7 @@ pub fn start_terminal_session(
                 eprintln!("[session:{}][diagnostic] Credentials error: {}", session_id, error);
                 let (status, message) =
                     map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
-                emit_session_status(&app, &session_id, status, Some(message));
+                emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
                 return;
             }
             PhaseOutcome::TimedOut => {
@@ -113,6 +115,7 @@ pub fn start_terminal_session(
                 emit_session_status(
                     &app,
                     &session_id,
+                    &runtime_status,
                     SessionStatus::Timeout,
                     Some(phase_timeout_message(&ConnectionPhase::LoadingCredentials)),
                 );
@@ -155,7 +158,7 @@ pub fn start_terminal_session(
             Ok(Err(error)) => {
                 let active_phase = current_phase_value(&current_phase);
                 let (status, message) = map_phase_error_to_status(&active_phase, &error);
-                emit_session_status(&app, &session_id, status, Some(message));
+                emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -163,6 +166,7 @@ pub fn start_terminal_session(
                 emit_session_status(
                     &app,
                     &session_id,
+                    &runtime_status,
                     SessionStatus::Timeout,
                     Some(phase_timeout_message(&current_phase_value(&current_phase))),
                 );
@@ -172,6 +176,7 @@ pub fn start_terminal_session(
                 emit_session_status(
                     &app,
                     &session_id,
+                    &runtime_status,
                     SessionStatus::Error,
                     Some("连接线程异常退出".to_string()),
                 );
@@ -196,7 +201,7 @@ pub fn start_terminal_session(
                 let error = AppError::Ssh2Error(error);
                 let (status, message) =
                     map_phase_error_to_status(&ConnectionPhase::OpeningChannel, &error);
-                emit_session_status(&app, &session_id, status, Some(message));
+                emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
                 return;
             }
         };
@@ -207,7 +212,7 @@ pub fn start_terminal_session(
             let error = AppError::Ssh2Error(error);
             let (status, message) =
                 map_phase_error_to_status(&ConnectionPhase::RequestingPty, &error);
-            emit_session_status(&app, &session_id, status, Some(message));
+            emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
             return;
         }
 
@@ -217,7 +222,7 @@ pub fn start_terminal_session(
             let error = AppError::Ssh2Error(error);
             let (status, message) =
                 map_phase_error_to_status(&ConnectionPhase::StartingShell, &error);
-            emit_session_status(&app, &session_id, status, Some(message));
+            emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
             return;
         }
 
@@ -225,7 +230,13 @@ pub fn start_terminal_session(
         session.lock().unwrap().set_blocking(false);
 
         // 派发"已连接"状态事件
-        emit_session_status(&app, &session_id, SessionStatus::Connected, None);
+        emit_session_status(
+            &app,
+            &session_id,
+            &runtime_status,
+            SessionStatus::Connected,
+            None,
+        );
 
         // 终端数据读取缓冲区（UTF-8，4KB）
         let mut buffer = [0_u8; 4096];
@@ -253,6 +264,7 @@ pub fn start_terminal_session(
                     emit_session_status(
                         &app,
                         &session_id,
+                        &runtime_status,
                         SessionStatus::Disconnected,
                         Some(error.to_string()),
                     );
@@ -268,6 +280,7 @@ pub fn start_terminal_session(
                             emit_session_status(
                                 &app,
                                 &session_id,
+                                &runtime_status,
                                 SessionStatus::Error,
                                 Some(error.to_string()),
                             );
@@ -280,6 +293,7 @@ pub fn start_terminal_session(
                             emit_session_status(
                                 &app,
                                 &session_id,
+                                &runtime_status,
                                 SessionStatus::Error,
                                 Some(error.to_string()),
                             );
@@ -288,7 +302,13 @@ pub fn start_terminal_session(
                     TerminalCommand::Close => {
                         // 主动关闭：关闭通道并派发断开状态
                         let _ = channel.close();
-                        emit_session_status(&app, &session_id, SessionStatus::Disconnected, None);
+                        emit_session_status(
+                            &app,
+                            &session_id,
+                            &runtime_status,
+                            SessionStatus::Disconnected,
+                            None,
+                        );
                         return;
                     }
                 }
@@ -299,6 +319,7 @@ pub fn start_terminal_session(
                 emit_session_status(
                     &app,
                     &session_id,
+                    &runtime_status,
                     SessionStatus::Disconnected,
                     Some("连接已断开".to_string()),
                 );
@@ -525,13 +546,17 @@ fn emit_connection_progress(app: &AppHandle, session_id: &str, phase: Connection
 /// - `session_id`: 会话唯一标识符
 /// - `status`: 新的会话状态
 /// - `message`: 可选的状态附加消息（如错误详情）
-fn emit_session_status(
-    app: &AppHandle,
+fn emit_session_status<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     session_id: &str,
+    runtime_status: &Arc<Mutex<SessionStatus>>,
     status: SessionStatus,
     message: Option<String>,
 ) {
     eprintln!("[session:{}][diagnostic] emit_session_status: {:?}, message: {:?}", session_id, status, message);
+    *runtime_status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = status.clone();
     let result = app.emit(
         "session:status",
         SessionStatusEvent {
@@ -806,6 +831,29 @@ mod integration_tests {
             passphrase_ref: passphrase_ref.map(|s| s.to_string()),
             remark: None,
         }
+    }
+
+    /// 状态事件跨越 event seam 前必须先更新后端运行时状态。
+    #[test]
+    fn session_status_event_updates_backend_runtime_first() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        emit_session_status(
+            &app.handle().clone(),
+            "session-1",
+            &runtime_status,
+            SessionStatus::Connected,
+            None,
+        );
+
+        assert_eq!(
+            *runtime_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            SessionStatus::Connected
+        );
     }
 
     /// 验证 load_credentials：密码认证模式下 password_ref 为 None 时返回 InvalidHostConfig 错误

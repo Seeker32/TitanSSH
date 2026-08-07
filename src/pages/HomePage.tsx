@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Typography } from 'antd';
-import { listen } from '@tauri-apps/api/event';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import SftpPanel from '@/components/sftp/SftpPanel';
@@ -62,11 +61,6 @@ export default function HomePage() {
     useSessionStore.getState().initListeners().then(keep);
     useMonitorStore.getState().initListeners().then(keep);
     useSftpStore.getState().initListeners().then(keep);
-    listen<{ sessionId: string; status: string }>('session:status', (event) => {
-      if (event.payload.status === 'Connected') {
-        useSftpStore.getState().listDir(event.payload.sessionId, '/').catch(() => {});
-      }
-    }).then(keep);
     useHostStore.getState().loadHosts();
     return () => {
       disposed = true;

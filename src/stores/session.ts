@@ -1,14 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
-import type { MonitorSnapshot } from '@/types/monitor';
 import type { SessionInfo, SessionProgressEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { useMonitorStore } from './monitor';
 import { useSftpStore } from './sftp';
-
-const CONNECT_WATCHDOG_MS = 15_000;
-const connectWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
 
 interface SessionStatusPayload {
   sessionId: string;
@@ -16,15 +12,9 @@ interface SessionStatusPayload {
   message?: string | null;
 }
 
-interface TerminalDataPayload {
-  sessionId: string;
-  data: string;
-}
-
 interface SessionState {
   sessions: Map<string, SessionInfo>;
   activeView: 'home' | string;
-  snapshots: Map<string, MonitorSnapshot>;
   statusMessage: string;
   openSession: (hostId: string) => Promise<SessionInfo>;
   closeSession: (sessionId: string) => Promise<void>;
@@ -33,7 +23,6 @@ interface SessionState {
   setActiveView: (viewId: 'home' | string) => void;
   applySessionStatus: (payload: SessionStatusPayload) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
-  applySnapshot: (snapshot: MonitorSnapshot) => void;
   initListeners: () => Promise<() => void>;
 }
 
@@ -66,33 +55,9 @@ export function progressLabel(phase: ConnectionPhase, message?: string): string 
 }
 
 export const useSessionStore = create<SessionState>((set, get) => {
-  /** 清理指定会话的连接 watchdog。 */
-  function clearWatchdog(sessionId: string) {
-    const timer = connectWatchdogs.get(sessionId);
-    if (!timer) return;
-    clearTimeout(timer);
-    connectWatchdogs.delete(sessionId);
-  }
-
-  /** 注册指定会话的连接超时 watchdog。 */
-  function scheduleWatchdog(sessionId: string) {
-    clearWatchdog(sessionId);
-    connectWatchdogs.set(sessionId, setTimeout(() => {
-      const session = get().sessions.get(sessionId);
-      if (session?.status === SessionStatus.Connecting) {
-        get().applySessionStatus({
-          sessionId,
-          status: SessionStatus.Timeout,
-          message: `Connection watchdog timeout after ${CONNECT_WATCHDOG_MS / 1000}s`,
-        });
-      }
-    }, CONNECT_WATCHDOG_MS));
-  }
-
   return {
     sessions: new Map(),
     activeView: 'home',
-    snapshots: new Map(),
     statusMessage: '就绪',
 
     /** 打开 SSH 会话，并启动关联监控任务。 */
@@ -103,7 +68,6 @@ export const useSessionStore = create<SessionState>((set, get) => {
         activeView: session.sessionId,
         statusMessage: `正在连接 ${session.username}@${session.host}`,
       }));
-      scheduleWatchdog(session.sessionId);
       try {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
       } catch {
@@ -112,22 +76,15 @@ export const useSessionStore = create<SessionState>((set, get) => {
       return session;
     },
 
-    /** 关闭 SSH 会话，并停止监控及清理关联前端状态。 */
+    /** 关闭 SSH 会话；后端统一 teardown，前端只清理 projection。 */
     async closeSession(sessionId) {
-      clearWatchdog(sessionId);
-      try {
-        await useMonitorStore.getState().stopMonitoring(sessionId);
-      } catch {
-        // 监控停止失败不阻断会话关闭。
-      }
       await invoke('close_session', { sessionId });
       set((state) => {
         const sessions = new Map(state.sessions);
-        const snapshots = new Map(state.snapshots);
         sessions.delete(sessionId);
-        snapshots.delete(sessionId);
-        return { sessions, snapshots, activeView: state.activeView === sessionId ? 'home' : state.activeView };
+        return { sessions, activeView: state.activeView === sessionId ? 'home' : state.activeView };
       });
+      useMonitorStore.getState().clearSession(sessionId);
       useSftpStore.getState().clearSession(sessionId);
     },
 
@@ -146,20 +103,18 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set({ activeView });
     },
 
-    /** 应用会话状态事件，并同步后端会话元数据。 */
+    /** 应用后端权威会话状态；连接成功时初始化该会话的远程目录。 */
     applySessionStatus(payload) {
       const current = get().sessions.get(payload.sessionId);
-      if (payload.status !== SessionStatus.Connecting) clearWatchdog(payload.sessionId);
       set((state) => ({
         sessions: current
           ? new Map(state.sessions).set(payload.sessionId, { ...current, status: payload.status })
           : state.sessions,
         statusMessage: statusLabel(payload.status, payload.message ?? undefined),
       }));
-      Promise.resolve(invoke('sync_session_status', {
-        sessionId: payload.sessionId,
-        status: payload.status,
-      })).catch(() => {});
+      if (current && payload.status === SessionStatus.Connected) {
+        useSftpStore.getState().listDir(payload.sessionId, '/').catch(() => {});
+      }
     },
 
     /** 仅在连接中应用阶段诊断信息。 */
@@ -170,12 +125,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }
     },
 
-    /** 保存指定会话的监控快照兼容缓存。 */
-    applySnapshot(snapshot) {
-      set((state) => ({ snapshots: new Map(state.snapshots).set(snapshot.sessionId, snapshot) }));
-    },
-
-    /** 注册会话、终端和监控事件，返回统一清理函数。 */
+    /** 注册会话状态与连接进度事件，返回统一清理函数。 */
     async initListeners() {
       const unlistenStatus = await listen<SessionStatusPayload>('session:status', (event) => {
         get().applySessionStatus(event.payload);
@@ -183,15 +133,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
       const unlistenProgress = await listen<SessionProgressEvent>('session:progress', (event) => {
         get().applySessionProgress(event.payload);
       });
-      const unlistenData = await listen<TerminalDataPayload>('terminal:data', () => {});
-      const unlistenSnapshot = await listen<MonitorSnapshot>('monitor:snapshot', (event) => {
-        get().applySnapshot(event.payload);
-      });
       return () => {
         unlistenStatus();
         unlistenProgress();
-        unlistenData();
-        unlistenSnapshot();
       };
     },
   };

@@ -1,5 +1,5 @@
 use crate::core::session_manager::SessionManager;
-use crate::models::session::{SessionInfo, SessionStatus};
+use crate::models::session::SessionInfo;
 use crate::storage::host_store::HostStore;
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
@@ -89,7 +89,7 @@ pub fn resize_terminal(
 /// 获取所有活跃会话列表
 ///
 /// 返回 session_manager 内部 HashMap 中所有真实 SSH 会话的 SessionInfo 列表。
-/// 状态字段已通过 sync_session_status 保持与实际运行态一致。
+/// 状态字段直接来自后端运行时，不依赖前端回写。
 #[tauri::command]
 pub fn list_sessions(
     session_manager: State<'_, Mutex<SessionManager>>,
@@ -98,25 +98,4 @@ pub fn list_sessions(
         .lock()
         .map_err(|error| error.to_string())?
         .list_sessions())
-}
-
-/// 同步会话状态到后端元数据
-///
-/// 前端收到 session:status 事件后调用此命令，将状态变更写回 SessionManager 的 HashMap，
-/// 确保 list_sessions 返回的状态与实际运行态一致（修复 P1-1）。
-///
-/// # 参数
-/// - `session_id`: 会话唯一标识符
-/// - `status`: 新的会话状态
-#[tauri::command]
-pub fn sync_session_status(
-    session_id: String,
-    status: SessionStatus,
-    session_manager: State<'_, Mutex<SessionManager>>,
-) -> Result<(), String> {
-    session_manager
-        .lock()
-        .map_err(|error| error.to_string())?
-        .update_session_status(&session_id, status);
-    Ok(())
 }

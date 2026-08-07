@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
-import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
+import { emitMockEvent, listen, resetMockEvents } from '@tauri-apps/api/event';
 import HomePage from '@/pages/HomePage';
 import { useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
@@ -14,6 +14,7 @@ import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({ default: () => <div data-testid="xterm" /> }));
 const mockInvoke = vi.mocked(invoke);
+const mockListen = vi.mocked(listen);
 
 /** 重置首页会访问的全局 store。 */
 function resetStores() {
@@ -56,6 +57,16 @@ describe('HomePage integration', () => {
     });
     expect(screen.getByText('已连接')).toBeInTheDocument();
     expect(screen.getByText('21.5%')).toBeInTheDocument();
+  });
+
+  it('全局事件只由所属前端 module 监听一次', async () => {
+    render(<HomePage />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));
+    const eventNames = mockListen.mock.calls.map(([eventName]) => eventName);
+
+    expect(eventNames.filter((name) => name === 'session:status')).toHaveLength(1);
+    expect(eventNames.filter((name) => name === 'monitor:snapshot')).toHaveLength(1);
+    expect(eventNames.filter((name) => name === 'terminal:data')).toHaveLength(0);
   });
 
   it('拖动侧栏时更新并限制宽度', async () => {
