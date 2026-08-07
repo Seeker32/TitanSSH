@@ -16,6 +16,28 @@ fn get_semaphore() -> Arc<Semaphore> {
     TRANSFER_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(5))).clone()
 }
 
+/// 在阻塞模式下执行 SFTP 操作，完成后恢复非阻塞模式
+///
+/// terminal_service 将 session 设为非阻塞以支持终端 IO 循环，
+/// 但 libssh2 的 SFTP 子通道建立和文件操作需要阻塞模式才能正常完成。
+/// 此函数在持有 Mutex 锁期间临时切换为阻塞模式，操作完成后恢复，
+/// 确保终端 IO 线程下次获取锁时 session 仍处于非阻塞状态。
+///
+/// # 参数
+/// - `ssh`: 已锁定的 SSH session MutexGuard
+/// - `f`: 在阻塞模式下执行的闭包，返回 Result<T, E>
+fn with_blocking_session<T, E, F>(ssh: &std::sync::MutexGuard<Session>, f: F) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    // 切换为阻塞模式，确保 SFTP 子通道建立和 IO 操作不返回 WouldBlock
+    ssh.set_blocking(true);
+    let result = f();
+    // 无论成功或失败，恢复非阻塞模式供终端 IO 循环使用
+    ssh.set_blocking(false);
+    result
+}
+
 /// 取消令牌，用于通知传输任务退出
 #[derive(Clone)]
 pub struct CancelToken(Arc<std::sync::atomic::AtomicBool>);
@@ -89,32 +111,35 @@ impl SftpService {
         let ssh = handle.ssh_session.lock()
             .map_err(|e| AppError::SftpChannelError(e.to_string()))?;
 
-        let sftp = ssh.sftp()
-            .map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-
-        let entries_raw = sftp.readdir(Path::new(path))
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("No such file") || msg.contains("does not exist") {
-                    AppError::SftpPathNotFound(path.to_string())
-                } else if msg.contains("Permission denied") {
-                    AppError::SftpPermissionDenied(path.to_string())
-                } else {
-                    AppError::SftpChannelError(msg)
-                }
-            })?;
-
-        let mut entries: Vec<RemoteEntry> = entries_raw.into_iter().map(|(pb, stat)| {
-            let name = pb.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let full_path = pb.to_string_lossy().to_string();
-            let is_dir = stat.is_dir();
-            let size = if is_dir { 0 } else { stat.size.unwrap_or(0) };
-            let modified_at = stat.mtime.map(|t| t as i64 * 1000).unwrap_or(0);
-            let perm = stat.perm.map(|p| format_permissions(p)).unwrap_or_default();
-            RemoteEntry { name, path: full_path, is_dir, size, modified_at, permissions: perm }
-        }).collect();
+        // 临时切换为阻塞模式，避免 SFTP 子通道建立时返回 WouldBlock
+        // sftp 对象的整个生命周期（sftp() + readdir()）都必须在阻塞模式下执行，
+        // 因为 sftp 对象持有对 session 的引用，readdir 也需要阻塞模式
+        let mut entries = with_blocking_session(&ssh, || {
+            let sftp = ssh.sftp().map_err(|e| AppError::SftpChannelError(e.to_string()))?;
+            let entries_raw = sftp.readdir(Path::new(path))
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("No such file") || msg.contains("does not exist") {
+                        AppError::SftpPathNotFound(path.to_string())
+                    } else if msg.contains("Permission denied") {
+                        AppError::SftpPermissionDenied(path.to_string())
+                    } else {
+                        AppError::SftpChannelError(msg)
+                    }
+                })?;
+            let entries: Vec<RemoteEntry> = entries_raw.into_iter().map(|(pb, stat)| {
+                let name = pb.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let full_path = pb.to_string_lossy().to_string();
+                let is_dir = stat.is_dir();
+                let size = if is_dir { 0 } else { stat.size.unwrap_or(0) };
+                let modified_at = stat.mtime.map(|t| t as i64 * 1000).unwrap_or(0);
+                let perm = stat.perm.map(|p| format_permissions(p)).unwrap_or_default();
+                RemoteEntry { name, path: full_path, is_dir, size, modified_at, permissions: perm }
+            }).collect();
+            Ok::<Vec<RemoteEntry>, AppError>(entries)
+        })?;
 
         // 目录优先，同类按名称排序
         entries.sort_by(|a, b| {
@@ -153,14 +178,15 @@ impl SftpService {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| remote_path.clone());
 
-        // 先获取文件大小
+        // 先获取文件大小，临时切换阻塞模式避免 WouldBlock
         let ssh = handle.ssh_session.lock()
             .map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-        let sftp = ssh.sftp().map_err(|e| AppError::SftpChannelError(e.to_string()))?;
-        let stat = sftp.stat(Path::new(&remote_path))
-            .map_err(|e| AppError::SftpPathNotFound(e.to_string()))?;
-        let total_bytes = stat.size.unwrap_or(0);
-        drop(sftp);
+        let total_bytes = with_blocking_session(&ssh, || {
+            let sftp = ssh.sftp().map_err(|e| AppError::SftpChannelError(e.to_string()))?;
+            let stat = sftp.stat(Path::new(&remote_path))
+                .map_err(|e| AppError::SftpPathNotFound(e.to_string()))?;
+            Ok::<u64, AppError>(stat.size.unwrap_or(0))
+        })?;
         drop(ssh);
 
         let task_id = Uuid::new_v4().to_string();
@@ -410,7 +436,17 @@ fn run_transfer_blocking<R: Runtime>(
     use std::time::Instant;
 
     let ssh = ssh_session.lock().map_err(|_| false)?;
+    // 切换为阻塞模式，SFTP 子通道建立和文件 IO 均需阻塞模式
+    // run_transfer_blocking 本身在 spawn_blocking 线程中执行，不影响终端 IO 循环
+    ssh.set_blocking(true);
     let sftp = ssh.sftp().map_err(|_| false)?;
+
+    // RAII guard：函数任意路径退出时自动恢复非阻塞模式，供终端 IO 循环使用
+    struct RestoreNonBlocking<'a>(&'a std::sync::MutexGuard<'a, Session>);
+    impl Drop for RestoreNonBlocking<'_> {
+        fn drop(&mut self) { self.0.set_blocking(false); }
+    }
+    let _restore = RestoreNonBlocking(&ssh);
 
     const CHUNK: usize = 32 * 1024; // 32KB chunks
     let mut transferred: u64 = 0;
