@@ -1,6 +1,6 @@
-import { Moon, Sun } from 'lucide-react';
+import { Moon, Settings, Sun } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Button, Typography } from 'antd';
+import { Typography } from 'antd';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
@@ -28,13 +28,13 @@ export default function HomePage() {
   const sftpStates = useSftpStore((state) => state.sessionStates);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
   const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
+  const monitorCollapsed = useLayoutStore((state) => state.monitorCollapsed);
   const theme = useThemeStore((state) => state.theme);
   const sessions = useMemo(() => [...sessionsMap.values()], [sessionsMap]);
-  const snapshot = activeView === 'home' ? null : monitorSnapshots.get(activeView) ?? null;
-  const sftpState = activeView === 'home' ? null : sftpStates.get(activeView) ?? null;
+  const snapshot = activeView === null ? null : monitorSnapshots.get(activeView) ?? null;
+  const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
-  const [activeHostId, setActiveHostId] = useState<string | null>(null);
   const [resizing, setResizing] = useState(false);
   const resizingRef = useRef(false);
 
@@ -79,7 +79,6 @@ export default function HomePage() {
 
   /** 打开指定主机的 SSH 会话。 */
   async function openSession(hostId: string) {
-    setActiveHostId(hostId);
     await useSessionStore.getState().openSession(hostId);
   }
 
@@ -107,7 +106,18 @@ export default function HomePage() {
   /** 删除主机，并清理当前激活主机标识。 */
   async function removeHost(hostId: string) {
     await useHostStore.getState().deleteHost(hostId);
-    if (activeHostId === hostId) setActiveHostId(null);
+  }
+
+  /** 重命名分组：更新主机归属并迁移折叠状态。 */
+  async function renameGroup(oldName: string, newName: string) {
+    await useHostStore.getState().renameGroup(oldName, newName);
+    useLayoutStore.getState().renameCollapsedGroup(oldName, newName);
+  }
+
+  /** 删除分组：主机归入未分组并清除折叠状态。 */
+  async function deleteGroup(name: string) {
+    await useHostStore.getState().deleteGroup(name);
+    useLayoutStore.getState().removeCollapsedGroup(name);
   }
 
   /** 启动侧栏宽度拖动。 */
@@ -145,29 +155,41 @@ export default function HomePage() {
     <aside className="sidebar" style={{ width: sidebarWidth }}>
       <div className="sidebar-header">
         <Typography.Text type="secondary" className="brand">Titan SSH</Typography.Text>
-        <Button type="text" size="small" data-testid="theme-toggle" aria-label="切换主题"
-          onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}</Button>
       </div>
       <HostListSidebar hosts={filterHosts(hosts, searchQuery)} searchQuery={searchQuery} selectedHostId={selectedHostId}
         collapsedGroups={collapsedGroups}
         onToggleGroup={(name) => useLayoutStore.getState().toggleGroupCollapsed(name)}
+        onRenameGroup={renameGroup} onDeleteGroup={deleteGroup}
+        onEditHost={editHost} onDeleteHost={removeHost}
         onSearchChange={(query) => useHostStore.getState().setSearchQuery(query)}
         onSelect={(hostId) => useHostStore.getState().selectHost(hostId)}
         onOpen={openSession} onCreate={createHost} />
-      <ServerStatusPanel snapshot={snapshot} />
+      <div className="sidebar-footer">
+        {monitorCollapsed ? (
+          <div className="sidebar-footer-row">
+            <ServerStatusPanel snapshot={snapshot} collapsed onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
+            <FooterActions theme={theme} />
+          </div>
+        ) : (
+          <>
+            <ServerStatusPanel snapshot={snapshot} collapsed={false} onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
+            <div className="sidebar-footer-row sidebar-footer-row--right"><FooterActions theme={theme} /></div>
+          </>
+        )}
+      </div>
     </aside>
     <div className="sidebar-resizer" role="separator" aria-orientation="vertical" aria-valuenow={sidebarWidth}
       aria-valuemin={220} aria-valuemax={clampSidebarWidth(MAX_SIDEBAR_WIDTH, window.innerWidth)} onPointerDown={startSidebarResize} />
     <section className="main-panel">
-      <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
+      {sessions.length > 0 && <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
         onActivate={(view) => useSessionStore.getState().setActiveView(view)}
-        onClose={(sessionId) => useSessionStore.getState().closeSession(sessionId)} /></div>
+        onClose={(sessionId) => useSessionStore.getState().closeSession(sessionId)} /></div>}
       <div className="content-area">
-        <TerminalPane sessions={sessions} activeView={activeView} hosts={hosts}
+        <TerminalPane sessions={sessions} activeView={activeView}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
-          onOpenHost={openSession} onEditHost={editHost} onRemoveHost={removeHost} onCreateHost={createHost} />
-        {activeView !== 'home' && <SftpPanel sessionId={activeView} state={sftpState}
+          onCreateHost={createHost} />
+        {activeView !== null && <SftpPanel sessionId={activeView} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
@@ -178,4 +200,17 @@ export default function HomePage() {
       () => [...new Set(hosts.map((host) => host.group).filter(Boolean))], [hosts])}
       onClose={() => setEditorOpen(false)} onSave={saveHost} />
   </div>;
+}
+
+/** 侧栏底部全局入口：主题切换与设置占位。 */
+function FooterActions({ theme }: { theme: string }) {
+  return (
+    <div className="sidebar-footer-actions">
+      <button type="button" className="sidebar-footer-btn" data-testid="theme-toggle" aria-label="切换主题"
+        onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}</button>
+      <button type="button" className="sidebar-footer-btn" aria-label="设置" title="设置（即将推出）" disabled>
+        <Settings size={14} />
+      </button>
+    </div>
+  );
 }

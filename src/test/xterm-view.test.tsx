@@ -1,7 +1,7 @@
 import { act, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
-import XtermView from '@/components/terminal/XtermView';
+import XtermView, { terminalThemes } from '@/components/terminal/XtermView';
 
 const terminal = {
   cols: 80,
@@ -52,6 +52,13 @@ describe('XtermView', () => {
     render(<XtermView sessionId="session-1" active onInput={onInput} onResize={vi.fn()} />);
     inputHandler('ls\r');
     expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: 'ls\r' });
+  });
+
+  it('终端色板与 slate 视觉体系一致', () => {
+    expect(terminalThemes.dark.background).toBe('#0f172a');
+    expect(terminalThemes.light.background).toBe('#ffffff');
+    expect(terminalThemes.dark.cursor).toBe('#10b981');
+    expect(terminalThemes.light.cursor).toBe('#059669');
   });
 
   it('卸载时释放终端资源', async () => {

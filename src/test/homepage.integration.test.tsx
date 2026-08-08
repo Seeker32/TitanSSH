@@ -39,26 +39,34 @@ describe('HomePage integration', () => {
     });
   });
 
-  it('加载主机并从首页打开真实会话', async () => {
+  it('加载主机并从侧栏双击打开真实会话', async () => {
     const user = userEvent.setup();
-    const { container } = render(<HomePage />);
-    const homeView = container.querySelector('.home-view') as HTMLElement;
-    await user.click(await within(homeView).findByText('root@10.0.0.8:22'));
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
     expect(mockInvoke).toHaveBeenCalledWith('open_session', { hostId: 'host-1' });
     expect(await screen.findByTestId('xterm')).toBeInTheDocument();
   });
 
   it('会话与监控事件更新标签和服务器状态', async () => {
     const user = userEvent.setup();
-    const { container } = render(<HomePage />);
-    const homeView = container.querySelector('.home-view') as HTMLElement;
-    await user.click(await within(homeView).findByText('root@10.0.0.8:22'));
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
     await act(async () => {
       emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, message: null });
       emitMockEvent('monitor:snapshot', makeSnapshot());
     });
     expect(screen.getByText('已连接')).toBeInTheDocument();
     expect(screen.getByText('21.5%')).toBeInTheDocument();
+  });
+
+  it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<HomePage />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));
+    const emptyState = container.querySelector('.empty-state') as HTMLElement;
+    expect(within(emptyState).getByText(/选择左侧主机/)).toBeInTheDocument();
+    await user.click(within(emptyState).getByRole('button', { name: '新建主机' }));
+    expect(screen.getByText('新建连接')).toBeInTheDocument();
   });
 
   it('全局事件只由所属前端 module 监听一次', async () => {

@@ -12,19 +12,21 @@ interface Props {
   onResize: (event: { sessionId: string; cols: number; rows: number }) => void;
 }
 
-const lightTheme = {
-  background: '#ffffff', foreground: '#0f172a', cursor: '#059669', black: '#1e293b', red: '#dc2626',
-  green: '#059669', yellow: '#d97706', blue: '#2563eb', magenta: '#9333ea', cyan: '#0891b2', white: '#f1f5f9',
-  brightBlack: '#334155', brightRed: '#ef4444', brightGreen: '#10b981', brightYellow: '#f59e0b',
-  brightBlue: '#3b82f6', brightMagenta: '#a855f7', brightCyan: '#06b6d4', brightWhite: '#ffffff',
-};
-
-const darkTheme = {
-  background: '#0b1118', foreground: '#e6eff6', cursor: '#8ed2c0', black: '#15202b', red: '#ef4444',
-  green: '#10b981', yellow: '#f59e0b', blue: '#3b82f6', magenta: '#a855f7', cyan: '#06b6d4', white: '#e2e8f0',
-  brightBlack: '#334155', brightRed: '#f87171', brightGreen: '#6ee7b7', brightYellow: '#fbbf24',
-  brightBlue: '#60a5fa', brightMagenta: '#c084fc', brightCyan: '#22d3ee', brightWhite: '#ffffff',
-};
+/** 终端明暗主题色板：背景与前景对齐应用 slate 视觉体系，强调色保持 emerald。 */
+export const terminalThemes = {
+  light: {
+    background: '#ffffff', foreground: '#0f172a', cursor: '#059669', black: '#1e293b', red: '#dc2626',
+    green: '#059669', yellow: '#d97706', blue: '#2563eb', magenta: '#9333ea', cyan: '#0891b2', white: '#f1f5f9',
+    brightBlack: '#334155', brightRed: '#ef4444', brightGreen: '#10b981', brightYellow: '#f59e0b',
+    brightBlue: '#3b82f6', brightMagenta: '#a855f7', brightCyan: '#06b6d4', brightWhite: '#ffffff',
+  },
+  dark: {
+    background: '#0f172a', foreground: '#e2e8f0', cursor: '#10b981', black: '#1e293b', red: '#ef4444',
+    green: '#10b981', yellow: '#f59e0b', blue: '#3b82f6', magenta: '#a855f7', cyan: '#06b6d4', white: '#e2e8f0',
+    brightBlack: '#475569', brightRed: '#f87171', brightGreen: '#6ee7b7', brightYellow: '#fbbf24',
+    brightBlue: '#60a5fa', brightMagenta: '#c084fc', brightCyan: '#22d3ee', brightWhite: '#ffffff',
+  },
+} as const;
 
 /** 挂载 xterm，并将输入、尺寸和后端数据流连接到指定会话。 */
 export default function XtermView({ sessionId, active, onInput, onResize }: Props) {
@@ -74,7 +76,7 @@ export default function XtermView({ sessionId, active, onInput, onResize }: Prop
       cursorBlink: true,
       fontFamily: '"SFMono-Regular", "JetBrains Mono", monospace',
       fontSize: 13,
-      theme: useThemeStore.getState().theme === 'dark' ? darkTheme : lightTheme,
+      theme: useThemeStore.getState().theme === 'dark' ? terminalThemes.dark : terminalThemes.light,
       allowTransparency: true,
     });
     const addon = new FitAddon();
@@ -122,7 +124,7 @@ export default function XtermView({ sessionId, active, onInput, onResize }: Prop
   }, [active]);
 
   useEffect(() => {
-    if (terminalRef.current) terminalRef.current.options.theme = theme === 'dark' ? darkTheme : lightTheme;
+    if (terminalRef.current) terminalRef.current.options.theme = theme === 'dark' ? terminalThemes.dark : terminalThemes.light;
   }, [theme]);
 
   /** 拖动自定义滚动条并同步 xterm viewport。 */
@@ -153,7 +155,7 @@ export default function XtermView({ sessionId, active, onInput, onResize }: Prop
   }
 
   return <div ref={containerRef} className="terminal-view" hidden={!active}
-    style={{ background: theme === 'dark' ? darkTheme.background : lightTheme.background }}>
+    style={{ background: theme === 'dark' ? terminalThemes.dark.background : terminalThemes.light.background }}>
     <div className="custom-scrollbar"><div ref={thumbRef} className="custom-scrollbar__thumb" onMouseDown={startThumbDrag} /></div>
   </div>;
 }

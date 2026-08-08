@@ -1,3 +1,4 @@
+import { FileText, Folder } from 'lucide-react';
 import type { KeyboardEvent, MouseEvent } from 'react';
 import type { RemoteEntry, SftpSessionState } from '@/types/sftp';
 
@@ -73,7 +74,9 @@ export default function FileExplorer({ state, onNavigate, onSelect, onUpload, on
               <div key={entry.path} data-testid="file-row" className={`file-row ${state.selectedPaths.has(entry.path) ? 'file-row--selected' : ''}`}
                 role="row" tabIndex={0} onClick={() => handleClick(entry)} onDoubleClick={(event) => handleDoubleClick(event, entry)}
                 onKeyDown={(event) => handleKey(event, entry)}>
-                <span className="file-icon">{entry.isDir ? '📁' : '📄'}</span>
+                <span className={`file-icon ${entry.isDir ? 'file-icon--dir' : ''}`}>
+                  {entry.isDir ? <Folder size={14} /> : <FileText size={14} />}
+                </span>
                 <span className={`file-name ${entry.isDir ? 'file-name--dir' : ''}`}>{entry.name}</span>
                 <span className="file-size">{formatSize(entry.size)}</span>
                 <span className="file-date">{formatDate(entry.modifiedAt)}</span>

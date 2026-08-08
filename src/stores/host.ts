@@ -15,6 +15,8 @@ interface HostState {
   deleteHost: (hostId: string) => Promise<void>;
   setSearchQuery: (query: string) => void;
   selectHost: (hostId: string | null) => void;
+  renameGroup: (oldName: string, newName: string) => Promise<void>;
+  deleteGroup: (name: string) => Promise<void>;
 }
 
 /** 按搜索词过滤主机：空串返回全部，匹配名称或地址，不区分大小写。 */
@@ -48,7 +50,7 @@ export function groupHosts(hosts: HostConfig[]): HostGroup[] {
   return [...named, { name: '', hosts: ungrouped }];
 }
 
-export const useHostStore = create<HostState>((set) => ({
+export const useHostStore = create<HostState>((set, get) => ({
   hosts: [],
   loading: false,
   error: null,
@@ -101,5 +103,23 @@ export const useHostStore = create<HostState>((set) => ({
   /** 更新侧栏选中主机；传 null 清除选中。 */
   selectHost(hostId) {
     set({ selectedHostId: hostId });
+  },
+
+  /** 重命名分组：更新组内全部主机的 group 并逐个保存。同名或空白名不动作。 */
+  async renameGroup(oldName, newName) {
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === oldName) return;
+    const affected = get().hosts.filter((host) => host.group === oldName);
+    for (const host of affected) {
+      await get().saveHost({ ...host, group: trimmed });
+    }
+  },
+
+  /** 删除分组：组内主机归入"未分组"（group 置空）并逐个保存。 */
+  async deleteGroup(name) {
+    const affected = get().hosts.filter((host) => host.group === name);
+    for (const host of affected) {
+      await get().saveHost({ ...host, group: '' });
+    }
   },
 }));

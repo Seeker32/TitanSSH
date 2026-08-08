@@ -1,32 +1,24 @@
-import type { HostConfig } from '@/types/host';
 import type { SessionInfo } from '@/types/session';
-import HomeQuickActions from '@/components/home/HomeQuickActions';
+import EmptyState from '@/components/shell/EmptyState';
 import XtermView from './XtermView';
 
 interface Props {
   sessions: SessionInfo[];
-  activeView: 'home' | string;
-  hosts: HostConfig[];
+  activeView: string | null;
   onInput: (event: { sessionId: string; data: string }) => void;
   onResize: (event: { sessionId: string; cols: number; rows: number }) => void;
-  onOpenHost: (hostId: string) => void;
-  onEditHost: (hostId: string) => void;
-  onRemoveHost: (hostId: string) => void;
   onCreateHost: () => void;
 }
 
-/** 在首页快捷入口与各真实终端视图之间切换。 */
-export default function TerminalPane(props: Props) {
+/** 在空态页与各真实终端视图之间切换；会话实例常驻，仅切换显隐。 */
+export default function TerminalPane({ sessions, activeView, onInput, onResize, onCreateHost }: Props) {
   return (
     <section className="terminal-pane">
       <div className="viewport">
-        <div className="home-view" hidden={props.activeView !== 'home'}>
-          <HomeQuickActions hosts={props.hosts} onOpen={props.onOpenHost} onEdit={props.onEditHost}
-            onRemove={props.onRemoveHost} onCreate={props.onCreateHost} />
-        </div>
-        {props.sessions.map((session) => (
+        {activeView === null && <EmptyState onCreateHost={onCreateHost} />}
+        {sessions.map((session) => (
           <XtermView key={session.sessionId} sessionId={session.sessionId}
-            active={props.activeView === session.sessionId} onInput={props.onInput} onResize={props.onResize} />
+            active={activeView === session.sessionId} onInput={onInput} onResize={onResize} />
         ))}
       </div>
     </section>

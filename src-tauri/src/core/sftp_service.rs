@@ -12,13 +12,16 @@ use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-/// 全局并发信号量，最多允许 5 个传输任务同时运行（跨所有 session）
+/// 全局并发传输上限（跨所有 session 的信号量容量）
+const MAX_CONCURRENT_TRANSFERS: usize = 5;
+
+/// 全局并发信号量，最多允许 MAX_CONCURRENT_TRANSFERS 个传输任务同时运行（跨所有 session）
 static TRANSFER_SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
 
 /// 获取全局传输信号量
 fn get_semaphore() -> Arc<Semaphore> {
     TRANSFER_SEMAPHORE
-        .get_or_init(|| Arc::new(Semaphore::new(5)))
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)))
         .clone()
 }
 
@@ -1029,11 +1032,13 @@ mod tests {
 
     // ─── 并发控制测试 ────────────────────────────────────────────────────────
 
-    /// 验证全局 Semaphore 初始 permits 为 5（跨所有 session 的并发上限）
+    /// 验证全局 Semaphore 容量为 5（跨所有 session 的并发上限）
+    /// 全局信号量会被并行测试抢占，故断言"可用 permits 不超过容量"这一不变量。
     #[test]
     fn semaphore_has_five_permits() {
         let sem = get_semaphore();
-        assert_eq!(sem.available_permits(), 5);
+        assert_eq!(MAX_CONCURRENT_TRANSFERS, 5);
+        assert!(sem.available_permits() <= MAX_CONCURRENT_TRANSFERS);
     }
 
     // ─── CancelToken 测试 ────────────────────────────────────────────────────

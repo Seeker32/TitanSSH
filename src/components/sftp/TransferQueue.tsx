@@ -1,3 +1,4 @@
+import { Download, RotateCcw, Upload, X } from 'lucide-react';
 import type { SftpTaskStatus, TransferTask } from '@/types/sftp';
 
 interface Props {
@@ -32,12 +33,12 @@ export default function TransferQueue({ tasks, onCancel, onRetry }: Props) {
     const percent = progressPct(task);
     return <div key={task.taskId} className="task-item">
       <div className="task-top">
-        <span>{task.transferType === 'Download' ? '⬇' : '⬆'}</span>
+        <span className="task-direction">{task.transferType === 'Download' ? <Download size={13} /> : <Upload size={13} />}</span>
         <span className="task-name" title={task.fileName}>{task.fileName}</span>
         <span className={`task-status task-status--${task.status.toLowerCase()}`}>{taskStatusLabel(task.status)}</span>
-        {active && <button data-testid="cancel-btn" className="task-btn" title="取消" onClick={() => onCancel(task.taskId)}>✕</button>}
+        {active && <button data-testid="cancel-btn" className="task-btn" title="取消" onClick={() => onCancel(task.taskId)}><X size={12} /></button>}
         {(task.status === 'Failed' || task.status === 'Cancelled')
-          && <button data-testid="retry-btn" className="task-btn" title="重新发起" onClick={() => onRetry(task)}>↺</button>}
+          && <button data-testid="retry-btn" className="task-btn" title="重新发起" onClick={() => onRetry(task)}><RotateCcw size={12} /></button>}
       </div>
       <div className="progress-bar" data-testid="progress-bar">
         <div className={`progress-fill ${task.status === 'Done' ? 'progress-fill--done' : ''}`}

@@ -14,13 +14,13 @@ interface SessionStatusPayload {
 
 interface SessionState {
   sessions: Map<string, SessionInfo>;
-  activeView: 'home' | string;
+  activeView: string | null;
   statusMessage: string;
   openSession: (hostId: string) => Promise<SessionInfo>;
   closeSession: (sessionId: string) => Promise<void>;
   writeTerminal: (sessionId: string, data: string) => Promise<void>;
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
-  setActiveView: (viewId: 'home' | string) => void;
+  setActiveView: (viewId: string | null) => void;
   applySessionStatus: (payload: SessionStatusPayload) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
   initListeners: () => Promise<() => void>;
@@ -57,7 +57,7 @@ export function progressLabel(phase: ConnectionPhase, message?: string): string 
 export const useSessionStore = create<SessionState>((set, get) => {
   return {
     sessions: new Map(),
-    activeView: 'home',
+    activeView: null,
     statusMessage: '就绪',
 
     /** 打开 SSH 会话，并启动关联监控任务。 */
@@ -82,7 +82,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set((state) => {
         const sessions = new Map(state.sessions);
         sessions.delete(sessionId);
-        return { sessions, activeView: state.activeView === sessionId ? 'home' : state.activeView };
+        return { sessions, activeView: state.activeView === sessionId ? null : state.activeView };
       });
       useMonitorStore.getState().clearSession(sessionId);
       useSftpStore.getState().clearSession(sessionId);
@@ -98,7 +98,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       await invoke('resize_terminal', { sessionId, cols, rows });
     },
 
-    /** 切换首页或真实会话视图。 */
+    /** 切换当前会话视图；null 表示无会话（空态）。 */
     setActiveView(activeView) {
       set({ activeView });
     },

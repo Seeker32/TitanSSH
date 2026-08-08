@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
-import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, useLayoutStore } from '@/stores/layout';
+import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, readMonitorCollapsed, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
@@ -96,6 +96,67 @@ describe('Zustand stores', () => {
     expect(readCollapsedGroups()).toEqual(['beta', 'alpha']);
   });
 
+  it('重命名分组更新组内主机并仅保存受影响主机', async () => {
+    const alpha = [makeHost({ group: 'alpha' }), makeHost({ id: 'h2', name: 'b', group: 'alpha' })];
+    const beta = makeHost({ id: 'h3', name: 'c', group: 'beta' });
+    let current = [...alpha, beta];
+    mockInvoke.mockImplementation(async (command, args) => {
+      if (command === 'save_host') {
+        current = current.map((h) => h.id === args.request.id ? { ...h, group: args.request.group } : h);
+        return current;
+      }
+      return current;
+    });
+    useHostStore.setState({ hosts: current });
+    await useHostStore.getState().renameGroup('alpha', 'prod');
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+    expect(useHostStore.getState().hosts.filter((h) => h.group === 'prod')).toHaveLength(2);
+    expect(useHostStore.getState().hosts.find((h) => h.id === 'h3')?.group).toBe('beta');
+  });
+
+  it('重命名同名或空白名不触发保存', async () => {
+    const all = [makeHost({ group: 'alpha' })];
+    useHostStore.setState({ hosts: all });
+    await useHostStore.getState().renameGroup('alpha', 'alpha');
+    await useHostStore.getState().renameGroup('alpha', '   ');
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('删除分组后组内主机归入未分组', async () => {
+    let current = [makeHost({ group: 'alpha' }), makeHost({ id: 'h2', name: 'b', group: 'alpha' })];
+    mockInvoke.mockImplementation(async (command, args) => {
+      if (command === 'save_host') {
+        current = current.map((h) => h.id === args.request.id ? { ...h, group: args.request.group } : h);
+        return current;
+      }
+      return current;
+    });
+    useHostStore.setState({ hosts: current });
+    await useHostStore.getState().deleteGroup('alpha');
+    expect(useHostStore.getState().hosts.every((h) => h.group === '')).toBe(true);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('折叠状态随分组重命名迁移、删除时移除', () => {
+    useLayoutStore.setState({ collapsedGroups: ['alpha', 'beta'] });
+    useLayoutStore.getState().renameCollapsedGroup('alpha', 'prod');
+    expect(useLayoutStore.getState().collapsedGroups).toEqual(['prod', 'beta']);
+    useLayoutStore.getState().removeCollapsedGroup('prod');
+    expect(useLayoutStore.getState().collapsedGroups).toEqual(['beta']);
+    expect(readCollapsedGroups()).toEqual(['beta']);
+  });
+
+  it('监视条折叠状态可切换并持久化', () => {
+    localStorage.removeItem('monitor-collapsed');
+    useLayoutStore.setState({ monitorCollapsed: false });
+    useLayoutStore.getState().toggleMonitorCollapsed();
+    expect(useLayoutStore.getState().monitorCollapsed).toBe(true);
+    expect(readMonitorCollapsed()).toBe(true);
+    useLayoutStore.getState().toggleMonitorCollapsed();
+    expect(useLayoutStore.getState().monitorCollapsed).toBe(false);
+    expect(readMonitorCollapsed()).toBe(false);
+  });
+
   it('侧栏宽度使用默认值并限制最小值与主区域空间', () => {
     expect(useLayoutStore.getState().sidebarWidth).toBe(DEFAULT_SIDEBAR_WIDTH);
     useLayoutStore.getState().setSidebarWidth(1);
@@ -173,7 +234,7 @@ describe('Zustand stores', () => {
     mockInvoke.mockResolvedValue(undefined);
     await useSessionStore.getState().closeSession('session-1');
 
-    expect(useSessionStore.getState().activeView).toBe('home');
+    expect(useSessionStore.getState().activeView).toBeNull();
     expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
     expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);

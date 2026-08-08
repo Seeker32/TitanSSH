@@ -1,9 +1,8 @@
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import FileExplorer from '@/components/sftp/FileExplorer';
-import HomeQuickActions from '@/components/home/HomeQuickActions';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
 import { groupHosts } from '@/stores/host';
@@ -21,30 +20,11 @@ vi.mock('@/components/terminal/XtermView', () => ({
 }));
 
 describe('React components', () => {
-  it('首页主机卡片分别触发连接、编辑、删除和新建', async () => {
-    const user = userEvent.setup();
-    const handlers = { onOpen: vi.fn(), onEdit: vi.fn(), onRemove: vi.fn(), onCreate: vi.fn() };
-    render(<HomeQuickActions hosts={[makeHost()]} {...handlers} />);
-    await user.click(screen.getByText('root@10.0.0.8:22'));
-    await user.click(screen.getByText('编辑'));
-    await user.click(screen.getByText('删除'));
-    await user.click(screen.getByText('+ 新建主机'));
-    expect(handlers.onOpen).toHaveBeenCalledWith('host-1');
-    expect(handlers.onEdit).toHaveBeenCalledWith('host-1');
-    expect(handlers.onRemove).toHaveBeenCalledWith('host-1');
-    expect(handlers.onCreate).toHaveBeenCalledOnce();
-  });
-
-  it('空主机列表显示引导文案', () => {
-    render(<HomeQuickActions hosts={[]} onOpen={vi.fn()} onEdit={vi.fn()} onRemove={vi.fn()} onCreate={vi.fn()} />);
-    expect(screen.getByText(/暂无保存的主机/)).toBeInTheDocument();
-  });
-
   it('侧栏主机卡片渲染服务器图标，单击选中、双击连接', async () => {
     const user = userEvent.setup();
     const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
     render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} collapsedGroups={[]}
-      onToggleGroup={vi.fn()} {...handlers} />);
+      onToggleGroup={vi.fn()} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()} {...handlers} />);
     const card = screen.getByText('prod').closest('[role="button"]')!;
     expect(card.querySelector('svg')).not.toBeNull();
     await user.click(screen.getByText('prod'));
@@ -59,11 +39,11 @@ describe('React components', () => {
     const user = userEvent.setup();
     const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
     const { rerender } = render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} collapsedGroups={[]}
-      onToggleGroup={vi.fn()} {...handlers} />);
+      onToggleGroup={vi.fn()} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()} {...handlers} />);
     await user.type(screen.getByPlaceholderText('搜索主机…'), 'prod');
     expect(handlers.onSearchChange).toHaveBeenCalledWith('p');
     rerender(<HostListSidebar hosts={[]} searchQuery="prod" selectedHostId={null} collapsedGroups={[]}
-      onToggleGroup={vi.fn()} {...handlers} />);
+      onToggleGroup={vi.fn()} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()} {...handlers} />);
     expect(screen.getByText('未找到匹配的主机')).toBeInTheDocument();
   });
 
@@ -82,7 +62,7 @@ describe('React components', () => {
     const onToggleGroup = vi.fn();
     const hosts = [makeHost({ group: '' }), makeHost({ id: 'h2', name: 'staging', group: 'prod-env' })];
     const { container, rerender } = render(<HostListSidebar hosts={hosts} searchQuery="" selectedHostId={null}
-      collapsedGroups={[]} onToggleGroup={onToggleGroup}
+      collapsedGroups={[]} onToggleGroup={onToggleGroup} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()}
       onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     const headers = container.querySelectorAll('.host-group-header');
     expect(headers).toHaveLength(2);
@@ -91,16 +71,56 @@ describe('React components', () => {
     await user.click(screen.getByTestId('group-header-prod-env'));
     expect(onToggleGroup).toHaveBeenCalledWith('prod-env');
     rerender(<HostListSidebar hosts={hosts} searchQuery="" selectedHostId={null} collapsedGroups={['prod-env']}
-      onToggleGroup={onToggleGroup} onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+      onToggleGroup={onToggleGroup} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()} onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(screen.queryByText('staging')).not.toBeInTheDocument();
     expect(screen.getByText('prod')).toBeInTheDocument();
   });
 
   it('搜索时以平铺列表展示，不显示分组头', () => {
     render(<HostListSidebar hosts={[makeHost()]} searchQuery="prod" selectedHostId={null} collapsedGroups={[]}
-      onToggleGroup={vi.fn()} onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+      onToggleGroup={vi.fn()} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()} onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(screen.queryByText('未分组')).not.toBeInTheDocument();
     expect(screen.getByText('prod')).toBeInTheDocument();
+  });
+
+  it('分组头 hover 显示重命名/删除，未分组无操作，重命名行内编辑提交', async () => {
+    const user = userEvent.setup();
+    const onRenameGroup = vi.fn();
+    const onDeleteGroup = vi.fn();
+    const hosts = [makeHost({ group: '' }), makeHost({ id: 'h2', name: 'staging', group: 'prod-env' })];
+    render(<HostListSidebar hosts={hosts} searchQuery="" selectedHostId={null} collapsedGroups={[]}
+      onToggleGroup={vi.fn()} onEditHost={vi.fn()} onDeleteHost={vi.fn()} onRenameGroup={onRenameGroup} onDeleteGroup={onDeleteGroup}
+      onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    const group = screen.getByTestId('group-header-prod-env');
+    await user.hover(group);
+    await user.click(screen.getByTestId('group-rename-btn'));
+    const input = screen.getByDisplayValue('prod-env');
+    await user.clear(input);
+    await user.type(input, 'prod-eu');
+    await user.keyboard('{Enter}');
+    expect(onRenameGroup).toHaveBeenCalledWith('prod-env', 'prod-eu');
+    await user.hover(group);
+    await user.click(screen.getByTestId('group-delete-btn'));
+    expect(onDeleteGroup).toHaveBeenCalledWith('prod-env');
+    const ungrouped = screen.getByTestId('group-header-ungrouped');
+    await user.hover(ungrouped);
+    expect(within(ungrouped).queryByTestId('group-delete-btn')).not.toBeInTheDocument();
+    expect(within(ungrouped).queryByTestId('group-rename-btn')).not.toBeInTheDocument();
+  });
+
+  it('主机卡片 hover 提供编辑与删除操作', async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const onDelete = vi.fn();
+    render(<HostListSidebar hosts={[makeHost()]} searchQuery="" selectedHostId={null} collapsedGroups={[]}
+      onToggleGroup={vi.fn()} onRenameGroup={vi.fn()} onDeleteGroup={vi.fn()} onEditHost={onEdit} onDeleteHost={onDelete}
+      onSearchChange={vi.fn()} onSelect={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    const card = screen.getByTestId('host-card-host-1');
+    await user.hover(card);
+    await user.click(screen.getByTestId('host-edit-btn'));
+    expect(onEdit).toHaveBeenCalledWith('host-1');
+    await user.click(screen.getByTestId('host-delete-btn'));
+    expect(onDelete).toHaveBeenCalledWith('host-1');
   });
 
   it('分组函数：空分组不产生分组头', () => {
@@ -108,34 +128,68 @@ describe('React components', () => {
     expect(groupHosts([makeHost({ group: '' })])).toEqual([{ name: '', hosts: [makeHost({ group: '' })] }]);
   });
 
-  it('终端标签保持首页并按会话状态渲染和关闭', async () => {
+  it('终端标签仅渲染会话，激活切换并关闭', async () => {
     const user = userEvent.setup();
     const activate = vi.fn();
     const close = vi.fn();
     render(<TerminalTabs sessions={[makeSession({ status: SessionStatus.Connected })]} activeView="session-1" onActivate={activate} onClose={close} />);
-    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(screen.queryByText('首页')).not.toBeInTheDocument();
     expect(document.querySelector('.dot-connected')).toBeInTheDocument();
-    await user.click(screen.getByText('首页'));
+    await user.click(screen.getByText('root@10.0.0.8'));
     await user.click(screen.getByLabelText('关闭 root@10.0.0.8'));
-    expect(activate).toHaveBeenCalledWith('home');
+    expect(activate).toHaveBeenCalledWith('session-1');
     expect(close).toHaveBeenCalledWith('session-1');
   });
 
   it('终端面板保留每个会话实例，仅展示当前视图', () => {
-    render(<TerminalPane sessions={[makeSession(), makeSession({ sessionId: 'session-2' })]} activeView="session-2" hosts={[]}
-      onInput={vi.fn()} onResize={vi.fn()} onOpenHost={vi.fn()} onEditHost={vi.fn()} onRemoveHost={vi.fn()} onCreateHost={vi.fn()} />);
+    render(<TerminalPane sessions={[makeSession(), makeSession({ sessionId: 'session-2' })]} activeView="session-2"
+      onInput={vi.fn()} onResize={vi.fn()} />);
     const terminals = screen.getAllByTestId('xterm');
     expect(terminals).toHaveLength(2);
     expect(terminals[0]).not.toBeVisible();
     expect(terminals[1]).toBeVisible();
   });
 
+  it('无会话时终端面板显示空态页并可新建主机', () => {
+    const onCreateHost = vi.fn();
+    render(<TerminalPane sessions={[]} activeView={null} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} />);
+    expect(screen.getByText(/选择左侧主机/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '新建主机' }));
+    expect(onCreateHost).toHaveBeenCalledOnce();
+  });
+
+  it('文件行与传输队列使用 lucide 图标而非 emoji', () => {
+    const state = { currentPath: '/', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const { container } = render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+    const rows = container.querySelectorAll('.file-row');
+    expect(rows[0].querySelector('svg')).not.toBeNull();
+    expect(rows[1].querySelector('svg')).not.toBeNull();
+    const tasks = new Map([[makeTransferTask().taskId, makeTransferTask()]]);
+    render(<TransferQueue tasks={tasks} onCancel={vi.fn()} onRetry={vi.fn()} />);
+    expect(container.querySelectorAll('svg').length).toBeGreaterThan(0);
+    expect(screen.queryByText('📁')).not.toBeInTheDocument();
+    expect(screen.queryByText('⬇')).not.toBeInTheDocument();
+  });
+
   it('服务器状态正确显示占位、指标和磁盘容量', () => {
-    const { rerender } = render(<ServerStatusPanel snapshot={null} />);
+    const { rerender } = render(<ServerStatusPanel snapshot={null} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getByText('未连接')).toBeInTheDocument();
-    rerender(<ServerStatusPanel snapshot={makeSnapshot()} />);
+    rerender(<ServerStatusPanel snapshot={makeSnapshot()} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getByText('21.5%')).toBeInTheDocument();
     expect(screen.getByText(/剩余 300.0 GB \/ 总量 500.0 GB/)).toBeInTheDocument();
+  });
+
+  it('监视条折叠态显示状态点，点击请求展开', async () => {
+    const user = userEvent.setup();
+    const onToggle = vi.fn();
+    const { rerender } = render(<ServerStatusPanel snapshot={makeSnapshot()} collapsed onToggle={onToggle} />);
+    expect(screen.getByTestId('monitor-strip')).toBeInTheDocument();
+    expect(screen.queryByText('21.5%')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('monitor-strip'));
+    expect(onToggle).toHaveBeenCalledOnce();
+    rerender(<ServerStatusPanel snapshot={makeSnapshot()} collapsed={false} onToggle={onToggle} />);
+    expect(screen.getByText('21.5%')).toBeInTheDocument();
   });
 
   it('文件浏览器目录优先，并区分选择、导航与下载', async () => {

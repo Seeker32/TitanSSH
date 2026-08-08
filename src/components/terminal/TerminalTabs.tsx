@@ -1,11 +1,11 @@
-import { Button } from 'antd';
+import { X } from 'lucide-react';
 import type { MouseEvent } from 'react';
 import type { SessionInfo } from '@/types/session';
 
 interface Props {
   sessions: SessionInfo[];
-  activeView: 'home' | string;
-  onActivate: (viewId: 'home' | string) => void;
+  activeView: string | null;
+  onActivate: (viewId: string) => void;
   onClose: (sessionId: string) => void;
 }
 
@@ -17,7 +17,7 @@ function statusDot(status: string) {
   return 'dot-offline';
 }
 
-/** 渲染固定首页和真实 SSH 会话标签。 */
+/** 渲染真实 SSH 会话标签栏（无会话时整栏隐藏）。 */
 export default function TerminalTabs({ sessions, activeView, onActivate, onClose }: Props) {
   /** 关闭标签且不触发激活。 */
   function closeTab(event: MouseEvent, sessionId: string) {
@@ -27,17 +27,13 @@ export default function TerminalTabs({ sessions, activeView, onActivate, onClose
 
   return (
     <div className="tab-bar" role="tablist">
-      <div className={`tab ${activeView === 'home' ? 'active' : ''}`} role="tab"
-        aria-selected={activeView === 'home'} onClick={() => onActivate('home')}>
-        <span className="tab-label">首页</span>
-      </div>
       {sessions.map((session) => (
         <div key={session.sessionId} className={`tab ${activeView === session.sessionId ? 'active' : ''}`}
           role="tab" aria-selected={activeView === session.sessionId} onClick={() => onActivate(session.sessionId)}>
           <span className={`status-dot ${statusDot(session.status)}`} />
           <span className="tab-label">{session.username}@{session.host}</span>
-          <Button type="text" size="small" className="close-btn" aria-label={`关闭 ${session.username}@${session.host}`}
-            onClick={(event) => closeTab(event, session.sessionId)}>×</Button>
+          <button type="button" className="close-btn" aria-label={`关闭 ${session.username}@${session.host}`}
+            onClick={(event) => closeTab(event, session.sessionId)}><X size={11} /></button>
         </div>
       ))}
     </div>

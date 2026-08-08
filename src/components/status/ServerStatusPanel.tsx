@@ -1,7 +1,14 @@
 import { Card, Col, Empty, Progress, Row, Statistic, Typography } from 'antd';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import type { MonitorSnapshot } from '@/types/monitor';
 
-interface Props { snapshot: MonitorSnapshot | null }
+interface Props {
+  snapshot: MonitorSnapshot | null;
+  /** 是否折叠为状态点窄条 */
+  collapsed: boolean;
+  /** 请求切换折叠状态 */
+  onToggle: () => void;
+}
 
 /** 将监控数值格式化为百分比文本。 */
 function formatPercent(value: number | undefined) {
@@ -28,8 +35,18 @@ function progressColor(value: number) {
   return '#ef4444';
 }
 
-/** 渲染后端单次推送的服务器监控快照。 */
-export default function ServerStatusPanel({ snapshot }: Props) {
+/** 渲染后端单次推送的服务器监控快照；折叠态只显示状态点窄条。 */
+export default function ServerStatusPanel({ snapshot, collapsed, onToggle }: Props) {
+  if (collapsed) {
+    return (
+      <div className="monitor-strip" data-testid="monitor-strip" role="button" aria-expanded="false" onClick={onToggle}>
+        <span className={`status-dot ${snapshot ? 'dot-connected' : 'dot-offline'}`} />
+        <span className="monitor-strip-label">监控</span>
+        <ChevronDown size={12} className="monitor-strip-chevron" />
+      </div>
+    );
+  }
+
   const metrics = [
     ['CPU', snapshot?.cpuUsage],
     ['Memory', snapshot?.memoryUsage],
@@ -37,7 +54,9 @@ export default function ServerStatusPanel({ snapshot }: Props) {
   ] as const;
   return (
     <Card size="small" variant="borderless" className="status-panel"
-      title={<><Typography.Text type="secondary">服务器状态</Typography.Text><strong>{snapshot ? '已连接' : '未连接'}</strong></>}>
+      title={<><Typography.Text type="secondary">服务器状态</Typography.Text><strong>{snapshot ? '已连接' : '未连接'}</strong></>}
+      extra={<button type="button" className="monitor-collapse-btn" data-testid="monitor-collapse-btn"
+        aria-label="折叠监视条" title="折叠监视条" onClick={onToggle}><ChevronUp size={12} /></button>}>
       <Row gutter={[12, 12]}>
         {metrics.map(([label, value], index) => (
           <Col span={index === 2 ? 24 : 12} key={label}>
