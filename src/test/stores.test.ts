@@ -47,12 +47,17 @@ describe('Zustand stores', () => {
     expect(useHostStore.getState()).toMatchObject({ loading: false, error: 'Error: offline' });
   });
 
-  it('主机搜索跨名称与地址过滤且不区分大小写', () => {
-    const hosts = [makeHost(), makeHost({ id: 'host-2', name: 'staging', host: '10.0.0.9', username: 'deploy' })];
-    expect(filterHosts(hosts, '')).toHaveLength(2);
+  it('主机搜索跨名称、地址与分组名过滤且不区分大小写', () => {
+    const hosts = [
+      makeHost({ group: '' }),
+      makeHost({ id: 'host-2', name: 'staging', host: '10.0.0.9', username: 'deploy', group: '' }),
+      makeHost({ id: 'host-3', name: 'db', host: '10.0.0.10', group: 'eu-west' }),
+    ];
+    expect(filterHosts(hosts, '')).toHaveLength(3);
     expect(filterHosts(hosts, 'PROD')).toEqual([hosts[0]]);
     expect(filterHosts(hosts, '10.0.0.9')).toEqual([hosts[1]]);
-    expect(filterHosts(hosts, '   ')).toHaveLength(2);
+    expect(filterHosts(hosts, 'EU')).toEqual([hosts[2]]);
+    expect(filterHosts(hosts, '   ')).toHaveLength(3);
     expect(filterHosts(hosts, 'no-such-host')).toEqual([]);
   });
 

@@ -19,12 +19,13 @@ interface HostState {
   deleteGroup: (name: string) => Promise<void>;
 }
 
-/** 按搜索词过滤主机：空串返回全部，匹配名称或地址，不区分大小写。 */
+/** 按搜索词过滤主机：空串返回全部，匹配名称、地址或分组名，不区分大小写。 */
 export function filterHosts(hosts: HostConfig[], query: string): HostConfig[] {
   const keyword = query.trim().toLowerCase();
   if (!keyword) return hosts;
   return hosts.filter((host) =>
-    host.name.toLowerCase().includes(keyword) || host.host.toLowerCase().includes(keyword));
+    host.name.toLowerCase().includes(keyword) || host.host.toLowerCase().includes(keyword)
+    || host.group.toLowerCase().includes(keyword));
 }
 
 /** 主机分组，name 为空串表示"未分组"。 */
