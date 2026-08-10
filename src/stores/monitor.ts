@@ -102,7 +102,7 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
       return;
     }
     set((state) => ({
-      tasks: new Map(state.tasks).set(event.taskId, { ...existing, status: event.status }),
+      tasks: new Map(state.tasks).set(event.taskId, { ...existing, status: event.status, error: event.error }),
     }));
   },
 
@@ -121,7 +121,7 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
       const buffered = pendingTaskEvents.get(task.taskId);
       pendingTaskEvents.delete(task.taskId);
       return {
-        tasks: new Map(state.tasks).set(task.taskId, buffered ? { ...task, status: buffered.status } : task),
+        tasks: new Map(state.tasks).set(task.taskId, buffered ? { ...task, status: buffered.status, error: buffered.error } : task),
         sessionTaskMap: new Map(state.sessionTaskMap).set(sessionId, task.taskId),
         pendingTaskEvents,
       };

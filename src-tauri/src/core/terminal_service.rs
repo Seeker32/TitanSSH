@@ -1,6 +1,7 @@
 use crate::core::ssh_transport;
 use crate::core::ssh_transport::{ConnectPhase, TerminalTransport};
 use crate::errors::app_error::AppError;
+use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::session::{SessionStatus, SessionStatusEvent, TerminalDataEvent};
 use crate::storage::secure_store;
@@ -35,7 +36,6 @@ pub enum ConnectionPhase {
 pub struct ConnectionProgressEvent {
     pub session_id: String,
     pub phase: ConnectionPhase,
-    pub message: String,
     pub timestamp: i64,
 }
 
@@ -500,7 +500,6 @@ fn emit_connection_progress<R: Runtime>(
         ConnectionProgressEvent {
             session_id: session_id.to_string(),
             phase,
-            message,
             timestamp,
         },
     );
@@ -532,7 +531,7 @@ fn emit_session_status<R: tauri::Runtime>(
         SessionStatusEvent {
             session_id: session_id.to_string(),
             status,
-            message,
+            error: message.map(|detail| AppErrorInfo { code: "Unknown".to_string(), detail: Some(detail) }),
         },
     );
     if let Err(ref e) = result {
@@ -963,7 +962,6 @@ mod integration_tests {
         let event = ConnectionProgressEvent {
             session_id: "session-1".to_string(),
             phase: ConnectionPhase::LoadingCredentials,
-            message: "正在读取凭据...".to_string(),
             timestamp: 1_710_000_000_111,
         };
 
@@ -973,7 +971,6 @@ mod integration_tests {
             json!({
                 "sessionId": "session-1",
                 "phase": "LoadingCredentials",
-                "message": "正在读取凭据...",
                 "timestamp": 1_710_000_000_111_i64,
             })
         );

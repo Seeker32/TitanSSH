@@ -52,11 +52,14 @@ export interface TaskInfo {
   status: TaskStatus;
   /** Unix 毫秒时间戳 */
   createdAt: number;
+  /** 最近的失败详情；仅 Failed 状态可能存在。 */
+  error?: AppErrorInfo | null;
 }
 
 /** 长任务状态变更事件 payload */
 export interface TaskStatusEvent {
   taskId: string;
   status: TaskStatus;
-  message?: string;
+  error?: AppErrorInfo | null;
 }
+import type { AppErrorInfo } from '@/i18n';

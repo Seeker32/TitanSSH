@@ -25,8 +25,8 @@ export interface TransferTask {
   transferredBytes: number;
   speedBps: number;
   status: SftpTaskStatus;
-  /** 失败原因；Failed 时为错误描述，Cancelled 时为 null */
-  errorMessage: string | null;
+  /** 失败原因；Failed 时为结构化错误，Cancelled 时为 null */
+  error: AppErrorInfo | null;
   /** Unix 毫秒时间戳 */
   createdAt: number;
 }
@@ -43,7 +43,7 @@ export interface SftpTaskStatusEvent {
   taskId: string;
   sessionId: string;
   status: SftpTaskStatus;
-  errorMessage: string | null;
+  error: AppErrorInfo | null;
 }
 
 /** per-session SFTP 状态；selectedPaths 为运行时 Set，不序列化到 Tauri 边界 */
@@ -52,6 +52,7 @@ export interface SftpSessionState {
   entries: RemoteEntry[];
   selectedPaths: Set<string>;
   loading: boolean;
-  error: string | null;
+  error: AppErrorInfo | null;
   tasks: Map<string, TransferTask>;
 }
+import type { AppErrorInfo } from '@/i18n';

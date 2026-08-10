@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::errors::app_error::AppErrorInfo;
 
 /// 真实 SSH 会话信息，与前端 UI 标签页完全解耦
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,8 +32,8 @@ pub enum SessionStatus {
 pub struct SessionStatusEvent {
     pub session_id: String,
     pub status: SessionStatus,
-    /// 可选的错误详情文本
-    pub message: Option<String>,
+    /// 可选的语言无关错误。
+    pub error: Option<AppErrorInfo>,
 }
 
 /// 终端数据流事件 Payload
@@ -49,6 +50,6 @@ pub struct TerminalDataEvent {
 pub struct TaskStatusEvent {
     pub task_id: String,
     pub status: crate::models::monitor::TaskStatus,
-    /// 可选的错误详情文本
-    pub message: Option<String>,
+    /// 可选的语言无关错误。
+    pub error: Option<AppErrorInfo>,
 }

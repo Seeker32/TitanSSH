@@ -1,6 +1,6 @@
 import { Moon, Settings, Sun } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Modal, Typography } from 'antd';
+import { Modal, Select, Typography } from 'antd';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
@@ -15,7 +15,9 @@ import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useThemeStore } from '@/stores/theme';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
-import { TERMINAL_THEME_NAMES, terminalThemeLabels, terminalThemes } from '@/components/terminal/terminalThemes';
+import { translate } from '@/i18n';
+import { useLocaleStore } from '@/stores/locale';
+import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
 import type { TransferTask } from '@/types/sftp';
 
@@ -212,27 +214,31 @@ export default function HomePage() {
 function FooterActions({ theme }: { theme: string }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const terminalTheme = useTerminalThemeStore((state) => state.terminalTheme);
+  const locale = useLocaleStore((state) => state.locale);
 
   return (
     <div className="sidebar-footer-actions">
-      <button type="button" className="sidebar-footer-btn" data-testid="theme-toggle" aria-label="切换主题"
+      <button type="button" className="sidebar-footer-btn" data-testid="theme-toggle" aria-label={translate(locale, 'theme.toggle')}
         onClick={() => useThemeStore.getState().toggleTheme()}>{theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}</button>
-      <button type="button" className="sidebar-footer-btn" aria-label="设置" title="设置" onClick={() => setSettingsOpen(true)}>
+      <button type="button" className="sidebar-footer-btn" aria-label={translate(locale, 'settings.title')} title={translate(locale, 'settings.title')} onClick={() => setSettingsOpen(true)}>
         <Settings size={14} />
       </button>
-      <Modal open={settingsOpen} title="SSH 终端主题" footer={null} onCancel={() => setSettingsOpen(false)}>
+      <Modal open={settingsOpen} title={translate(locale, 'settings.title')} footer={null} onCancel={() => setSettingsOpen(false)}>
         <div className="terminal-theme-options">
+          <label>{translate(locale, 'settings.language')} <Select value={locale} onChange={(value) => useLocaleStore.getState().setLocale(value)}
+            options={[{ value: 'zh-CN', label: translate(locale, 'locale.zh-CN') }, { value: 'en-US', label: translate(locale, 'locale.en-US') }]} /></label>
+          <Typography.Text type="secondary">{translate(locale, 'settings.terminalTheme')}</Typography.Text>
           {TERMINAL_THEME_NAMES.map((name) => {
             const palette = terminalThemes[name];
             const selected = name === terminalTheme;
             return <button key={name} type="button" aria-pressed={selected}
-              aria-label={`SSH 终端主题：${terminalThemeLabels[name]}`} className="terminal-theme-card"
+              aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
               onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
               <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
                 <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
               </span>
-              <span>{terminalThemeLabels[name]}</span>
-              {selected && <span className="terminal-theme-card__selected">已选择</span>}
+              <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
+              {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
             </button>;
           })}
         </div>

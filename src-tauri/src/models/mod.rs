@@ -64,7 +64,7 @@ mod tests {
                 transferred_bytes: 5,
                 speed_bps: 2,
                 status: SftpTaskStatus::Running,
-                error_message: None,
+                error: None,
                 created_at: 1,
             })
             .unwrap(),

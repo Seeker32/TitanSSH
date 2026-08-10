@@ -3,6 +3,8 @@ import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { SftpSessionState, TransferTask } from '@/types/sftp';
 import FileExplorer from './FileExplorer';
 import TransferQueue from './TransferQueue';
+import { translate } from '@/i18n';
+import { useLocaleStore } from '@/stores/locale';
 
 interface Props {
   sessionId: string;
@@ -25,6 +27,7 @@ function clampHeight(height: number) {
 
 /** 渲染可调整高度的文件浏览器与传输队列。 */
 export default function SftpPanel(props: Props) {
+  const locale = useLocaleStore((state) => state.locale);
   const [tab, setTab] = useState<'explorer' | 'queue'>('explorer');
   const [height, setHeight] = useState(280);
   const dragging = useRef(false);
@@ -62,11 +65,11 @@ export default function SftpPanel(props: Props) {
     <div data-testid="sftp-resizer" className="sftp-resizer" role="separator" aria-orientation="horizontal" onPointerDown={startResize} />
     <div className="sftp-header">
       <button data-testid="tab-explorer" className={`sftp-tab ${tab === 'explorer' ? 'sftp-tab--active' : ''}`}
-        onClick={() => setTab('explorer')}>文件浏览器</button>
+        onClick={() => setTab('explorer')}>{translate(locale, 'sftp.explorer')}</button>
       <button data-testid="tab-queue" className={`sftp-tab ${tab === 'queue' ? 'sftp-tab--active' : ''}`}
-        onClick={() => setTab('queue')}>传输队列</button>
+        onClick={() => setTab('queue')}>{translate(locale, 'sftp.queue')}</button>
     </div>
-    {!props.state ? <div className="sftp-placeholder">请选择会话</div>
+    {!props.state ? <div className="sftp-placeholder">{translate(locale, 'sftp.selectSession')}</div>
       : tab === 'explorer' ? <FileExplorer state={props.state}
         onNavigate={(path) => props.onNavigate(props.sessionId, path)}
         onSelect={(path) => props.onSelect(props.sessionId, path)}

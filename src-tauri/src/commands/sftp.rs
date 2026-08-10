@@ -1,5 +1,6 @@
 use crate::core::sftp_service::SftpService;
 use crate::models::sftp::{RemoteEntry, TransferTask};
+use crate::errors::app_error::AppErrorInfo;
 use tauri::{AppHandle, State};
 
 /// 列举远程目录内容，按目录优先、名称排序
@@ -12,10 +13,10 @@ pub fn sftp_list_dir(
     session_id: String,
     path: String,
     sftp_service: State<'_, SftpService>,
-) -> Result<Vec<RemoteEntry>, String> {
+) -> Result<Vec<RemoteEntry>, AppErrorInfo> {
     sftp_service
         .list_dir(&session_id, &path)
-        .map_err(|e| e.to_string())
+        .map_err(AppErrorInfo::from)
 }
 
 /// 发起文件下载任务，立即返回 status = Pending 的 TransferTask
@@ -31,10 +32,10 @@ pub fn sftp_download(
     remote_path: String,
     local_path: String,
     sftp_service: State<'_, SftpService>,
-) -> Result<TransferTask, String> {
+) -> Result<TransferTask, AppErrorInfo> {
     sftp_service
         .enqueue_download(session_id, remote_path, local_path, app)
-        .map_err(|e| e.to_string())
+        .map_err(AppErrorInfo::from)
 }
 
 /// 发起文件上传任务，立即返回 status = Pending 的 TransferTask
@@ -50,10 +51,10 @@ pub fn sftp_upload(
     local_path: String,
     remote_path: String,
     sftp_service: State<'_, SftpService>,
-) -> Result<TransferTask, String> {
+) -> Result<TransferTask, AppErrorInfo> {
     sftp_service
         .enqueue_upload(session_id, local_path, remote_path, app)
-        .map_err(|e| e.to_string())
+        .map_err(AppErrorInfo::from)
 }
 
 /// 取消指定传输任务；若任务已为终态则静默成功
@@ -64,7 +65,7 @@ pub fn sftp_upload(
 pub fn sftp_cancel_task(
     task_id: String,
     sftp_service: State<'_, SftpService>,
-) -> Result<(), String> {
+) -> Result<(), AppErrorInfo> {
     sftp_service.cancel_task(&task_id);
     Ok(())
 }

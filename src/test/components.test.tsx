@@ -270,8 +270,8 @@ describe('React components', () => {
     const base = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map() };
     const { rerender } = render(<FileExplorer state={base} {...props} />);
     expect(screen.getByText('加载中...')).toBeInTheDocument();
-    rerender(<FileExplorer state={{ ...base, loading: false, error: 'denied' }} {...props} />);
-    expect(screen.getByText('denied')).toBeInTheDocument();
+    rerender(<FileExplorer state={{ ...base, loading: false, error: { code: 'Unknown', detail: 'denied' } }} {...props} />);
+    expect(screen.getByText(/denied/)).toBeInTheDocument();
     rerender(<FileExplorer state={{ ...base, loading: false }} {...props} />);
     expect(screen.getByText('空目录')).toBeInTheDocument();
   });
@@ -281,10 +281,10 @@ describe('React components', () => {
     const cancel = vi.fn();
     const retry = vi.fn();
     const running = makeTransferTask({ transferredBytes: 25600, speedBps: 1024, status: 'Running' });
-    const failed = makeTransferTask({ taskId: 'task-2', status: 'Failed', errorMessage: 'network' });
+    const failed = makeTransferTask({ taskId: 'task-2', status: 'Failed', error: { code: 'SftpTransferError', detail: 'network' } });
     render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} onCancel={cancel} onRetry={retry} />);
     expect(screen.getByText('50%')).toBeInTheDocument();
-    expect(screen.getByText('network')).toBeInTheDocument();
+    expect(screen.getByText(/network/)).toBeInTheDocument();
     await user.click(screen.getByTestId('cancel-btn'));
     await user.click(screen.getByTestId('retry-btn'));
     expect(cancel).toHaveBeenCalledWith(running.taskId);

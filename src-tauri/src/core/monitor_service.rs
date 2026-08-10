@@ -1,5 +1,6 @@
 use crate::core::monitor_worker;
 use crate::errors::app_error::AppError;
+use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::monitor::{MonitorSnapshot, TaskInfo, TaskStatus};
 use crate::models::session::TaskStatusEvent;
@@ -265,7 +266,7 @@ fn emit_task_status<R: Runtime>(
         TaskStatusEvent {
             task_id: task_id.to_string(),
             status,
-            message,
+            error: message.map(|detail| AppErrorInfo { code: "MonitorError".to_string(), detail: Some(detail) }),
         },
     );
 }

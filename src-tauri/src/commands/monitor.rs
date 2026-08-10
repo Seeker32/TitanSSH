@@ -1,6 +1,7 @@
 use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
+use crate::errors::app_error::{AppError, AppErrorInfo};
 use tauri::{AppHandle, State};
 
 /// 为指定会话启动监控任务
@@ -14,13 +15,13 @@ pub fn start_monitoring(
     session_id: String,
     session_manager: State<'_, SessionManager>,
     monitor_service: State<'_, MonitorService>,
-) -> Result<TaskInfo, String> {
+) -> Result<TaskInfo, AppErrorInfo> {
     let host = session_manager
         .host_config(&session_id)
-        .map_err(String::from)?;
+        .map_err(AppErrorInfo::from)?;
     monitor_service
         .start_monitoring(session_id, host, app)
-        .map_err(|error| error.to_string())
+        .map_err(AppErrorInfo::from)
 }
 
 /// 停止指定 task_id 对应的监控任务
@@ -30,7 +31,7 @@ pub fn start_monitoring(
 pub fn stop_monitoring(
     task_id: String,
     monitor_service: State<'_, MonitorService>,
-) -> Result<(), String> {
+) -> Result<(), AppErrorInfo> {
     monitor_service.stop_monitoring(&task_id);
     Ok(())
 }
@@ -43,8 +44,8 @@ pub fn stop_monitoring(
 pub fn get_monitor_status(
     session_id: String,
     monitor_service: State<'_, MonitorService>,
-) -> Result<MonitorSnapshot, String> {
+) -> Result<MonitorSnapshot, AppErrorInfo> {
     monitor_service
         .get_monitor_status(&session_id)
-        .ok_or_else(|| "未找到该会话的监控数据".to_string())
+        .ok_or_else(|| AppErrorInfo::from(AppError::SessionNotFound(session_id)))
 }

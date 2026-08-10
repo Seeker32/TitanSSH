@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
+import { toAppError } from '@/i18n';
 import type {
   RemoteEntry,
   SftpProgressEvent,
@@ -74,7 +75,7 @@ export const useSftpStore = create<SftpState>((set, get) => ({
       }));
     } catch (error) {
       updateSession(set, sessionId, (state) => ({
-        ...state, error: error instanceof Error ? error.message : String(error),
+        ...state, error: toAppError(error),
       }));
     } finally {
       updateSession(set, sessionId, (state) => ({ ...state, loading: false }));
@@ -150,7 +151,7 @@ export const useSftpStore = create<SftpState>((set, get) => ({
       tasks: new Map(current.tasks).set(event.taskId, {
         ...task,
         status: event.status,
-        errorMessage: event.errorMessage,
+        error: event.error,
         transferredBytes: event.status === 'Done' ? task.totalBytes : task.transferredBytes,
       }),
     }));

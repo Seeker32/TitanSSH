@@ -116,7 +116,7 @@ export function makeTransferTask(overrides: Partial<TransferTask> = {}): Transfe
     transferredBytes: 0,
     speedBps: 0,
     status: 'Pending',
-    errorMessage: null,
+    error: null,
     createdAt: 1_710_000_000_000,
     ...overrides,
   };

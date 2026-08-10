@@ -1,6 +1,8 @@
 import { FileText, Folder } from 'lucide-react';
 import type { KeyboardEvent, MouseEvent } from 'react';
 import type { RemoteEntry, SftpSessionState } from '@/types/sftp';
+import { formatAppError, translate } from '@/i18n';
+import { useLocaleStore } from '@/stores/locale';
 
 interface Props {
   state: SftpSessionState;
@@ -25,12 +27,13 @@ function formatSize(bytes: number) {
 }
 
 /** 格式化远程文件修改时间。 */
-function formatDate(timestamp: number) {
-  return timestamp ? new Date(timestamp).toLocaleDateString('zh-CN') : '';
+function formatDate(timestamp: number, locale: string) {
+  return timestamp ? new Intl.DateTimeFormat(locale).format(new Date(timestamp)) : '';
 }
 
 /** 渲染远程路径与文件列表。 */
 export default function FileExplorer({ state, onNavigate, onSelect, onUpload, onDownload }: Props) {
+  const locale = useLocaleStore((store) => store.locale);
   const entries = [...state.entries].sort((a, b) => Number(b.isDir) - Number(a.isDir));
 
   /** 单击文件时切换选择。 */
@@ -63,13 +66,13 @@ export default function FileExplorer({ state, onNavigate, onSelect, onUpload, on
             <button className="path-seg" onClick={() => onNavigate(segment.path)}>{segment.label}</button></span>
         ))}
         <span className="path-actions">
-          <button onClick={onUpload}>上传</button>
-          <button disabled={state.selectedPaths.size === 0} onClick={() => onDownload([...state.selectedPaths])}>下载</button>
+          <button onClick={onUpload}>{translate(locale, 'sftp.upload')}</button>
+          <button disabled={state.selectedPaths.size === 0} onClick={() => onDownload([...state.selectedPaths])}>{translate(locale, 'sftp.download')}</button>
         </span>
       </div>
-      {state.loading ? <div className="state-msg">加载中...</div>
-        : state.error ? <div className="state-msg state-msg--error">{state.error}</div>
-          : entries.length === 0 ? <div className="state-msg">空目录</div>
+      {state.loading ? <div className="state-msg">{translate(locale, 'sftp.loading')}</div>
+        : state.error ? <div className="state-msg state-msg--error">{formatAppError(locale, state.error)}</div>
+          : entries.length === 0 ? <div className="state-msg">{translate(locale, 'sftp.empty')}</div>
             : <div className="file-list" role="rowgroup">{entries.map((entry) => (
               <div key={entry.path} data-testid="file-row" className={`file-row ${state.selectedPaths.has(entry.path) ? 'file-row--selected' : ''}`}
                 role="row" tabIndex={0} onClick={() => handleClick(entry)} onDoubleClick={(event) => handleDoubleClick(event, entry)}
@@ -79,7 +82,7 @@ export default function FileExplorer({ state, onNavigate, onSelect, onUpload, on
                 </span>
                 <span className={`file-name ${entry.isDir ? 'file-name--dir' : ''}`}>{entry.name}</span>
                 <span className="file-size">{formatSize(entry.size)}</span>
-                <span className="file-date">{formatDate(entry.modifiedAt)}</span>
+                <span className="file-date">{formatDate(entry.modifiedAt, locale)}</span>
               </div>
             ))}</div>}
     </div>

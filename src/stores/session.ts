@@ -1,16 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
-import type { SessionInfo, SessionProgressEvent } from '@/types/session';
+import type { SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
+import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
+import { formatAppError, translate } from '@/i18n';
+import { useLocaleStore } from '@/stores/locale';
 import { useMonitorStore } from './monitor';
 import { useSftpStore } from './sftp';
-
-interface SessionStatusPayload {
-  sessionId: string;
-  status: SessionStatus;
-  message?: string | null;
-}
 
 interface SessionState {
   sessions: Map<string, SessionInfo>;
@@ -21,44 +18,34 @@ interface SessionState {
   writeTerminal: (sessionId: string, data: string) => Promise<void>;
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
   setActiveView: (viewId: string | null) => void;
-  applySessionStatus: (payload: SessionStatusPayload) => void;
+  applySessionStatus: (payload: SessionStatusEvent) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
   initListeners: () => Promise<() => void>;
 }
 
 /** 将连接状态映射为用户可读的中文提示。 */
-export function statusLabel(status: SessionStatus, message?: string): string {
+export function statusLabel(status: SessionStatus, error?: AppErrorInfo | null, locale: Locale = useLocaleStore.getState().locale): string {
   switch (status) {
-    case SessionStatus.Connecting: return '正在连接...';
+    case SessionStatus.Connecting: return translate(locale, 'session.connectingGeneric');
     case SessionStatus.Connected: return '';
-    case SessionStatus.AuthFailed: return '认证失败，请检查用户名和密码';
-    case SessionStatus.Timeout: return '连接超时，请检查网络或主机地址';
-    case SessionStatus.Error: return message?.trim() ? `连接错误：${message.trim()}` : '连接错误';
-    case SessionStatus.Disconnected: return '连接已断开';
-    default: return '连接异常';
+    case SessionStatus.AuthFailed: return error ? formatAppError(locale, error) : translate(locale, 'session.authFailed');
+    case SessionStatus.Timeout: return error ? formatAppError(locale, error) : translate(locale, 'session.timeout');
+    case SessionStatus.Error: return error ? formatAppError(locale, error) : translate(locale, 'session.error');
+    case SessionStatus.Disconnected: return translate(locale, 'session.disconnected');
+    default: return translate(locale, 'session.unknown');
   }
 }
 
 /** 将连接阶段映射为用户可读的中文进度。 */
-export function progressLabel(phase: ConnectionPhase, message?: string): string {
-  if (message?.trim()) return message.trim();
-  switch (phase) {
-    case ConnectionPhase.LoadingCredentials: return '正在读取凭据...';
-    case ConnectionPhase.ConnectingTcp: return '正在建立 TCP 连接...';
-    case ConnectionPhase.SshHandshake: return '正在进行 SSH 握手...';
-    case ConnectionPhase.Authenticating: return '正在进行 SSH 认证...';
-    case ConnectionPhase.OpeningChannel: return '正在打开终端通道...';
-    case ConnectionPhase.RequestingPty: return '正在请求终端 PTY...';
-    case ConnectionPhase.StartingShell: return '正在启动 Shell...';
-    default: return '正在连接...';
-  }
+export function progressLabel(phase: ConnectionPhase, locale: Locale = useLocaleStore.getState().locale): string {
+  return translate(locale, `phase.${phase}` as TranslationKey);
 }
 
 export const useSessionStore = create<SessionState>((set, get) => {
   return {
     sessions: new Map(),
     activeView: null,
-    statusMessage: '就绪',
+    statusMessage: translate(useLocaleStore.getState().locale, 'session.ready'),
 
     /** 打开 SSH 会话，并启动关联监控任务。 */
     async openSession(hostId) {
@@ -66,7 +53,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set((state) => ({
         sessions: new Map(state.sessions).set(session.sessionId, session),
         activeView: session.sessionId,
-        statusMessage: `正在连接 ${session.username}@${session.host}`,
+        statusMessage: translate(useLocaleStore.getState().locale, 'session.connecting', { name: `${session.username}@${session.host}` }),
       }));
       try {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
@@ -110,7 +97,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         sessions: current
           ? new Map(state.sessions).set(payload.sessionId, { ...current, status: payload.status })
           : state.sessions,
-        statusMessage: statusLabel(payload.status, payload.message ?? undefined),
+        statusMessage: statusLabel(payload.status, payload.error),
       }));
       if (current && payload.status === SessionStatus.Connected) {
         useSftpStore.getState().listDir(payload.sessionId, '/').catch(() => {});
@@ -121,13 +108,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
     applySessionProgress(payload) {
       const current = get().sessions.get(payload.sessionId);
       if (current?.status === SessionStatus.Connecting) {
-        set({ statusMessage: progressLabel(payload.phase, payload.message) });
+        set({ statusMessage: progressLabel(payload.phase) });
       }
     },
 
     /** 注册会话状态与连接进度事件，返回统一清理函数。 */
     async initListeners() {
-      const unlistenStatus = await listen<SessionStatusPayload>('session:status', (event) => {
+      const unlistenStatus = await listen<SessionStatusEvent>('session:status', (event) => {
         get().applySessionStatus(event.payload);
       });
       const unlistenProgress = await listen<SessionProgressEvent>('session:progress', (event) => {

@@ -1,6 +1,8 @@
 import { X } from 'lucide-react';
 import type { MouseEvent } from 'react';
 import type { SessionInfo } from '@/types/session';
+import { translate } from '@/i18n';
+import { useLocaleStore } from '@/stores/locale';
 
 interface Props {
   sessions: SessionInfo[];
@@ -19,6 +21,7 @@ function statusDot(status: string) {
 
 /** 渲染真实 SSH 会话标签栏（无会话时整栏隐藏）。 */
 export default function TerminalTabs({ sessions, activeView, onActivate, onClose }: Props) {
+  const locale = useLocaleStore((state) => state.locale);
   /** 关闭标签且不触发激活。 */
   function closeTab(event: MouseEvent, sessionId: string) {
     event.stopPropagation();
@@ -32,7 +35,7 @@ export default function TerminalTabs({ sessions, activeView, onActivate, onClose
           role="tab" aria-selected={activeView === session.sessionId} onClick={() => onActivate(session.sessionId)}>
           <span className={`status-dot ${statusDot(session.status)}`} />
           <span className="tab-label">{session.username}@{session.host}</span>
-          <button type="button" className="close-btn" aria-label={`关闭 ${session.username}@${session.host}`}
+          <button type="button" className="close-btn" aria-label={translate(locale, 'tab.close', { name: `${session.username}@${session.host}` })}
             onClick={(event) => closeTab(event, session.sessionId)}><X size={11} /></button>
         </div>
       ))}

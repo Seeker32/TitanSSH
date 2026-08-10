@@ -22,8 +22,13 @@ export enum ConnectionPhase {
 export interface SessionProgressEvent {
   sessionId: string;
   phase: ConnectionPhase;
-  message: string;
   timestamp: number;
+}
+
+export interface SessionStatusEvent {
+  sessionId: string;
+  status: SessionStatus;
+  error?: AppErrorInfo | null;
 }
 
 export enum SessionStatus {
@@ -34,3 +39,4 @@ export enum SessionStatus {
   Timeout = "Timeout",
   Error = "Error",
 }
+import type { AppErrorInfo } from '@/i18n';

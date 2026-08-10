@@ -1,6 +1,7 @@
 use crate::core::host_service::HostConfigService;
 use crate::core::session_manager::SessionManager;
 use crate::models::session::SessionInfo;
+use crate::errors::app_error::{AppError, AppErrorInfo};
 use tauri::{AppHandle, State};
 
 /// 打开新的 SSH 会话
@@ -17,17 +18,17 @@ pub fn open_session(
     app: AppHandle,
     host_id: String,
     session_manager: State<'_, SessionManager>,
-) -> Result<SessionInfo, String> {
+) -> Result<SessionInfo, AppErrorInfo> {
     // 从持久化存储查询主机配置
-    let service = HostConfigService::new(&app)?;
+    let service = HostConfigService::new(&app).map_err(AppErrorInfo::from)?;
     let host = service
-        .get_host(&host_id)?
-        .ok_or_else(|| format!("Host not found: {host_id}"))?;
+        .get_host(&host_id).map_err(AppErrorInfo::from)?
+        .ok_or_else(|| AppErrorInfo::from(AppError::InvalidHostConfig(format!("Host not found: {host_id}"))))?;
 
     // 路由到 session_manager 协调层，由其启动 terminal_service
     session_manager
         .open_session(app, host)
-        .map_err(String::from)
+        .map_err(AppErrorInfo::from)
 }
 
 /// 关闭指定 SSH 会话
@@ -39,10 +40,10 @@ pub fn close_session(
     app: AppHandle,
     session_id: String,
     session_manager: State<'_, SessionManager>,
-) -> Result<(), String> {
+) -> Result<(), AppErrorInfo> {
     session_manager
         .close_session(&session_id, &app)
-        .map_err(String::from)
+        .map_err(AppErrorInfo::from)
 }
 
 /// 向指定会话的终端写入数据
@@ -53,10 +54,10 @@ pub fn write_terminal(
     session_id: String,
     data: String,
     session_manager: State<'_, SessionManager>,
-) -> Result<(), String> {
+) -> Result<(), AppErrorInfo> {
     session_manager
         .write_terminal(&session_id, data)
-        .map_err(String::from)
+        .map_err(AppErrorInfo::from)
 }
 
 /// 调整指定会话的终端大小
@@ -69,10 +70,10 @@ pub fn resize_terminal(
     cols: u32,
     rows: u32,
     session_manager: State<'_, SessionManager>,
-) -> Result<(), String> {
+) -> Result<(), AppErrorInfo> {
     session_manager
         .resize_terminal(&session_id, cols, rows)
-        .map_err(String::from)
+        .map_err(AppErrorInfo::from)
 }
 
 /// 获取所有活跃会话列表
@@ -82,6 +83,6 @@ pub fn resize_terminal(
 #[tauri::command]
 pub fn list_sessions(
     session_manager: State<'_, SessionManager>,
-) -> Result<Vec<SessionInfo>, String> {
+) -> Result<Vec<SessionInfo>, AppErrorInfo> {
     Ok(session_manager.list_sessions())
 }

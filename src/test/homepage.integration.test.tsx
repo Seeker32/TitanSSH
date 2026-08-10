@@ -54,7 +54,7 @@ describe('HomePage integration', () => {
     render(<HomePage />);
     await user.dblClick(await screen.findByTestId('host-card-host-1'));
     await act(async () => {
-      emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, message: null });
+      emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, error: null });
       emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
         available: true,
         interfaces: [
@@ -144,7 +144,7 @@ describe('HomePage integration', () => {
     const user = userEvent.setup();
     render(<HomePage />);
     await user.click(await screen.findByRole('button', { name: '设置' }));
-    const dialog = screen.getByRole('dialog', { name: 'SSH 终端主题' });
+    const dialog = screen.getByRole('dialog', { name: '设置' });
     expect(within(dialog).getAllByRole('button', { name: /SSH 终端主题/ })).toHaveLength(6);
     const applicationTheme = document.documentElement.dataset.theme;
     await user.click(within(dialog).getByRole('button', { name: /Dracula/ }));

@@ -1,5 +1,6 @@
 use crate::core::ssh_transport::{self, SftpTransport};
 use crate::errors::app_error::AppError;
+use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::sftp::{
     RemoteEntry, SftpProgressEvent, SftpTaskStatus, SftpTaskStatusEvent, TransferTask, TransferType,
@@ -331,7 +332,7 @@ impl SftpService {
             transferred_bytes: 0,
             speed_bps: 0,
             status: SftpTaskStatus::Pending,
-            error_message: None,
+            error: None,
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
@@ -412,7 +413,7 @@ impl SftpService {
             transferred_bytes: 0,
             speed_bps: 0,
             status: SftpTaskStatus::Pending,
-            error_message: None,
+            error: None,
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
@@ -509,7 +510,7 @@ impl SftpService {
             return false;
         }
         task.status = status.clone();
-        task.error_message = error_message.clone();
+        task.error = error_message.clone().map(|detail| AppErrorInfo { code: "SftpTransferError".to_string(), detail: Some(detail) });
         drop(tasks);
 
         // 终态后移除取消令牌；session 已关闭时（cleanup 后）跳过
@@ -529,7 +530,7 @@ impl SftpService {
                 task_id: task_id.to_string(),
                 session_id: session_id.to_string(),
                 status,
-                error_message,
+                error: error_message.map(|detail| AppErrorInfo { code: "SftpTransferError".to_string(), detail: Some(detail) }),
             },
         );
         true
@@ -1146,7 +1147,7 @@ mod tests {
                 transferred_bytes: 0,
                 speed_bps: 0,
                 status: SftpTaskStatus::Pending,
-                error_message: None,
+                error: None,
                 created_at: 0,
             },
         );
@@ -1192,7 +1193,7 @@ mod tests {
                 transferred_bytes: 512,
                 speed_bps: 1024,
                 status: SftpTaskStatus::Running,
-                error_message: None,
+                error: None,
                 created_at: 0,
             },
         );
@@ -1264,7 +1265,7 @@ mod tests {
                 transferred_bytes: 0,
                 speed_bps: 0,
                 status,
-                error_message: None,
+                error: None,
                 created_at: 0,
             },
         );
@@ -1324,7 +1325,7 @@ mod tests {
         ));
         let task = service.tasks.lock().unwrap().get("task-1").unwrap().clone();
         assert_eq!(task.status, SftpTaskStatus::Done);
-        assert!(task.error_message.is_none());
+        assert!(task.error.is_none());
         assert!(
             service
                 .handle("session-1")
@@ -1491,7 +1492,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(registry_task.status, SftpTaskStatus::Done);
-        assert!(registry_task.error_message.is_none());
+        assert!(registry_task.error.is_none());
         assert!(
             service
                 .handle("session-1")

@@ -1,4 +1,13 @@
 use thiserror::Error;
+use serde::{Deserialize, Serialize};
+
+/// 跨 Tauri 边界的稳定错误 payload；detail 保留底层诊断供前端本地化摘要后展示。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppErrorInfo {
+    pub code: String,
+    pub detail: Option<String>,
+}
 
 /// 应用层错误枚举，覆盖 SSH 连接、认证、会话、存储等所有错误场景
 ///
@@ -59,16 +68,31 @@ pub enum AppError {
     SftpTransferError(String),
 }
 
-/// 将 AppError 转换为 String，供 Tauri command 层返回给前端
-impl From<AppError> for String {
+/// 将内部错误转换为语言无关的 IPC 错误。
+impl From<AppError> for AppErrorInfo {
     fn from(error: AppError) -> Self {
-        error.to_string()
+        let (code, detail) = match error {
+            AppError::SshConnectionError(detail) => ("SshConnectionError", detail),
+            AppError::AuthenticationError(detail) => ("AuthenticationError", detail),
+            AppError::SessionNotFound(detail) => ("SessionNotFound", detail),
+            AppError::InvalidHostConfig(detail) => ("InvalidHostConfig", detail),
+            AppError::StorageError(detail) => ("StorageError", detail),
+            AppError::IoError(detail) => ("IoError", detail.to_string()),
+            AppError::SshProtocolError(detail) => ("SshProtocolError", detail),
+            AppError::SecureStoreError(detail) => ("SecureStoreError", detail),
+            AppError::CredentialNotFound(detail) => ("CredentialNotFound", detail),
+            AppError::SftpChannelError(detail) => ("SftpChannelError", detail),
+            AppError::SftpPermissionDenied(detail) => ("SftpPermissionDenied", detail),
+            AppError::SftpPathNotFound(detail) => ("SftpPathNotFound", detail),
+            AppError::SftpTransferError(detail) => ("SftpTransferError", detail),
+        };
+        Self { code: code.to_string(), detail: Some(detail) }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AppError;
+    use super::{AppError, AppErrorInfo};
 
     /// SSH 协议错误只保存稳定文本，不向所属 module 外泄漏 ssh2 错误类型。
     #[test]
@@ -76,5 +100,13 @@ mod tests {
         let error = AppError::SshProtocolError("channel failed".to_string());
 
         assert_eq!(error.to_string(), "SSH 协议错误: channel failed");
+    }
+
+    /// IPC 错误使用稳定代码与 camelCase detail，不携带已本地化 UI 文案。
+    #[test]
+    fn app_error_info_serializes_as_structured_payload() {
+        let value = serde_json::to_value(AppErrorInfo::from(AppError::AuthenticationError("denied".to_string())))
+            .expect("错误 payload 应序列化");
+        assert_eq!(value, serde_json::json!({ "code": "AuthenticationError", "detail": "denied" }));
     }
 }
