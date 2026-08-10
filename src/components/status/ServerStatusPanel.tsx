@@ -4,6 +4,10 @@ import type { MonitorSnapshot } from '@/types/monitor';
 
 interface Props {
   snapshot: MonitorSnapshot | null;
+  /** 当前 Session 选择的网卡接口名称。 */
+  selectedInterfaceName?: string | null;
+  /** 请求切换当前 Session 的网卡接口。 */
+  onInterfaceChange?: (interfaceName: string) => void;
   /** 是否折叠为状态点窄条 */
   collapsed: boolean;
   /** 请求切换折叠状态 */
@@ -49,7 +53,7 @@ function progressColor(value: number) {
 }
 
 /** 渲染后端单次推送的服务器监控快照；折叠态只显示状态点窄条。 */
-export default function ServerStatusPanel({ snapshot, collapsed, onToggle }: Props) {
+export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, collapsed, onToggle }: Props) {
   if (collapsed) {
     return (
       <div className="monitor-strip" data-testid="monitor-strip" role="button" aria-expanded="false" onClick={onToggle}>
@@ -65,7 +69,9 @@ export default function ServerStatusPanel({ snapshot, collapsed, onToggle }: Pro
     ['Memory', snapshot?.memoryUsage],
     ['Disk', snapshot?.diskUsage],
   ] as const;
-  const defaultInterface = snapshot?.network.available ? snapshot.network.interfaces[0] : undefined;
+  const selectedInterface = snapshot?.network.available
+    ? snapshot.network.interfaces.find((item) => item.name === selectedInterfaceName) ?? snapshot.network.interfaces[0]
+    : undefined;
   return (
     <Card size="small" variant="borderless" className="status-panel"
       title={<><Typography.Text type="secondary">服务器状态</Typography.Text><strong>{snapshot ? '已连接' : '未连接'}</strong></>}
@@ -83,11 +89,15 @@ export default function ServerStatusPanel({ snapshot, collapsed, onToggle }: Pro
         ))}
         {snapshot && (!snapshot.network.available ? (
           <Col span={24}><Typography.Text type="secondary">网络数据不可用</Typography.Text></Col>
-        ) : !defaultInterface ? (
+        ) : !selectedInterface ? (
           <Col span={24}><Typography.Text type="secondary">无可用网卡</Typography.Text></Col>
         ) : <>
-          <Col span={12}><Statistic title={`下行 · ${defaultInterface.name}`} value={formatRate(defaultInterface.receiveBytesPerSecond)} /></Col>
-          <Col span={12}><Statistic title={`上行 · ${defaultInterface.name}`} value={formatRate(defaultInterface.transmitBytesPerSecond)} /></Col>
+          <Col span={24}><label>网卡接口 <select aria-label="网卡接口" value={selectedInterface.name}
+            onChange={(event) => onInterfaceChange?.(event.target.value)}>{snapshot.network.interfaces.map((item) => (
+              <option key={item.name} value={item.name}>{item.name}</option>
+            ))}</select></label></Col>
+          <Col span={12}><Statistic title={`下行 · ${selectedInterface.name}`} value={formatRate(selectedInterface.receiveBytesPerSecond)} /></Col>
+          <Col span={12}><Statistic title={`上行 · ${selectedInterface.name}`} value={formatRate(selectedInterface.transmitBytesPerSecond)} /></Col>
         </>)}
         <Col span={24}><Typography.Text type="secondary" className="updated">
           Updated: {snapshot ? new Date(snapshot.timestamp).toLocaleTimeString() : '--'}

@@ -211,8 +211,9 @@ describe('React components', () => {
         { name: 'eth1', receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 },
       ],
     } })} selectedInterfaceName="eth1" onInterfaceChange={onInterfaceChange} collapsed={false} onToggle={vi.fn()} />);
-    const selector = screen.getByLabelText('网卡接口');
+    const selector = screen.getByLabelText('网卡接口') as HTMLSelectElement;
     expect(selector).toHaveValue('eth1');
+    expect([...selector.options].map((option) => option.value)).toEqual(['eth0', 'eth1']);
     expect(screen.getByText('2.0 KB/s')).toBeInTheDocument();
     fireEvent.change(selector, { target: { value: 'eth0' } });
     expect(onInterfaceChange).toHaveBeenCalledWith('eth0');

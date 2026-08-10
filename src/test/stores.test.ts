@@ -235,6 +235,7 @@ describe('Zustand stores', () => {
       sessionTaskMap: new Map([['session-1', task.taskId]]),
       tasks: new Map([[task.taskId, task]]),
       snapshots: new Map([['session-1', makeSnapshot()]]),
+      selectedInterfaces: new Map([['session-1', 'eth0']]),
     });
     mockInvoke.mockResolvedValue(undefined);
     await useSessionStore.getState().closeSession('session-1');
@@ -245,6 +246,7 @@ describe('Zustand stores', () => {
     expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
+    expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
   });
 
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {

@@ -5,12 +5,14 @@ import type { MonitorSnapshot, TaskInfo, TaskStatusEvent } from '@/types/monitor
 
 interface MonitorState {
   snapshots: Map<string, MonitorSnapshot>;
+  selectedInterfaces: Map<string, string>;
   tasks: Map<string, TaskInfo>;
   sessionTaskMap: Map<string, string>;
   /** invoke 返回前到达的任务状态事件缓存，任务元数据到达后补投 */
   pendingTaskEvents: Map<string, TaskStatusEvent>;
   getSessionTask: (sessionId: string) => TaskInfo | null;
   applySnapshot: (snapshot: MonitorSnapshot) => void;
+  selectNetworkInterface: (sessionId: string, interfaceName: string) => void;
   applyTaskStatus: (event: TaskStatusEvent) => void;
   fetchSnapshot: (sessionId: string) => Promise<MonitorSnapshot>;
   startMonitoring: (sessionId: string) => Promise<TaskInfo>;
@@ -21,6 +23,7 @@ interface MonitorState {
 
 export const useMonitorStore = create<MonitorState>((set, get) => ({
   snapshots: new Map(),
+  selectedInterfaces: new Map(),
   tasks: new Map(),
   sessionTaskMap: new Map(),
   pendingTaskEvents: new Map(),
@@ -31,9 +34,31 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     return taskId ? get().tasks.get(taskId) ?? null : null;
   },
 
-  /** 写入指定会话的最新监控快照。 */
+  /** 写入指定会话快照，并按可用候选接口维护该会话的选择。 */
   applySnapshot(snapshot) {
-    set((state) => ({ snapshots: new Map(state.snapshots).set(snapshot.sessionId, snapshot) }));
+    set((state) => {
+      const selectedInterfaces = new Map(state.selectedInterfaces);
+      if (snapshot.network.available) {
+        const interfaces = snapshot.network.interfaces;
+        const selected = selectedInterfaces.get(snapshot.sessionId);
+        if (interfaces.length === 0) {
+          selectedInterfaces.delete(snapshot.sessionId);
+        } else if (!interfaces.some((item) => item.name === selected)) {
+          selectedInterfaces.set(snapshot.sessionId, interfaces[0].name);
+        }
+      }
+      return {
+        snapshots: new Map(state.snapshots).set(snapshot.sessionId, snapshot),
+        selectedInterfaces,
+      };
+    });
+  },
+
+  /** 切换指定会话的当前网卡；仅接受最新可用快照中的候选接口。 */
+  selectNetworkInterface(sessionId, interfaceName) {
+    const snapshot = get().snapshots.get(sessionId);
+    if (!snapshot?.network.available || !snapshot.network.interfaces.some((item) => item.name === interfaceName)) return;
+    set((state) => ({ selectedInterfaces: new Map(state.selectedInterfaces).set(sessionId, interfaceName) }));
   },
 
   /** 应用长任务状态事件；未知任务缓存最新事件，元数据到达后补投。 */
@@ -92,10 +117,12 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
       const sessionTaskMap = new Map(state.sessionTaskMap);
       const snapshots = new Map(state.snapshots);
       const tasks = new Map(state.tasks);
+      const selectedInterfaces = new Map(state.selectedInterfaces);
       sessionTaskMap.delete(sessionId);
       snapshots.delete(sessionId);
+      selectedInterfaces.delete(sessionId);
       if (taskId) tasks.delete(taskId);
-      return { sessionTaskMap, snapshots, tasks };
+      return { sessionTaskMap, snapshots, tasks, selectedInterfaces };
     });
   },
 

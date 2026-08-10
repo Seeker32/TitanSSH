@@ -69,6 +69,33 @@ describe('HomePage integration', () => {
     expect(screen.getByText('2.0 KB/s')).toBeInTheDocument();
   });
 
+  it('切换活动会话后保留各自的网卡选择', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    act(() => useSessionStore.setState({ sessions: new Map([
+      ['session-1', makeSession()],
+      ['session-2', makeSession({ sessionId: 'session-2' })],
+    ]), activeView: 'session-1' }));
+    await act(async () => {
+      emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
+        available: true,
+        interfaces: [
+          { name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+          { name: 'eth1', receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 },
+        ],
+      } }));
+      emitMockEvent('monitor:snapshot', makeSnapshot({ sessionId: 'session-2', network: {
+        available: true,
+        interfaces: [{ name: 'ens5', receiveBytesPerSecond: 4096, transmitBytesPerSecond: 2048 }],
+      } }));
+    });
+    await user.selectOptions(screen.getByLabelText('网卡接口'), 'eth1');
+    act(() => useSessionStore.getState().setActiveView('session-2'));
+    expect(screen.getByLabelText('网卡接口')).toHaveValue('ens5');
+    act(() => useSessionStore.getState().setActiveView('session-1'));
+    expect(screen.getByLabelText('网卡接口')).toHaveValue('eth1');
+  });
+
   it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {
     const user = userEvent.setup();
     const { container } = render(<HomePage />);
