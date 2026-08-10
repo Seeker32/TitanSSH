@@ -1,216 +1,48 @@
-# SSH Terminal Manager
+# TitanSSH
 
-A cross-platform desktop application for managing SSH server connections and terminal sessions, built with Tauri + React + Rust.
+TitanSSH is a desktop app for working with Linux servers over SSH. Keep your server connections in one place, open terminal sessions in tabs, transfer files, and check the essentials without leaving the app.
 
-## Tech Stack
+## What you can do
 
-### Frontend
-- **Framework**: React 19 + TypeScript
-- **Build Tool**: Vite
-- **State Management**: Zustand
-- **Terminal**: xterm.js + xterm-addon-fit
-- **UI**: Ant Design 6
-- **Testing**: Vitest + React Testing Library + Playwright
+- Save and organize server connections
+- Sign in with a password or an SSH private key
+- Open multiple terminal sessions at once
+- Choose a terminal-only theme without changing the rest of the app
+- Upload and download files with progress tracking
+- View CPU, memory, disk, network activity, and server uptime
 
-### Backend
-- **Framework**: Tauri 2.x
-- **Language**: Rust (Edition 2024)
-- **Async Runtime**: Tokio
-- **SSH Library**: ssh2 (libssh2 bindings)
-- **Security**: keyring (OS keychain integration)
-- **Testing**: proptest + mockall
+Passwords are stored in your operating system's secure keychain. Private keys stay on your computer; TitanSSH stores only their file paths.
 
-## Project Structure
+## Get started
 
-```
-ssh-terminal-manager/
-├── src/                   # React frontend application
-│   ├── components/        # React components
-│   │   ├── host/          # Server configuration UI
-│   │   ├── terminal/      # Terminal components
-│   │   ├── status/        # Status monitoring UI
-│   │   └── layout/        # Layout components
-│   ├── stores/            # Zustand stores
-│   ├── types/             # TypeScript type definitions
-│   ├── pages/             # Page components
-│   └── test/              # Test setup
-├── src-tauri/             # Rust backend application
-│   ├── src/
-│   │   ├── commands/      # Tauri command handlers
-│   │   ├── core/          # Core business logic
-│   │   │   ├── session_manager.rs
-│   │   │   ├── ssh_client.rs
-│   │   │   ├── monitor_worker.rs
-│   │   │   └── terminal_bridge.rs
-│   │   ├── models/        # Data models
-│   │   ├── storage/       # Data persistence
-│   │   └── errors/        # Error types
-│   └── Cargo.toml
-├── public/                # Static assets
-├── dist/                  # Build output
-├── package.json           # Frontend dependencies
-├── vite.config.ts         # Vite configuration
-├── vitest.config.ts       # Vitest configuration
-└── README.md
-```
+You will need Node.js 22.13 or newer, pnpm, and a current stable Rust toolchain. On macOS, also install Xcode Command Line Tools. Linux and Windows may need their usual C/C++ build tools.
 
-## Getting Started
-
-### Prerequisites
-
-- **Node.js**: v22.13 or higher
-- **pnpm**: Latest version (or npm/yarn)
-- **Rust**: Latest stable (install via [rustup](https://rustup.rs/))
-- **System Dependencies**:
-  - macOS: Xcode Command Line Tools
-  - Linux: libssl-dev, pkg-config
-  - Windows: Visual Studio Build Tools
-
-### Installation
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd ssh-terminal-manager
-```
-
-2. Install frontend dependencies:
 ```bash
 pnpm install
-```
-
-3. Rust dependencies will be automatically handled by Cargo.
-
-### Development
-
-Run the development server:
-```bash
 pnpm tauri dev
 ```
 
-This will:
-- Start the Vite dev server on port 5173
-- Launch the Tauri application
-- Enable hot module replacement (HMR)
+The app will open in development mode. Add a connection from the sidebar, then double-click it to start a terminal session.
 
-### Testing
+## Terminal themes
 
-Run frontend tests:
+Open **Settings** in the sidebar to choose a terminal theme. TitanSSH includes Light, Dark, One Dark, Dracula, Solarized Light, and Solarized Dark. Your choice is saved locally and affects terminal content only, so the app's own light or dark appearance stays unchanged.
+
+## Checks and builds
+
 ```bash
-pnpm test              # Run once
-pnpm test:watch        # Watch mode
-pnpm exec playwright install chromium  # First-time E2E browser install
-pnpm test:e2e          # Browser-level mocked Tauri flow
-```
-
-Run backend tests:
-```bash
-cd src-tauri
-cargo test             # All tests
-cargo test --lib       # Unit tests only
-```
-
-### Building
-
-Build the application for production:
-```bash
+pnpm test
 pnpm tauri build
 ```
 
-The built application will be in `src-tauri/target/release/bundle/`.
-
-## Features (Phase 1)
-
-### Server Configuration Management
-- ✅ Create, edit, and delete server configurations
-- ✅ Support for password authentication
-- ✅ Support for private key authentication
-- ✅ Secure password storage using OS keychain
-- ✅ Persistent configuration storage
-
-### Terminal Sessions
-- ✅ Multi-tab terminal interface
-- ✅ Real-time bidirectional communication
-- ✅ Terminal resize support
-- ✅ ANSI color and control sequence support
-- ✅ Session state management
-
-### Server Monitoring
-- ✅ Real-time CPU usage
-- ✅ Memory and swap usage
-- ✅ Load average (1, 5, 15 minutes)
-- ✅ Server uptime
-- ✅ Automatic monitoring on session connect
-
-### User Interface
-- ✅ Clean, intuitive layout
-- ✅ Server list sidebar
-- ✅ Status monitoring panel
-- ✅ Multi-tab terminal area
-- ✅ Resizable panels
-
-## Architecture
-
-### Communication Flow
-
-```
-Frontend (React 19)
-    ↓ Tauri Commands
-Backend (Rust)
-    ↓ SSH Protocol
-Remote Server
-    ↑ PTY Output
-Backend (Rust)
-    ↑ Tauri Events
-Frontend (React 19)
-```
-
-### Key Components
-
-- **SessionManager**: Manages all active SSH sessions
-- **SshClient**: Handles SSH connections and authentication
-- **MonitorWorker**: Collects server status periodically
-- **HostStore**: Persists server configurations
-- **Zustand Stores**: Frontend state management
-
-## Development Guidelines
-
-### Code Style
-- Frontend: Follow React Hooks and Zustand immutable update best practices
-- Backend: Follow Rust standard conventions
-- Use TypeScript strict mode
-- Write tests for critical functionality
-
-### Testing Strategy
-- **Unit Tests**: Test individual functions and components
-- **Property Tests**: Verify correctness properties with random inputs
-- **Integration Tests**: Test end-to-end workflows
+The packaged app is written to `src-tauri/target/release/bundle/`.
 
 ## Troubleshooting
 
-### Common Issues
+**Can't connect?** Confirm the server address, SSH service, firewall rules, username, and authentication details.
 
-**Port 5173 already in use:**
-```bash
-# Kill the process using the port
-lsof -ti:5173 | xargs kill -9
-```
-
-**Rust compilation errors:**
-```bash
-# Update Rust toolchain
-rustup update stable
-```
-
-**SSH connection fails:**
-- Check firewall settings
-- Verify SSH server is running
-- Confirm credentials are correct
+**Development app will not start?** Make sure Node.js, pnpm, Rust, and the platform build tools above are installed.
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions are welcome! Please read the design document in `.kiro/specs/ssh-terminal-manager/` for detailed architecture information.
