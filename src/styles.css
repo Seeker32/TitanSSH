@@ -102,6 +102,11 @@ button { cursor: pointer; }
   border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card-bg); color: var(--color-text-secondary); }
 .sidebar-footer-btn:hover:not(:disabled) { border-color: var(--color-border-focus); color: var(--color-accent); }
 .sidebar-footer-btn:disabled { opacity: .4; cursor: default; }
+.terminal-theme-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.terminal-theme-card { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 8px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-card-bg); color: var(--color-text-primary); text-align: left; }
+.terminal-theme-card[aria-pressed="true"] { border-color: var(--color-accent); box-shadow: inset 0 0 0 1px var(--color-accent); }
+.terminal-theme-preview { display: flex; flex-direction: column; gap: 2px; min-height: 42px; padding: 6px; border-radius: 4px; font: 10px monospace; }
+.terminal-theme-card__selected { color: var(--color-accent); font-size: 11px; }
 .monitor-strip { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; padding: 6px 10px;
   border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-card-bg); cursor: pointer; }
 .monitor-strip:hover { background: var(--color-card-bg-hover); }

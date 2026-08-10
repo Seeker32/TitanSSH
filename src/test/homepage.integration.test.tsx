@@ -9,6 +9,7 @@ import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
+import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { SessionStatus } from '@/types/session';
 import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
 
@@ -23,6 +24,7 @@ function resetStores() {
   useMonitorStore.setState(useMonitorStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
+  useTerminalThemeStore.setState(useTerminalThemeStore.getInitialState(), true);
 }
 
 describe('HomePage integration', () => {
@@ -136,6 +138,19 @@ describe('HomePage integration', () => {
     const before = document.documentElement.dataset.theme;
     await user.click(toggle);
     expect(document.documentElement.dataset.theme).not.toBe(before);
+  });
+
+  it('设置对话框提供六个可访问的 SSH 终端主题，并保存选择', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.click(await screen.findByRole('button', { name: '设置' }));
+    const dialog = screen.getByRole('dialog', { name: 'SSH 终端主题' });
+    expect(within(dialog).getAllByRole('button', { name: /SSH 终端主题/ })).toHaveLength(6);
+    const applicationTheme = document.documentElement.dataset.theme;
+    await user.click(within(dialog).getByRole('button', { name: /Dracula/ }));
+    expect(useTerminalThemeStore.getState().terminalTheme).toBe('dracula');
+    expect(localStorage.getItem('terminal-theme')).toBe('dracula');
+    expect(document.documentElement.dataset.theme).toBe(applicationTheme);
   });
 
   it('拖动侧栏右边缘时更新并限制宽度，且不显示独立拖拽线', async () => {

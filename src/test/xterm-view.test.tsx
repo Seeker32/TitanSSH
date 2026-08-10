@@ -1,7 +1,9 @@
 import { act, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
-import XtermView, { terminalThemes } from '@/components/terminal/XtermView';
+import XtermView, { terminalThemes, TERMINAL_THEME_NAMES } from '@/components/terminal/XtermView';
+import { useTerminalThemeStore } from '@/stores/terminal-theme';
+import { useThemeStore } from '@/stores/theme';
 
 const terminal = {
   cols: 80,
@@ -28,6 +30,7 @@ describe('XtermView', () => {
     inputDisposable.dispose.mockClear();
     terminal.onData.mockImplementation((handler) => { inputHandler = handler; return inputDisposable; });
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(0); return 1; });
+    useTerminalThemeStore.setState(useTerminalThemeStore.getInitialState(), true);
   });
 
   it('挂载时初始化终端与尺寸插件', () => {
@@ -59,6 +62,19 @@ describe('XtermView', () => {
     expect(terminalThemes.light.background).toBe('#ffffff');
     expect(terminalThemes.dark.cursor).toBe('#10b981');
     expect(terminalThemes.light.cursor).toBe('#059669');
+  });
+
+  it('每个全局 SSH 终端主题都会应用到已挂载和新建终端，且不受应用主题切换影响', () => {
+    const first = render(<XtermView sessionId="session-1" active onInput={vi.fn()} onResize={vi.fn()} />);
+    for (const theme of TERMINAL_THEME_NAMES) {
+      act(() => useTerminalThemeStore.getState().setTerminalTheme(theme));
+      expect(terminal.options.theme).toEqual(terminalThemes[theme]);
+    }
+    act(() => useThemeStore.getState().setTheme('dark'));
+    expect(terminal.options.theme).toEqual(terminalThemes.solarizedDark);
+    first.unmount();
+    render(<XtermView sessionId="session-2" active onInput={vi.fn()} onResize={vi.fn()} />);
+    expect(terminal.options.theme).toEqual(terminalThemes.solarizedDark);
   });
 
   it('卸载时释放终端资源', async () => {
