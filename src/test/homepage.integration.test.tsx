@@ -55,12 +55,18 @@ describe('HomePage integration', () => {
       emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, message: null });
       emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
         available: true,
-        interfaces: [{ name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 }],
+        interfaces: [
+          { name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+          { name: 'eth1', receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 },
+        ],
       } }));
     });
     expect(screen.getByText('已连接')).toBeInTheDocument();
     expect(screen.getByText('21.5%')).toBeInTheDocument();
     expect(screen.getByText('1.0 KB/s')).toBeInTheDocument();
+    expect(screen.getByLabelText('网卡接口')).toHaveValue('eth0');
+    await user.selectOptions(screen.getByLabelText('网卡接口'), 'eth1');
+    expect(screen.getByText('2.0 KB/s')).toBeInTheDocument();
   });
 
   it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {

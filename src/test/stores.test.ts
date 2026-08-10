@@ -258,6 +258,54 @@ describe('Zustand stores', () => {
     cleanup();
   });
 
+  it('网卡选择首次默认第一张、可切换且后台会话彼此隔离', () => {
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ network: {
+      available: true,
+      interfaces: [
+        { name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+        { name: 'eth1', receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 },
+      ],
+    } }));
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-1')).toBe('eth0');
+
+    useMonitorStore.getState().selectNetworkInterface('session-1', 'eth1');
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ sessionId: 'session-2', network: {
+      available: true,
+      interfaces: [{ name: 'ens5', receiveBytesPerSecond: 4096, transmitBytesPerSecond: 2048 }],
+    } }));
+
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-1')).toBe('eth1');
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-2')).toBe('ens5');
+  });
+
+  it('网卡选择在不可用时保留，接口消失或空列表时按规则更新', () => {
+    const available = (interfaces: Array<{ name: string; receiveBytesPerSecond: number | null; transmitBytesPerSecond: number | null }>) =>
+      makeSnapshot({ network: { available: true, interfaces } });
+    useMonitorStore.getState().applySnapshot(available([
+      { name: 'eth0', receiveBytesPerSecond: 1, transmitBytesPerSecond: 1 },
+      { name: 'eth1', receiveBytesPerSecond: 2, transmitBytesPerSecond: 2 },
+    ]));
+    useMonitorStore.getState().selectNetworkInterface('session-1', 'eth1');
+
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ network: { available: false, interfaces: [] } }));
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-1')).toBe('eth1');
+    useMonitorStore.getState().applySnapshot(available([
+      { name: 'eth1', receiveBytesPerSecond: 2, transmitBytesPerSecond: 2 },
+      { name: 'eth2', receiveBytesPerSecond: 3, transmitBytesPerSecond: 3 },
+    ]));
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-1')).toBe('eth1');
+
+    useMonitorStore.getState().applySnapshot(available([{ name: 'eth2', receiveBytesPerSecond: 3, transmitBytesPerSecond: 3 }]));
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-1')).toBe('eth2');
+    useMonitorStore.getState().applySnapshot(available([]));
+    expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
+    useMonitorStore.getState().applySnapshot(available([{ name: 'eth3', receiveBytesPerSecond: 4, transmitBytesPerSecond: 4 }]));
+    expect(useMonitorStore.getState().selectedInterfaces.get('session-1')).toBe('eth3');
+
+    useMonitorStore.getState().clearSession('session-1');
+    expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
+  });
+
   it('SFTP 目录成功与失败分别更新 entries 和 error', async () => {
     mockInvoke.mockResolvedValueOnce([makeRemoteEntry()]).mockRejectedValueOnce(new Error('denied'));
     await useSftpStore.getState().listDir('session-1', '/var/log');

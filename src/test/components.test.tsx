@@ -202,6 +202,22 @@ describe('React components', () => {
     expect(screen.getByText('网络数据不可用')).toBeInTheDocument();
   });
 
+  it('服务器状态下拉框展示全部网卡并切换当前速率', () => {
+    const onInterfaceChange = vi.fn();
+    render(<ServerStatusPanel snapshot={makeSnapshot({ network: {
+      available: true,
+      interfaces: [
+        { name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+        { name: 'eth1', receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 },
+      ],
+    } })} selectedInterfaceName="eth1" onInterfaceChange={onInterfaceChange} collapsed={false} onToggle={vi.fn()} />);
+    const selector = screen.getByLabelText('网卡接口');
+    expect(selector).toHaveValue('eth1');
+    expect(screen.getByText('2.0 KB/s')).toBeInTheDocument();
+    fireEvent.change(selector, { target: { value: 'eth0' } });
+    expect(onInterfaceChange).toHaveBeenCalledWith('eth0');
+  });
+
   it('监视条折叠态显示状态点，点击请求展开', async () => {
     const user = userEvent.setup();
     const onToggle = vi.fn();
