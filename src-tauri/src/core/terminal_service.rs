@@ -573,10 +573,6 @@ mod tests {
     }
 
     proptest! {
-        /// **验证: 需求 4.3, 4.4**
-        ///
-        /// Property 6: 终端事件按 session_id 正确路由
-        ///
         /// 对任意 session_id 和终端数据，构造 TerminalDataEvent 后，
         /// 验证事件中的 session_id 与产生该事件的会话 ID 完全一致，
         /// 不会被路由到其他会话。
@@ -605,10 +601,6 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 4.3, 4.4**
-        ///
-        /// Property 6 扩展：不同会话的终端事件不会互相路由
-        ///
         /// 对任意两个不同的 session_id，验证各自构造的 TerminalDataEvent
         /// 的 session_id 互不相同，确保事件不会跨会话路由。
         #[test]
@@ -656,10 +648,6 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 7.4, 7.5**
-        ///
-        /// Property 7: 关闭会话后终端流停止
-        ///
         /// 模拟终端工作线程的核心 IO 循环逻辑：
         /// - 使用 `Arc<AtomicBool>` 作为 shutdown 标志（与 start_terminal_session 中一致）
         /// - 使用 proptest 生成任意数量的待处理数据帧序列
@@ -708,10 +696,6 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 7.4, 7.5**
-        ///
-        /// Property 7 扩展：shutdown 前后事件产生数量对比
-        ///
         /// 验证 shutdown 标志的边界语义：
         /// - shutdown=false 时，循环体正常执行，可产生事件
         /// - shutdown=true 时，循环体不执行，事件数量为零

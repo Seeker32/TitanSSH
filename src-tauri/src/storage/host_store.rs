@@ -194,10 +194,6 @@ mod tests {
     }
 
     proptest! {
-        /// **验证: 需求 1.1, 1.5**
-        ///
-        /// Property 1: HostConfig 持久化往返
-        ///
         /// 使用 proptest 生成任意合法 HostConfig，save 后 load 验证：
         /// 1. 非敏感字段（id, name, host, port, username, auth_type, private_key_path, remark）完全一致
         /// 2. 敏感字段（password_ref, passphrase_ref）仅以引用键形式存在，不含明文凭据

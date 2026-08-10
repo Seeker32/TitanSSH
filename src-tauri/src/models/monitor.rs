@@ -162,10 +162,6 @@ mod tests {
     }
 
     proptest! {
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 8: 所有时间戳为毫秒
-        ///
         /// 验证 SessionInfo.created_at 为毫秒级时间戳（值 > 1_000_000_000_000）
         #[test]
         fn prop_session_info_created_at_is_millis(session in arb_session_info()) {
@@ -177,10 +173,6 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 8: 所有时间戳为毫秒
-        ///
         /// 验证 MonitorSnapshot.timestamp 为毫秒级时间戳（值 > 1_000_000_000_000）
         #[test]
         fn prop_monitor_snapshot_timestamp_is_millis(snapshot in arb_monitor_snapshot()) {
@@ -192,10 +184,6 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 8: 所有时间戳为毫秒
-        ///
         /// 验证 TaskInfo.created_at 为毫秒级时间戳（值 > 1_000_000_000_000）
         #[test]
         fn prop_task_info_created_at_is_millis(task in arb_task_info()) {
@@ -207,10 +195,6 @@ mod tests {
             );
         }
 
-        /// **验证: 需求 7.1**
-        ///
-        /// Property 8: 所有时间戳为毫秒（联合验证）
-        ///
         /// 同时验证三种结构体的时间戳字段均为毫秒级，
         /// 确保系统中所有暴露给前端的时间字段一致遵守毫秒约定
         #[test]
