@@ -1,8 +1,8 @@
 use crate::errors::app_error::AppError;
 use keyring::Entry;
 
-/// 安全存储服务名，与 tauri.conf.json identifier 保持一致
-const SERVICE_NAME: &str = "dev.titanssh.ssh-terminal-manager";
+/// OS 安全存储服务名
+const SERVICE_NAME: &str = "TitanSSH";
 
 /// 将凭据写入 OS 安全存储（macOS Keychain / Windows Credential Manager / Linux Secret Service）
 /// - key: 凭据的唯一标识键
@@ -110,6 +110,12 @@ mod tests {
     }
 
     // --- key 格式契约测试（纯逻辑，不依赖 OS keyring）---
+
+    /// 安全存储服务名使用正式产品名，不再沿用开发期 bundle identifier
+    #[test]
+    fn service_name_uses_production_product_name() {
+        assert_eq!(SERVICE_NAME, "TitanSSH");
+    }
 
     #[test]
     fn password_key_format_matches_ref_format() {

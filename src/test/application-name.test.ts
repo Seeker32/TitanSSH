@@ -11,6 +11,7 @@ describe('application name', () => {
 
     expect(packageJson.name).toBe('titanssh');
     expect(tauriConfig.productName).toBe('TitanSSH');
+    expect(tauriConfig.identifier).toBe('com.titanssh.desktop');
     expect(tauriConfig.app.windows[0].title).toBe('TitanSSH');
     expect(cargoToml).toContain('name = "titanssh"');
     expect(main).toContain('titanssh::run()');

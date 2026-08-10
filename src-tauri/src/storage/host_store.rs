@@ -1,8 +1,23 @@
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
+
+const LEGACY_IDENTIFIER: &str = "dev.titanssh.ssh-terminal-manager";
+const HOSTS_FILE_NAME: &str = "hosts.json";
+
+/// 将开发期 identifier 目录中的主机配置复制到正式目录
+fn migrate_legacy_hosts(legacy_file: &Path, new_file: &Path) -> Result<(), AppError> {
+    if new_file.exists() || !legacy_file.exists() {
+        return Ok(());
+    }
+
+    fs::copy(legacy_file, new_file)
+        .map(|_| ())
+        .map_err(|error| AppError::StorageError(format!("迁移旧主机配置失败: {error}")))?;
+    Ok(())
+}
 
 pub struct HostStore {
     file_path: PathBuf,
@@ -28,7 +43,11 @@ impl HostStore {
         fs::create_dir_all(&app_data_dir)
             .map_err(|error| AppError::StorageError(format!("无法创建应用数据目录: {error}")))?;
 
-        let file_path = app_data_dir.join("hosts.json");
+        let file_path = app_data_dir.join(HOSTS_FILE_NAME);
+        if let Some(data_root) = app_data_dir.parent() {
+            let legacy_file = data_root.join(LEGACY_IDENTIFIER).join(HOSTS_FILE_NAME);
+            migrate_legacy_hosts(&legacy_file, &file_path)?;
+        }
 
         Ok(Self { file_path })
     }
@@ -81,7 +100,7 @@ impl HostStore {
 
 #[cfg(test)]
 mod tests {
-    use super::HostStore;
+    use super::{migrate_legacy_hosts, HostStore};
     use crate::models::host::{AuthType, HostConfig};
     use proptest::prelude::*;
     use std::fs;
@@ -115,6 +134,63 @@ mod tests {
         let store = HostStore::from_file_path(temp_hosts_file());
         let hosts = store.load().expect("load should succeed");
         assert!(hosts.is_empty());
+    }
+
+    /// 正式目录尚无配置时复制开发期 hosts.json
+    #[test]
+    fn migrate_legacy_hosts_copies_missing_production_file() {
+        let root = std::env::temp_dir().join(format!("titan-host-migration-{}", Uuid::new_v4()));
+        let legacy_file = root.join("legacy/hosts.json");
+        let new_file = root.join("production/hosts.json");
+        fs::create_dir_all(legacy_file.parent().expect("legacy parent should exist"))
+            .expect("legacy dir should be created");
+        fs::create_dir_all(new_file.parent().expect("production parent should exist"))
+            .expect("production dir should be created");
+        fs::write(&legacy_file, "legacy hosts").expect("legacy hosts should be written");
+
+        migrate_legacy_hosts(&legacy_file, &new_file).expect("migration should succeed");
+
+        assert_eq!(
+            fs::read_to_string(new_file).expect("production hosts should exist"),
+            "legacy hosts"
+        );
+    }
+
+    /// 正式目录已有配置时不得被开发期文件覆盖
+    #[test]
+    fn migrate_legacy_hosts_preserves_existing_production_file() {
+        let root = std::env::temp_dir().join(format!("titan-host-migration-{}", Uuid::new_v4()));
+        let legacy_file = root.join("legacy/hosts.json");
+        let new_file = root.join("production/hosts.json");
+        fs::create_dir_all(legacy_file.parent().expect("legacy parent should exist"))
+            .expect("legacy dir should be created");
+        fs::create_dir_all(new_file.parent().expect("production parent should exist"))
+            .expect("production dir should be created");
+        fs::write(&legacy_file, "legacy hosts").expect("legacy hosts should be written");
+        fs::write(&new_file, "production hosts").expect("production hosts should be written");
+
+        migrate_legacy_hosts(&legacy_file, &new_file).expect("migration should be a no-op");
+
+        assert_eq!(
+            fs::read_to_string(new_file).expect("production hosts should exist"),
+            "production hosts"
+        );
+    }
+
+    /// 旧路径不可复制时返回存储错误，不静默丢失主机配置
+    #[test]
+    fn migrate_legacy_hosts_reports_copy_failure() {
+        let root = std::env::temp_dir().join(format!("titan-host-migration-{}", Uuid::new_v4()));
+        let legacy_file = root.join("legacy-directory");
+        let new_file = root.join("production/hosts.json");
+        fs::create_dir_all(&legacy_file).expect("legacy directory should be created");
+        fs::create_dir_all(new_file.parent().expect("production parent should exist"))
+            .expect("production dir should be created");
+
+        let error = migrate_legacy_hosts(&legacy_file, &new_file)
+            .expect_err("copying a directory as hosts.json should fail");
+
+        assert!(error.to_string().contains("迁移旧主机配置失败"));
     }
 
     #[test]
