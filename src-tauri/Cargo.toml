@@ -1,6 +1,6 @@
 [package]
 name = "titanssh"
-version = "0.1.2"
+version = "0.1.3"
 description = "A SSH Client"
 authors = ["Seeker32"]
 edition = "2024"
