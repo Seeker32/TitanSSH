@@ -266,7 +266,10 @@ fn emit_task_status<R: Runtime>(
         TaskStatusEvent {
             task_id: task_id.to_string(),
             status,
-            error: message.map(|detail| AppErrorInfo { code: "MonitorError".to_string(), detail: Some(detail) }),
+            error: message.map(|detail| AppErrorInfo {
+                code: "MonitorError".to_string(),
+                detail: Some(detail),
+            }),
         },
     );
 }

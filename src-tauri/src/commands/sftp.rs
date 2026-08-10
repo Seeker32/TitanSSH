@@ -1,6 +1,6 @@
 use crate::core::sftp_service::SftpService;
-use crate::models::sftp::{RemoteEntry, TransferTask};
 use crate::errors::app_error::AppErrorInfo;
+use crate::models::sftp::{RemoteEntry, TransferTask};
 use tauri::{AppHandle, State};
 
 /// 列举远程目录内容，按目录优先、名称排序

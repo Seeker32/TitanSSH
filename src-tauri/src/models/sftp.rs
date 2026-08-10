@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::errors::app_error::AppErrorInfo;
+use serde::{Deserialize, Serialize};
 
 /// 远程文件系统条目（文件或目录）
 #[derive(Debug, Clone, Serialize, Deserialize)]

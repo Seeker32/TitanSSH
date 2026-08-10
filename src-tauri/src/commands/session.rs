@@ -1,7 +1,7 @@
 use crate::core::host_service::HostConfigService;
 use crate::core::session_manager::SessionManager;
-use crate::models::session::SessionInfo;
 use crate::errors::app_error::{AppError, AppErrorInfo};
+use crate::models::session::SessionInfo;
 use tauri::{AppHandle, State};
 
 /// 打开新的 SSH 会话
@@ -22,8 +22,13 @@ pub fn open_session(
     // 从持久化存储查询主机配置
     let service = HostConfigService::new(&app).map_err(AppErrorInfo::from)?;
     let host = service
-        .get_host(&host_id).map_err(AppErrorInfo::from)?
-        .ok_or_else(|| AppErrorInfo::from(AppError::InvalidHostConfig(format!("Host not found: {host_id}"))))?;
+        .get_host(&host_id)
+        .map_err(AppErrorInfo::from)?
+        .ok_or_else(|| {
+            AppErrorInfo::from(AppError::InvalidHostConfig(format!(
+                "Host not found: {host_id}"
+            )))
+        })?;
 
     // 路由到 session_manager 协调层，由其启动 terminal_service
     session_manager

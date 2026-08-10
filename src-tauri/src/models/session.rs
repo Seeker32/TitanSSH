@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::errors::app_error::AppErrorInfo;
+use serde::{Deserialize, Serialize};
 
 /// 真实 SSH 会话信息，与前端 UI 标签页完全解耦
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

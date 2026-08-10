@@ -510,7 +510,10 @@ impl SftpService {
             return false;
         }
         task.status = status.clone();
-        task.error = error_message.clone().map(|detail| AppErrorInfo { code: "SftpTransferError".to_string(), detail: Some(detail) });
+        task.error = error_message.clone().map(|detail| AppErrorInfo {
+            code: "SftpTransferError".to_string(),
+            detail: Some(detail),
+        });
         drop(tasks);
 
         // 终态后移除取消令牌；session 已关闭时（cleanup 后）跳过
@@ -530,7 +533,10 @@ impl SftpService {
                 task_id: task_id.to_string(),
                 session_id: session_id.to_string(),
                 status,
-                error: error_message.map(|detail| AppErrorInfo { code: "SftpTransferError".to_string(), detail: Some(detail) }),
+                error: error_message.map(|detail| AppErrorInfo {
+                    code: "SftpTransferError".to_string(),
+                    detail: Some(detail),
+                }),
             },
         );
         true

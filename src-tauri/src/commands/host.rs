@@ -1,7 +1,7 @@
 use crate::core::host_service::HostConfigService;
+use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::HostConfig;
 use crate::models::host::SaveHostRequest;
-use crate::errors::app_error::AppErrorInfo;
 use tauri::AppHandle;
 
 /// 列出所有已保存的主机配置,不含明文凭据
@@ -23,7 +23,10 @@ pub fn list_hosts(app: AppHandle) -> Result<Vec<HostConfig>, AppErrorInfo> {
 /// # 返回
 /// 更新后的主机列表
 #[tauri::command]
-pub fn save_host(app: AppHandle, request: SaveHostRequest) -> Result<Vec<HostConfig>, AppErrorInfo> {
+pub fn save_host(
+    app: AppHandle,
+    request: SaveHostRequest,
+) -> Result<Vec<HostConfig>, AppErrorInfo> {
     let service = HostConfigService::new(&app)?;
     service.save(&request).map_err(AppErrorInfo::from)
 }

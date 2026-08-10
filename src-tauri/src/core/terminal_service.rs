@@ -5,7 +5,7 @@ use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::session::{SessionStatus, SessionStatusEvent, TerminalDataEvent};
 use crate::storage::secure_store;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -14,8 +14,6 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime};
 
-/// 凭据读取阶段超时时间，避免系统钥匙串卡住导致 UI 长期停留在“连接中”
-const CREDENTIAL_LOAD_TIMEOUT_SECS: u64 = 5;
 /// SSH 连接阶段总超时时间（含 TCP、握手、认证），作为 libssh2 阻塞场景的外层兜底
 const CONNECT_TOTAL_TIMEOUT_SECS: u64 = 15;
 
@@ -38,13 +36,6 @@ pub struct ConnectionProgressEvent {
     pub session_id: String,
     pub phase: ConnectionPhase,
     pub timestamp: i64,
-}
-
-/// 阶段执行结果，区分业务错误与超时兜底
-#[derive(Debug)]
-enum PhaseOutcome<T> {
-    Completed(Result<T, AppError>),
-    TimedOut,
 }
 
 /// 终端会话命令枚举，用于协调层向终端工作线程发送指令
@@ -78,39 +69,47 @@ pub fn start_terminal_session<R: Runtime>(
     shutdown: Arc<AtomicBool>,
     runtime_status: Arc<Mutex<SessionStatus>>,
 ) {
+    start_terminal_session_with_credential_loader(
+        app,
+        host,
+        session_id,
+        command_rx,
+        shutdown,
+        runtime_status,
+        load_credentials,
+    );
+}
+
+/// 启动可注入凭据加载器的终端工作线程，生产环境使用系统安全存储，测试可模拟首次授权等待
+fn start_terminal_session_with_credential_loader<R, F>(
+    app: AppHandle<R>,
+    host: HostConfig,
+    session_id: String,
+    command_rx: Receiver<TerminalCommand>,
+    shutdown: Arc<AtomicBool>,
+    runtime_status: Arc<Mutex<SessionStatus>>,
+    credential_loader: F,
+) where
+    R: Runtime,
+    F: FnOnce(&HostConfig) -> Result<(Option<String>, Option<String>), AppError> + Send + 'static,
+{
     thread::spawn(move || {
-        // 从安全存储读取运行时凭据，并对钥匙串阻塞设置独立超时
+        // 系统安全存储首次访问可能等待用户授权；终端工作线程直接等待授权结果
+        // ponytail: Keychain API 无法取消；先等待系统结果，若出现真实永久挂起再引入可取消凭据代理。
         emit_connection_progress(&app, &session_id, ConnectionPhase::LoadingCredentials);
         info!(
-            "[session:{}][diagnostic] Starting credential load with {}s timeout",
-            session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
+            "[session:{}][diagnostic] Starting credential load",
+            session_id
         );
-        let host_for_credentials = host.clone();
-        let session_id_for_credentials = session_id.clone();
-        let credentials = match run_phase_with_timeout(
-            Duration::from_secs(CREDENTIAL_LOAD_TIMEOUT_SECS),
-            move || {
-                debug!(
-                    "[session:{}][diagnostic] Credential thread started",
-                    session_id_for_credentials
-                );
-                let result = load_credentials(&host_for_credentials);
-                debug!(
-                    "[session:{}][diagnostic] Credential thread completed: {:?}",
-                    session_id_for_credentials,
-                    result.is_ok()
-                );
-                result
-            },
-        ) {
-            PhaseOutcome::Completed(Ok(creds)) => {
+        let credentials = match credential_loader(&host) {
+            Ok(creds) => {
                 info!(
                     "[session:{}][diagnostic] Credentials loaded successfully",
                     session_id
                 );
                 creds
             }
-            PhaseOutcome::Completed(Err(error)) => {
+            Err(error) => {
                 error!(
                     "[session:{}][diagnostic] Credential loading failed: error_code={}",
                     session_id,
@@ -119,21 +118,6 @@ pub fn start_terminal_session<R: Runtime>(
                 let (status, message) =
                     map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
                 emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
-                return;
-            }
-            PhaseOutcome::TimedOut => {
-                warn!(
-                    "[session:{}][diagnostic] Credentials timed out after {}s",
-                    session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
-                );
-                emit_session_status(
-                    &app,
-                    &session_id,
-                    &runtime_status,
-                    SessionStatus::Timeout,
-                    Some(phase_timeout_message(&ConnectionPhase::LoadingCredentials)),
-                );
-                debug!("[session:{}][diagnostic] Timeout event emitted", session_id);
                 return;
             }
         };
@@ -357,27 +341,6 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
             };
             Ok((None, passphrase))
         }
-    }
-}
-
-/// 在独立线程中执行可能阻塞的阶段，并使用超时结果将“卡死”显式化
-///
-/// 该函数用于保护钥匙串读取等无法由调用方中断的阻塞操作，
-/// 超时后直接返回 `TimedOut`，由上层决定派发何种阶段状态。
-fn run_phase_with_timeout<T, F>(timeout: Duration, operation: F) -> PhaseOutcome<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, AppError> + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = operation();
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => PhaseOutcome::Completed(result),
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => PhaseOutcome::TimedOut,
     }
 }
 
@@ -1017,61 +980,50 @@ mod integration_tests {
         );
     }
 
-    /// 验证 run_phase_with_timeout 在操作超时时正确返回 TimedOut
+    /// 首次系统授权超过五秒后，成功读取的凭据仍应继续进入 SSH 连接阶段
     #[test]
-    fn run_phase_with_timeout_returns_timed_out_for_slow_operation() {
-        use std::{sync::mpsc, thread, time::Duration};
-
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = run_phase_with_timeout(Duration::from_millis(100), move || {
-                started_tx.send(()).expect("操作线程应启动");
-                release_rx.recv().expect("测试应释放操作线程");
-                Ok::<_, AppError>("should not complete")
-            });
-            result_tx.send(result).expect("超时结果应返回");
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("操作线程应在测试超时前启动");
-        let result = result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("超时必须在阻塞操作完成前返回");
-
-        assert!(
-            matches!(result, PhaseOutcome::TimedOut),
-            "Expected TimedOut when operation exceeds timeout, got {:?}",
-            result
-        );
-        release_tx.send(()).expect("应释放操作线程");
-    }
-
-    /// 验证 run_phase_with_timeout 在操作成功时正确返回 Completed
-    #[test]
-    fn run_phase_with_timeout_returns_completed_for_fast_operation() {
+    fn slow_credential_authorization_does_not_timeout_session() {
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
+        use tauri::test::mock_app;
 
-        let start = Instant::now();
-        let result = run_phase_with_timeout(Duration::from_secs(5), || {
-            Ok::<_, AppError>("success result")
-        });
-        let elapsed = start.elapsed();
+        let app = mock_app();
+        let mut host = make_password_host(Some("credential-ref"));
+        host.port = 0;
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
 
-        // Should return Completed with the result
-        assert!(
-            matches!(result, PhaseOutcome::Completed(Ok("success result"))),
-            "Expected Completed with success result, got {:?}",
-            result
+        start_terminal_session_with_credential_loader(
+            app.handle().clone(),
+            host,
+            "session-slow-authorization".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| {
+                thread::sleep(Duration::from_millis(5_100));
+                Ok((Some("password".to_string()), None))
+            },
         );
 
-        // Should return quickly (not wait for full timeout)
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "Fast operation should return immediately. Elapsed: {:?}",
-            elapsed
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while matches!(
+            *runtime_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            SessionStatus::Connecting
+        ) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            *runtime_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            SessionStatus::Error,
+            "用户完成系统授权后，应继续进入 SSH 连接阶段并返回网络错误"
         );
     }
 }
