@@ -60,6 +60,7 @@ export function makeSnapshot(overrides: Partial<MonitorSnapshot> = {}): MonitorS
     diskUsage: 40.0,
     diskAvailableBytes: 300 * 1024 * 1024 * 1024,
     diskTotalBytes: 500 * 1024 * 1024 * 1024,
+    network: { available: true, interfaces: [] },
     ...overrides,
   };
 }

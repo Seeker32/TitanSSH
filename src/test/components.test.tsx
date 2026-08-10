@@ -185,7 +185,7 @@ describe('React components', () => {
       available: true,
       interfaces: [{ name: 'eth0', receiveBytesPerSecond: 1536, transmitBytesPerSecond: 0 }],
     } })} collapsed={false} onToggle={vi.fn()} />);
-    expect(screen.getByText('eth0')).toBeInTheDocument();
+    expect(screen.getByText('下行 · eth0')).toBeInTheDocument();
     expect(screen.getByText('1.5 KB/s')).toBeInTheDocument();
     expect(screen.getByText('0 B/s')).toBeInTheDocument();
 

@@ -2,7 +2,7 @@ use crate::core::ssh_transport;
 use crate::core::ssh_transport::ExecTransport;
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
-use crate::models::monitor::MonitorSnapshot;
+use crate::models::monitor::{MonitorSnapshot, NetworkInterface, NetworkSnapshot};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -12,12 +12,51 @@ use std::time::Duration;
 const STATUS_SCRIPT: &str = r#"MEMINFO_LINE=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {available=$2} END {printf "MEM_TOTAL_KB=%s\nMEM_AVAILABLE_KB=%s\n", total, available}' /proc/meminfo 2>/dev/null)
 CPU_LINE=$(awk '/^cpu / {printf "CPU_TOTAL=%s\nCPU_IDLE=%s\n", ($2+$3+$4+$5+$6+$7+$8+$9+$10), ($5+$6)}' /proc/stat 2>/dev/null)
 DISK_LINE=$(df -B1 / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); printf "DISK=%s\nDISK_AVAIL=%s\nDISK_TOTAL=%s\n", $5, $4, $2}')
+NETWORK_STATUS=unavailable
+if [ -r /proc/net/dev ]; then
+  NETWORK_LINE=$(awk 'NR > 2 && $1 != "lo:" {printf "NET=%s,%s,%s\n", substr($1, 1, length($1) - 1), $2, $10}' /proc/net/dev 2>/dev/null) && NETWORK_STATUS=available
+fi
 echo "$CPU_LINE"
 echo "$MEMINFO_LINE"
-echo "$DISK_LINE""#;
+echo "$DISK_LINE"
+echo "NETWORK_STATUS=$NETWORK_STATUS"
+[ "$NETWORK_STATUS" = available ] && echo "$NETWORK_LINE""#;
 
 /// CPU 原始计数快照，来自 /proc/stat 第一行累计值
 type CpuSample = (u64, u64);
+
+/// 单次采集的网卡累计计数，用于下次计算传输速率。
+#[derive(Debug, Clone, PartialEq)]
+struct NetworkSample {
+    timestamp: i64,
+    interfaces: Vec<NetworkCounter>,
+}
+
+/// 单张网卡的原始接收与发送累计字节数。
+#[derive(Debug, Clone, PartialEq)]
+struct NetworkCounter {
+    name: String,
+    receive_bytes: u64,
+    transmit_bytes: u64,
+}
+
+#[cfg(test)]
+impl NetworkSample {
+    /// 构造测试和解析共用的网卡累计计数样本。
+    fn new(timestamp: i64, interfaces: Vec<(&str, u64, u64)>) -> Self {
+        Self {
+            timestamp,
+            interfaces: interfaces
+                .into_iter()
+                .map(|(name, receive_bytes, transmit_bytes)| NetworkCounter {
+                    name: name.to_string(),
+                    receive_bytes,
+                    transmit_bytes,
+                })
+                .collect(),
+        }
+    }
+}
 
 /// 监控采集主循环（可注入 connect_fn，便于单元测试）
 ///
@@ -48,6 +87,8 @@ pub fn run_monitor_loop_with<ConnFn>(
 {
     // 保存上一轮 CPU 原始计数，用于根据 /proc/stat 增量计算使用率
     let mut previous_cpu_sample = None;
+    // 保存上一轮网卡累计计数，用于根据真实采样间隔计算速率。
+    let mut previous_network_sample = None;
 
     // shutdown 预先为 true 时直接退出，不建立连接
     if shutdown.load(Ordering::Relaxed) {
@@ -65,9 +106,15 @@ pub fn run_monitor_loop_with<ConnFn>(
 
     // 采集循环：每 2 秒开新 channel 执行脚本
     while !shutdown.load(Ordering::Relaxed) {
-        match collect_once(&mut transport, &session_id, previous_cpu_sample) {
-            Ok((snapshot, current_cpu_sample)) => {
+        match collect_once(
+            &mut transport,
+            &session_id,
+            previous_cpu_sample,
+            previous_network_sample,
+        ) {
+            Ok((snapshot, current_cpu_sample, current_network_sample)) => {
                 previous_cpu_sample = current_cpu_sample;
+                previous_network_sample = current_network_sample;
                 on_snapshot(snapshot);
             }
             Err(err) => {
@@ -118,26 +165,30 @@ fn collect_once(
     transport: &mut ExecTransport,
     session_id: &str,
     previous_cpu_sample: Option<CpuSample>,
-) -> Result<(MonitorSnapshot, Option<CpuSample>), AppError> {
+    previous_network_sample: Option<NetworkSample>,
+) -> Result<(MonitorSnapshot, Option<CpuSample>, Option<NetworkSample>), AppError> {
     let output = transport.execute(&format!("sh -c '{}'", STATUS_SCRIPT.replace('\'', "'\\''")))?;
 
-    parse_snapshot(session_id, &output, previous_cpu_sample)
+    parse_snapshot_at(
+        session_id,
+        &output,
+        previous_cpu_sample,
+        previous_network_sample,
+        chrono::Utc::now().timestamp_millis(),
+    )
 }
 
-/// 解析脚本输出，构建 MonitorSnapshot
+/// 解析单次采集输出并按给定采样时刻计算网卡速率。
 ///
-/// 解析 KEY=VALUE 格式的脚本输出，提取 /proc/stat、/proc/meminfo 与 df 原始字段。
-/// 字段缺失或解析失败时默认回退为 0.0，不返回错误。
-///
-/// # 参数
-/// - `session_id`: 关联的会话 ID
-/// - `output`: 脚本标准输出文本
-/// - `previous_cpu_sample`: 上一轮 CPU 原始计数，用于计算增量使用率
-pub fn parse_snapshot(
+/// 网络字段缺失或格式错误时只将网络标记为不可用，不影响其他指标。
+/// `previous_network_sample` 仅由监控 worker 传入，用于保留首次采样的未知速率。
+fn parse_snapshot_at(
     session_id: &str,
     output: &str,
     previous_cpu_sample: Option<CpuSample>,
-) -> Result<(MonitorSnapshot, Option<CpuSample>), AppError> {
+    previous_network_sample: Option<NetworkSample>,
+    timestamp: i64,
+) -> Result<(MonitorSnapshot, Option<CpuSample>, Option<NetworkSample>), AppError> {
     let mut memory_total_kb = 0.0_f64;
     let mut memory_available_kb = 0.0_f64;
     let mut disk_usage = 0.0_f64;
@@ -145,6 +196,9 @@ pub fn parse_snapshot(
     let mut disk_total_bytes = 0_u64;
     let mut cpu_total = None;
     let mut cpu_idle = None;
+    let mut network_available = false;
+    let mut network_parse_failed = false;
+    let mut network_interfaces = vec![];
 
     for line in output.lines() {
         if let Some(v) = line.strip_prefix("CPU_TOTAL=") {
@@ -161,25 +215,124 @@ pub fn parse_snapshot(
             disk_available_bytes = v.trim().parse().unwrap_or_default();
         } else if let Some(v) = line.strip_prefix("DISK_TOTAL=") {
             disk_total_bytes = v.trim().parse().unwrap_or_default();
+        } else if line == "NETWORK_STATUS=available" {
+            network_available = true;
+        } else if let Some(v) = line.strip_prefix("NET=") {
+            if v.split(',').next().is_some_and(|name| name.trim() == "lo") {
+                continue;
+            }
+            match parse_network_counter(v) {
+                Some(counter) => network_interfaces.push(counter),
+                None => network_parse_failed = true,
+            }
         }
     }
 
     let current_cpu_sample = cpu_total.zip(cpu_idle);
     let cpu_usage = compute_cpu_usage(previous_cpu_sample, current_cpu_sample);
     let memory_usage = resolve_memory_usage(memory_total_kb, memory_available_kb);
+    let current_network_sample = network_available.then(|| NetworkSample {
+        timestamp,
+        interfaces: network_interfaces,
+    });
+    let (network, current_network_sample) = match current_network_sample {
+        Some(sample) if !network_parse_failed => (
+            NetworkSnapshot {
+                available: true,
+                interfaces: compute_network_rates(previous_network_sample.as_ref(), &sample),
+            },
+            Some(sample),
+        ),
+        _ => (
+            NetworkSnapshot {
+                available: false,
+                interfaces: vec![],
+            },
+            None,
+        ),
+    };
 
     Ok((
         MonitorSnapshot {
             session_id: session_id.to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
+            timestamp,
             cpu_usage,
             memory_usage,
             disk_usage,
             disk_available_bytes,
             disk_total_bytes,
+            network,
         },
         current_cpu_sample,
+        current_network_sample,
     ))
+}
+
+/// 解析一行 NET=name,receive,transmit 格式的网卡原始累计计数。
+fn parse_network_counter(value: &str) -> Option<NetworkCounter> {
+    let mut fields = value.split(',');
+    let name = fields.next()?.trim();
+    let receive_bytes = fields.next()?.trim().parse().ok()?;
+    let transmit_bytes = fields.next()?.trim().parse().ok()?;
+    (name != "lo" && !name.is_empty() && fields.next().is_none()).then(|| NetworkCounter {
+        name: name.to_string(),
+        receive_bytes,
+        transmit_bytes,
+    })
+}
+
+/// 根据当前与上次累计计数及毫秒间隔，生成可序列化的网卡字节每秒速率。
+fn compute_network_rates(
+    previous: Option<&NetworkSample>,
+    current: &NetworkSample,
+) -> Vec<NetworkInterface> {
+    current
+        .interfaces
+        .iter()
+        .map(|counter| {
+            let previous_counter = previous.and_then(|sample| {
+                sample
+                    .interfaces
+                    .iter()
+                    .find(|candidate| candidate.name == counter.name)
+                    .map(|candidate| (sample, candidate))
+            });
+            let receive_bytes_per_second = previous_counter.and_then(|(sample, candidate)| {
+                rate_between(
+                    candidate.receive_bytes,
+                    counter.receive_bytes,
+                    sample.timestamp,
+                    current.timestamp,
+                )
+            });
+            let transmit_bytes_per_second = previous_counter.and_then(|(sample, candidate)| {
+                rate_between(
+                    candidate.transmit_bytes,
+                    counter.transmit_bytes,
+                    sample.timestamp,
+                    current.timestamp,
+                )
+            });
+            NetworkInterface {
+                name: counter.name.clone(),
+                receive_bytes_per_second,
+                transmit_bytes_per_second,
+            }
+        })
+        .collect()
+}
+
+/// 使用真实毫秒间隔计算非负整数速率；回退计数和无效间隔返回未知。
+fn rate_between(
+    previous: u64,
+    current: u64,
+    previous_timestamp: i64,
+    current_timestamp: i64,
+) -> Option<u64> {
+    let elapsed_millis = current_timestamp.checked_sub(previous_timestamp)?;
+    let delta = current.checked_sub(previous)?;
+    (elapsed_millis > 0)
+        .then(|| ((delta as u128 * 1_000) / elapsed_millis as u128).min(u64::MAX as u128) as u64)
 }
 
 /// 根据 /proc/stat 连续两次原始计数，计算 CPU 使用率百分比。
@@ -219,27 +372,29 @@ fn resolve_memory_usage(total_kb: f64, available_kb: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_cpu_usage, parse_snapshot, parse_snapshot_at, NetworkSample};
+    use super::{NetworkSample, compute_cpu_usage, parse_snapshot_at};
 
     /// 验证 parse_snapshot 能正确解析原始脚本输出，并由 Rust 计算内存与磁盘指标
     #[test]
     fn parse_snapshot_extracts_metrics() {
         let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=577\nDISK=65\nDISK_AVAIL=137438953472\nDISK_TOTAL=549755813888";
-        let (snap, cpu_sample) = parse_snapshot("session-1", raw, None).expect("应能正常解析");
+        let (snap, cpu_sample, _) =
+            parse_snapshot_at("session-1", raw, None, None, 2_000).expect("应能正常解析");
         assert_eq!(snap.session_id, "session-1");
         assert_eq!(snap.cpu_usage, 0.0);
         assert!((snap.memory_usage - 42.3).abs() < 0.01);
         assert!((snap.disk_usage - 65.0).abs() < f64::EPSILON);
         assert_eq!(snap.disk_available_bytes, 137_438_953_472);
         assert_eq!(snap.disk_total_bytes, 549_755_813_888);
-        assert!(snap.timestamp > 1_000_000_000_000);
+        assert_eq!(snap.timestamp, 2_000);
         assert_eq!(cpu_sample, None);
     }
 
     /// 验证 parse_snapshot 在脚本输出为空时不报错，各指标默认为 0.0
     #[test]
     fn parse_snapshot_defaults_on_missing_fields() {
-        let (snap, cpu_sample) = parse_snapshot("session-2", "", None).expect("空输出不应返回错误");
+        let (snap, cpu_sample, _) =
+            parse_snapshot_at("session-2", "", None, None, 2_000).expect("空输出不应返回错误");
         assert_eq!(snap.cpu_usage, 0.0);
         assert_eq!(snap.memory_usage, 0.0);
         assert_eq!(snap.disk_usage, 0.0);
@@ -252,8 +407,8 @@ mod tests {
     #[test]
     fn parse_snapshot_computes_memory_usage_from_meminfo_fields() {
         let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=250\nDISK=65";
-        let (snap, _) =
-            parse_snapshot("session-3", raw, None).expect("应能从 meminfo 字段推导内存占用");
+        let (snap, _, _) = parse_snapshot_at("session-3", raw, None, None, 2_000)
+            .expect("应能从 meminfo 字段推导内存占用");
         assert!((snap.memory_usage - 75.0).abs() < 0.01);
     }
 
@@ -261,8 +416,9 @@ mod tests {
     #[test]
     fn parse_snapshot_computes_cpu_usage_from_proc_stat_fields() {
         let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500";
-        let (snap, cpu_sample) = parse_snapshot("session-4", raw, Some((100, 20)))
-            .expect("应能根据 /proc/stat 计数推导 CPU 占用");
+        let (snap, cpu_sample, _) =
+            parse_snapshot_at("session-4", raw, Some((100, 20)), None, 2_000)
+                .expect("应能根据 /proc/stat 计数推导 CPU 占用");
         assert!((snap.cpu_usage - 83.3).abs() < 0.01);
         assert_eq!(cpu_sample, Some((160, 30)));
     }
@@ -286,18 +442,32 @@ mod tests {
     #[test]
     fn parse_snapshot_preserves_network_interfaces_and_computes_rates() {
         let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nNETWORK_STATUS=available\nNET=eth1,2000,4000\nNET=eth0,500,1000";
-        let previous_network = NetworkSample::new(1_000, vec![("eth1", 500, 1_000), ("eth0", 100, 200)]);
+        let previous_network =
+            NetworkSample::new(1_000, vec![("eth1", 500, 1_000), ("eth0", 100, 200)]);
 
-        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
-            .expect("网络数据有效时应能解析快照");
+        let (snapshot, _, _) =
+            parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+                .expect("网络数据有效时应能解析快照");
 
         assert!(snapshot.network.available);
         assert_eq!(snapshot.network.interfaces[0].name, "eth1");
-        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, Some(1_500));
-        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, Some(3_000));
+        assert_eq!(
+            snapshot.network.interfaces[0].receive_bytes_per_second,
+            Some(1_500)
+        );
+        assert_eq!(
+            snapshot.network.interfaces[0].transmit_bytes_per_second,
+            Some(3_000)
+        );
         assert_eq!(snapshot.network.interfaces[1].name, "eth0");
-        assert_eq!(snapshot.network.interfaces[1].receive_bytes_per_second, Some(400));
-        assert_eq!(snapshot.network.interfaces[1].transmit_bytes_per_second, Some(800));
+        assert_eq!(
+            snapshot.network.interfaces[1].receive_bytes_per_second,
+            Some(400)
+        );
+        assert_eq!(
+            snapshot.network.interfaces[1].transmit_bytes_per_second,
+            Some(800)
+        );
     }
 
     /// 验证首次、新接口、计数器回退及无效间隔都保留未知速率，零流量仍为零。
@@ -306,34 +476,62 @@ mod tests {
         let raw = "NETWORK_STATUS=available\nNET=eth0,100,200\nNET=eth1,300,400";
         let previous_network = NetworkSample::new(2_000, vec![("eth0", 100, 200), ("eth2", 1, 1)]);
 
-        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
-            .expect("零间隔不应使整个监控快照失败");
+        let (snapshot, _, _) =
+            parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+                .expect("零间隔不应使整个监控快照失败");
 
-        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, None);
-        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, None);
-        assert_eq!(snapshot.network.interfaces[1].receive_bytes_per_second, None);
-        assert_eq!(snapshot.network.interfaces[1].transmit_bytes_per_second, None);
+        assert_eq!(
+            snapshot.network.interfaces[0].receive_bytes_per_second,
+            None
+        );
+        assert_eq!(
+            snapshot.network.interfaces[0].transmit_bytes_per_second,
+            None
+        );
+        assert_eq!(
+            snapshot.network.interfaces[1].receive_bytes_per_second,
+            None
+        );
+        assert_eq!(
+            snapshot.network.interfaces[1].transmit_bytes_per_second,
+            None
+        );
 
         let raw = "NETWORK_STATUS=available\nNET=eth0,100,200";
         let previous_network = NetworkSample::new(1_000, vec![("eth0", 200, 300)]);
-        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
-            .expect("计数器回退不应使整个监控快照失败");
-        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, None);
-        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, None);
+        let (snapshot, _, _) =
+            parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+                .expect("计数器回退不应使整个监控快照失败");
+        assert_eq!(
+            snapshot.network.interfaces[0].receive_bytes_per_second,
+            None
+        );
+        assert_eq!(
+            snapshot.network.interfaces[0].transmit_bytes_per_second,
+            None
+        );
 
         let previous_network = NetworkSample::new(1_000, vec![("eth0", 100, 200)]);
-        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
-            .expect("零流量不应使整个监控快照失败");
-        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, Some(0));
-        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, Some(0));
+        let (snapshot, _, _) =
+            parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+                .expect("零流量不应使整个监控快照失败");
+        assert_eq!(
+            snapshot.network.interfaces[0].receive_bytes_per_second,
+            Some(0)
+        );
+        assert_eq!(
+            snapshot.network.interfaces[0].transmit_bytes_per_second,
+            Some(0)
+        );
     }
 
     /// 验证网络源缺失不会阻断 CPU、内存和磁盘快照。
     #[test]
     fn parse_snapshot_keeps_other_metrics_when_network_is_unavailable() {
         let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nDISK_AVAIL=100\nDISK_TOTAL=200";
-        let (snapshot, _, network_sample) = parse_snapshot_at("session-1", raw, Some((100, 20)), None, 2_000)
-            .expect("网络源缺失时仍应产出快照");
+        let (snapshot, _, network_sample) =
+            parse_snapshot_at("session-1", raw, Some((100, 20)), None, 2_000)
+                .expect("网络源缺失时仍应产出快照");
 
         assert!(!snapshot.network.available);
         assert!(snapshot.network.interfaces.is_empty());
@@ -341,6 +539,17 @@ mod tests {
         assert!((snapshot.cpu_usage - 83.3).abs() < 0.01);
         assert!((snapshot.memory_usage - 50.0).abs() < 0.01);
         assert_eq!(snapshot.disk_usage, 65.0);
+    }
+
+    /// 验证网络采集成功但只有 lo 时仍返回可用的空候选列表。
+    #[test]
+    fn parse_snapshot_distinguishes_no_network_interfaces_from_unavailable() {
+        let raw = "NETWORK_STATUS=available\nNET=lo,100,200";
+        let (snapshot, _, _) =
+            parse_snapshot_at("session-1", raw, None, None, 2_000).expect("仅有 lo 时仍应产出快照");
+
+        assert!(snapshot.network.available);
+        assert!(snapshot.network.interfaces.is_empty());
     }
 }
 

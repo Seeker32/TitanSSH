@@ -6,7 +6,9 @@ pub mod sftp;
 #[cfg(test)]
 mod tests {
     use super::host::{AuthType, HostConfig};
-    use super::monitor::{MonitorSnapshot, TaskInfo, TaskStatus};
+    use super::monitor::{
+        MonitorSnapshot, NetworkInterface, NetworkSnapshot, TaskInfo, TaskStatus,
+    };
     use super::session::{SessionInfo, SessionStatus, TerminalDataEvent};
     use super::sftp::{SftpProgressEvent, SftpTaskStatus, TransferTask, TransferType};
     use serde_json::json;
@@ -33,6 +35,14 @@ mod tests {
                 disk_usage: 3.0,
                 disk_available_bytes: 4,
                 disk_total_bytes: 5,
+                network: NetworkSnapshot {
+                    available: true,
+                    interfaces: vec![NetworkInterface {
+                        name: "eth0".into(),
+                        receive_bytes_per_second: Some(4),
+                        transmit_bytes_per_second: None,
+                    }],
+                },
             })
             .unwrap(),
             serde_json::to_value(TaskInfo {
@@ -80,6 +90,28 @@ mod tests {
                 "发现 snake_case 字段: {object:?}"
             );
         }
+
+        let monitor = serde_json::to_value(MonitorSnapshot {
+            session_id: "session-1".into(),
+            timestamp: 1,
+            cpu_usage: 1.0,
+            memory_usage: 2.0,
+            disk_usage: 3.0,
+            disk_available_bytes: 4,
+            disk_total_bytes: 5,
+            network: NetworkSnapshot {
+                available: true,
+                interfaces: vec![NetworkInterface {
+                    name: "eth0".into(),
+                    receive_bytes_per_second: Some(4),
+                    transmit_bytes_per_second: None,
+                }],
+            },
+        })
+        .unwrap();
+        let interface = &monitor["network"]["interfaces"][0];
+        assert_eq!(interface["receiveBytesPerSecond"], 4);
+        assert!(interface.get("receive_bytes_per_second").is_none());
     }
 
     /// 验证升级后仍可读取旧版本写入的 snake_case 主机配置。

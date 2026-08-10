@@ -570,6 +570,10 @@ mod service_tests {
                     disk_usage: 30.0,
                     disk_available_bytes: 40,
                     disk_total_bytes: 50,
+                    network: crate::models::monitor::NetworkSnapshot {
+                        available: true,
+                        interfaces: vec![],
+                    },
                 },
             );
         }

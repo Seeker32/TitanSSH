@@ -1,5 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+/// 单张网卡接口的当前速率，由相邻累计字节计数计算。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInterface {
+    /// 网卡接口名称。
+    pub name: String,
+    /// 接收速率（下行），未知时为 None。
+    pub receive_bytes_per_second: Option<u64>,
+    /// 发送速率（上行），未知时为 None。
+    pub transmit_bytes_per_second: Option<u64>,
+}
+
+/// 网络采集结果，available 可区分采集失败和成功但没有候选接口。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkSnapshot {
+    /// /proc/net/dev 是否成功读取并解析。
+    pub available: bool,
+    /// 按远端返回顺序排列、且不含 lo 的候选网卡。
+    pub interfaces: Vec<NetworkInterface>,
+}
+
 /// 服务器监控快照，由后端采集后推送给前端渲染
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +39,8 @@ pub struct MonitorSnapshot {
     pub disk_available_bytes: u64,
     /// 根分区总容量，单位字节
     pub disk_total_bytes: u64,
+    /// 网络采集状态与全部候选网卡接口速率。
+    pub network: NetworkSnapshot,
 }
 
 /// 长任务信息，所有持续任务必须可跟踪
@@ -113,6 +137,10 @@ mod tests {
                     disk_usage,
                     disk_available_bytes,
                     disk_total_bytes,
+                    network: NetworkSnapshot {
+                        available: true,
+                        interfaces: vec![],
+                    },
                 },
             )
     }

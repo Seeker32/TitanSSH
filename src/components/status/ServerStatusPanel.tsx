@@ -28,6 +28,19 @@ function formatBytes(bytes: number | undefined) {
   return `${value.toFixed(1)} ${units[index]}`;
 }
 
+/** 将每秒字节速率格式化为易读文本，未知值与零流量保持可区分。 */
+function formatRate(bytesPerSecond: number | null | undefined) {
+  if (typeof bytesPerSecond !== 'number' || bytesPerSecond < 0) return '--';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytesPerSecond;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}/s`;
+}
+
 /** 根据使用率返回绿、黄、红三级进度色。 */
 function progressColor(value: number) {
   if (value < 60) return '#10b981';
@@ -52,6 +65,7 @@ export default function ServerStatusPanel({ snapshot, collapsed, onToggle }: Pro
     ['Memory', snapshot?.memoryUsage],
     ['Disk', snapshot?.diskUsage],
   ] as const;
+  const defaultInterface = snapshot?.network.available ? snapshot.network.interfaces[0] : undefined;
   return (
     <Card size="small" variant="borderless" className="status-panel"
       title={<><Typography.Text type="secondary">服务器状态</Typography.Text><strong>{snapshot ? '已连接' : '未连接'}</strong></>}
@@ -67,6 +81,14 @@ export default function ServerStatusPanel({ snapshot, collapsed, onToggle }: Pro
             </Typography.Text>}
           </Col>
         ))}
+        {snapshot && (!snapshot.network.available ? (
+          <Col span={24}><Typography.Text type="secondary">网络数据不可用</Typography.Text></Col>
+        ) : !defaultInterface ? (
+          <Col span={24}><Typography.Text type="secondary">无可用网卡</Typography.Text></Col>
+        ) : <>
+          <Col span={12}><Statistic title={`下行 · ${defaultInterface.name}`} value={formatRate(defaultInterface.receiveBytesPerSecond)} /></Col>
+          <Col span={12}><Statistic title={`上行 · ${defaultInterface.name}`} value={formatRate(defaultInterface.transmitBytesPerSecond)} /></Col>
+        </>)}
         <Col span={24}><Typography.Text type="secondary" className="updated">
           Updated: {snapshot ? new Date(snapshot.timestamp).toLocaleTimeString() : '--'}
         </Typography.Text></Col>
