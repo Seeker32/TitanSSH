@@ -125,11 +125,9 @@ export default function HomePage() {
   }
 
   /** 启动侧栏宽度拖动。 */
-  function startSidebarResize(event: React.PointerEvent) {
-    if (event.clientX < event.currentTarget.getBoundingClientRect().right - 8) return;
+  function startSidebarResize() {
     resizingRef.current = true;
     document.body.classList.add('sidebar-resizing');
-    useLayoutStore.getState().setSidebarWidth(event.clientX);
   }
 
   /** 选择本地保存路径并逐个下载远程文件。 */
@@ -156,7 +154,8 @@ export default function HomePage() {
   }
 
   return <div className="page-shell">
-    <aside className="sidebar" style={{ width: sidebarWidth }} onPointerDown={startSidebarResize}>
+    <aside className="sidebar" style={{ width: sidebarWidth }}>
+      <div data-testid="sidebar-resizer" className="sidebar-resizer" role="separator" aria-orientation="vertical" onPointerDown={startSidebarResize} />
       <div className="sidebar-header">
         <Typography.Text type="secondary" className="brand">Titan SSH</Typography.Text>
       </div>

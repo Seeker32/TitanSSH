@@ -153,15 +153,16 @@ describe('HomePage integration', () => {
     expect(document.documentElement.dataset.theme).toBe(applicationTheme);
   });
 
-  it('拖动侧栏右边缘时更新并限制宽度，且不显示独立拖拽线', async () => {
+  it('侧栏拖拽区同时承载尺寸调整光标与拖动事件', async () => {
     const { container } = render(<HomePage />);
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));
-    expect(container.querySelector('.sidebar-resizer')).not.toBeInTheDocument();
+    const resizer = screen.getByTestId('sidebar-resizer');
+    expect(resizer).toHaveClass('sidebar-resizer');
+    expect(resizer).toHaveAttribute('aria-orientation', 'vertical');
     const sidebar = container.querySelector('.sidebar')!;
-    vi.spyOn(sidebar, 'getBoundingClientRect').mockReturnValue({ right: 300 } as DOMRect);
     const start = new Event('pointerdown', { bubbles: true });
     Object.defineProperty(start, 'clientX', { value: 300 });
-    fireEvent(sidebar, start);
+    fireEvent(resizer, start);
     const move = new Event('pointermove');
     Object.defineProperty(move, 'clientX', { value: 1 });
     fireEvent(window, move);
