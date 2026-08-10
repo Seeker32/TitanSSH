@@ -180,6 +180,22 @@ describe('React components', () => {
     expect(screen.getByText(/剩余 300.0 GB \/ 总量 500.0 GB/)).toBeInTheDocument();
   });
 
+  it('服务器状态显示默认网卡速率，并区分无网卡和网络不可用', () => {
+    const { rerender } = render(<ServerStatusPanel snapshot={makeSnapshot({ network: {
+      available: true,
+      interfaces: [{ name: 'eth0', receiveBytesPerSecond: 1536, transmitBytesPerSecond: 0 }],
+    } })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText('eth0')).toBeInTheDocument();
+    expect(screen.getByText('1.5 KB/s')).toBeInTheDocument();
+    expect(screen.getByText('0 B/s')).toBeInTheDocument();
+
+    rerender(<ServerStatusPanel snapshot={makeSnapshot({ network: { available: true, interfaces: [] } })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText('无可用网卡')).toBeInTheDocument();
+
+    rerender(<ServerStatusPanel snapshot={makeSnapshot({ network: { available: false, interfaces: [] } })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText('网络数据不可用')).toBeInTheDocument();
+  });
+
   it('监视条折叠态显示状态点，点击请求展开', async () => {
     const user = userEvent.setup();
     const onToggle = vi.fn();

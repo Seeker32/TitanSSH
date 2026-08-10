@@ -219,7 +219,7 @@ fn resolve_memory_usage(total_kb: f64, available_kb: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_cpu_usage, parse_snapshot};
+    use super::{compute_cpu_usage, parse_snapshot, parse_snapshot_at, NetworkSample};
 
     /// 验证 parse_snapshot 能正确解析原始脚本输出，并由 Rust 计算内存与磁盘指标
     #[test]
@@ -280,6 +280,67 @@ mod tests {
         assert_eq!(compute_cpu_usage(None, Some((160, 30))), 0.0);
         assert_eq!(compute_cpu_usage(Some((200, 50)), Some((200, 60))), 0.0);
         assert_eq!(compute_cpu_usage(Some((200, 50)), None), 0.0);
+    }
+
+    /// 验证网络接口保留远端顺序、跳过 lo，并按真实采样间隔计算双向速率。
+    #[test]
+    fn parse_snapshot_preserves_network_interfaces_and_computes_rates() {
+        let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nNETWORK_STATUS=available\nNET=eth1,2000,4000\nNET=eth0,500,1000";
+        let previous_network = NetworkSample::new(1_000, vec![("eth1", 500, 1_000), ("eth0", 100, 200)]);
+
+        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+            .expect("网络数据有效时应能解析快照");
+
+        assert!(snapshot.network.available);
+        assert_eq!(snapshot.network.interfaces[0].name, "eth1");
+        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, Some(1_500));
+        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, Some(3_000));
+        assert_eq!(snapshot.network.interfaces[1].name, "eth0");
+        assert_eq!(snapshot.network.interfaces[1].receive_bytes_per_second, Some(400));
+        assert_eq!(snapshot.network.interfaces[1].transmit_bytes_per_second, Some(800));
+    }
+
+    /// 验证首次、新接口、计数器回退及无效间隔都保留未知速率，零流量仍为零。
+    #[test]
+    fn network_rate_edge_cases_remain_distinct_from_zero_traffic() {
+        let raw = "NETWORK_STATUS=available\nNET=eth0,100,200\nNET=eth1,300,400";
+        let previous_network = NetworkSample::new(2_000, vec![("eth0", 100, 200), ("eth2", 1, 1)]);
+
+        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+            .expect("零间隔不应使整个监控快照失败");
+
+        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, None);
+        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, None);
+        assert_eq!(snapshot.network.interfaces[1].receive_bytes_per_second, None);
+        assert_eq!(snapshot.network.interfaces[1].transmit_bytes_per_second, None);
+
+        let raw = "NETWORK_STATUS=available\nNET=eth0,100,200";
+        let previous_network = NetworkSample::new(1_000, vec![("eth0", 200, 300)]);
+        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+            .expect("计数器回退不应使整个监控快照失败");
+        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, None);
+        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, None);
+
+        let previous_network = NetworkSample::new(1_000, vec![("eth0", 100, 200)]);
+        let (snapshot, _, _) = parse_snapshot_at("session-1", raw, None, Some(previous_network), 2_000)
+            .expect("零流量不应使整个监控快照失败");
+        assert_eq!(snapshot.network.interfaces[0].receive_bytes_per_second, Some(0));
+        assert_eq!(snapshot.network.interfaces[0].transmit_bytes_per_second, Some(0));
+    }
+
+    /// 验证网络源缺失不会阻断 CPU、内存和磁盘快照。
+    #[test]
+    fn parse_snapshot_keeps_other_metrics_when_network_is_unavailable() {
+        let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nDISK_AVAIL=100\nDISK_TOTAL=200";
+        let (snapshot, _, network_sample) = parse_snapshot_at("session-1", raw, Some((100, 20)), None, 2_000)
+            .expect("网络源缺失时仍应产出快照");
+
+        assert!(!snapshot.network.available);
+        assert!(snapshot.network.interfaces.is_empty());
+        assert_eq!(network_sample, None);
+        assert!((snapshot.cpu_usage - 83.3).abs() < 0.01);
+        assert!((snapshot.memory_usage - 50.0).abs() < 0.01);
+        assert_eq!(snapshot.disk_usage, 65.0);
     }
 }
 

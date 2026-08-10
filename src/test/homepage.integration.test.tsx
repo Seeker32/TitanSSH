@@ -53,10 +53,14 @@ describe('HomePage integration', () => {
     await user.dblClick(await screen.findByTestId('host-card-host-1'));
     await act(async () => {
       emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, message: null });
-      emitMockEvent('monitor:snapshot', makeSnapshot());
+      emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
+        available: true,
+        interfaces: [{ name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 }],
+      } }));
     });
     expect(screen.getByText('已连接')).toBeInTheDocument();
     expect(screen.getByText('21.5%')).toBeInTheDocument();
+    expect(screen.getByText('1.0 KB/s')).toBeInTheDocument();
   });
 
   it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {

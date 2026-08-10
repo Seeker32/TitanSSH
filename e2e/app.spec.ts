@@ -202,8 +202,10 @@ test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) 
   await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('monitor:snapshot', {
     sessionId: 'session-1', timestamp: Date.now(), cpuUsage: 21.5, memoryUsage: 25, diskUsage: 40,
     diskAvailableBytes: 322122547200, diskTotalBytes: 536870912000,
+    network: { available: true, interfaces: [{ name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 }] },
   }));
   await expect(page.getByText('21.5%')).toBeVisible();
+  await expect(page.getByText('1.0 KB/s')).toBeVisible();
   await page.getByText('syslog').click();
   await page.getByRole('button', { name: '下载' }).click();
   await page.getByTestId('tab-queue').click();
