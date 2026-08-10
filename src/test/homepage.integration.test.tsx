@@ -64,9 +64,20 @@ describe('HomePage integration', () => {
     expect(screen.getByText('已连接')).toBeInTheDocument();
     expect(screen.getByText('21.5%')).toBeInTheDocument();
     expect(screen.getByText('1.0 KB/s')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '最近一分钟网卡速率趋势' })).toBeInTheDocument();
     expect(screen.getByLabelText('网卡接口')).toHaveValue('eth0');
     await user.selectOptions(screen.getByLabelText('网卡接口'), 'eth1');
     expect(screen.getByText('2.0 KB/s')).toBeInTheDocument();
+    await act(async () => emitMockEvent('monitor:snapshot', makeSnapshot({ timestamp: 1_710_000_121_000, network: {
+      available: true,
+      interfaces: [
+        { name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+        { name: 'eth1', receiveBytesPerSecond: 3072, transmitBytesPerSecond: 1536 },
+      ],
+    } })));
+    expect(useMonitorStore.getState().networkTrends.get('session-1')).toEqual([
+      { timestamp: 1_710_000_121_000, receiveBytesPerSecond: 3072, transmitBytesPerSecond: 1536 },
+    ]);
   });
 
   it('切换活动会话后保留各自的网卡选择', async () => {

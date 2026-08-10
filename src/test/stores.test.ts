@@ -308,6 +308,55 @@ describe('Zustand stores', () => {
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
   });
 
+  it('所选网卡趋势按真实 60 秒窗口淘汰，后台 Session 不互相混入', () => {
+    const snapshot = (timestamp: number, sessionId = 'session-1', receiveBytesPerSecond = 1) => makeSnapshot({
+      sessionId,
+      timestamp,
+      network: { available: true, interfaces: [
+        { name: 'eth0', receiveBytesPerSecond, transmitBytesPerSecond: receiveBytesPerSecond * 2 },
+        { name: 'eth1', receiveBytesPerSecond: receiveBytesPerSecond * 3, transmitBytesPerSecond: receiveBytesPerSecond * 4 },
+      ] },
+    });
+    useMonitorStore.getState().applySnapshot(snapshot(0));
+    useMonitorStore.getState().applySnapshot(snapshot(30_000, 'session-2', 8));
+    useMonitorStore.getState().applySnapshot(snapshot(30_000, 'session-1', 2));
+    useMonitorStore.getState().applySnapshot(snapshot(60_001, 'session-1', 3));
+
+    expect(useMonitorStore.getState().networkTrends.get('session-1')?.map((sample) => sample.timestamp)).toEqual([30_000, 60_001]);
+    expect(useMonitorStore.getState().networkTrends.get('session-2')?.map((sample) => sample.receiveBytesPerSecond)).toEqual([8]);
+    useMonitorStore.getState().selectNetworkInterface('session-1', 'eth1');
+    expect(useMonitorStore.getState().networkTrends.has('session-1')).toBe(false);
+    useMonitorStore.getState().applySnapshot(snapshot(61_000, 'session-1', 4));
+    expect(useMonitorStore.getState().networkTrends.get('session-1')).toEqual([
+      { timestamp: 61_000, receiveBytesPerSecond: 12, transmitBytesPerSecond: 16 },
+    ]);
+  });
+
+  it('网络不可用和未知速率写入趋势缺口，恢复后继续并在关闭时清理', () => {
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ timestamp: 1_000, network: {
+      available: true,
+      interfaces: [{ name: 'eth0', receiveBytesPerSecond: 1, transmitBytesPerSecond: 2 }],
+    } }));
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ timestamp: 2_000, network: { available: false, interfaces: [] } }));
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ timestamp: 3_000, network: {
+      available: true,
+      interfaces: [{ name: 'eth0', receiveBytesPerSecond: null, transmitBytesPerSecond: null }],
+    } }));
+    useMonitorStore.getState().applySnapshot(makeSnapshot({ timestamp: 4_000, network: {
+      available: true,
+      interfaces: [{ name: 'eth0', receiveBytesPerSecond: 4, transmitBytesPerSecond: 8 }],
+    } }));
+
+    expect(useMonitorStore.getState().networkTrends.get('session-1')).toEqual([
+      { timestamp: 1_000, receiveBytesPerSecond: 1, transmitBytesPerSecond: 2 },
+      { timestamp: 2_000, receiveBytesPerSecond: null, transmitBytesPerSecond: null },
+      { timestamp: 3_000, receiveBytesPerSecond: null, transmitBytesPerSecond: null },
+      { timestamp: 4_000, receiveBytesPerSecond: 4, transmitBytesPerSecond: 8 },
+    ]);
+    useMonitorStore.getState().clearSession('session-1');
+    expect(useMonitorStore.getState().networkTrends.has('session-1')).toBe(false);
+  });
+
   it('SFTP 目录成功与失败分别更新 entries 和 error', async () => {
     mockInvoke.mockResolvedValueOnce([makeRemoteEntry()]).mockRejectedValueOnce(new Error('denied'));
     await useSftpStore.getState().listDir('session-1', '/var/log');

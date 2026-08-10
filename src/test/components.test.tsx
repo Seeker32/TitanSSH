@@ -219,6 +219,23 @@ describe('React components', () => {
     expect(onInterfaceChange).toHaveBeenCalledWith('eth0');
   });
 
+  it('服务器状态使用可访问 SVG 展示双向一分钟趋势和图例', () => {
+    render(<ServerStatusPanel snapshot={makeSnapshot({ network: {
+      available: true,
+      interfaces: [{ name: 'eth0', receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 }],
+    } })} selectedInterfaceName="eth0" trendSamples={[
+      { timestamp: 1_000, receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+      { timestamp: 2_000, receiveBytesPerSecond: null, transmitBytesPerSecond: null },
+      { timestamp: 3_000, receiveBytesPerSecond: 2048, transmitBytesPerSecond: 1024 },
+    ]} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByRole('img', { name: '最近一分钟网卡速率趋势' })).toBeInTheDocument();
+    expect(screen.getByText('下行趋势')).toBeInTheDocument();
+    expect(screen.getByText('上行趋势')).toBeInTheDocument();
+    expect(screen.getByText('60 秒前')).toBeInTheDocument();
+    expect(screen.getByText('现在')).toBeInTheDocument();
+    expect(screen.getByText('2.0 KB/s')).toBeInTheDocument();
+  });
+
   it('监视条折叠态显示状态点，点击请求展开', async () => {
     const user = userEvent.setup();
     const onToggle = vi.fn();

@@ -212,6 +212,16 @@ test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) 
   await expect(page.getByLabel('网卡接口')).toHaveValue('eth0');
   await page.getByLabel('网卡接口').selectOption('eth1');
   await expect(page.getByText('2.0 KB/s')).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('monitor:snapshot', {
+    sessionId: 'session-1', timestamp: Date.now() + 1_000, cpuUsage: 21.5, memoryUsage: 25, diskUsage: 40,
+    diskAvailableBytes: 322122547200, diskTotalBytes: 536870912000,
+    network: { available: true, interfaces: [
+      { name: 'eth0', receiveBytesPerSecond: 1024, transmitBytesPerSecond: 512 },
+      { name: 'eth1', receiveBytesPerSecond: 3072, transmitBytesPerSecond: 1536 },
+    ] },
+  }));
+  await expect(page.getByRole('img', { name: '最近一分钟网卡速率趋势' })).toBeVisible();
+  await expect(page.getByText('3.0 KB/s')).toBeVisible();
   await page.getByText('syslog').click();
   await page.getByRole('button', { name: '下载' }).click();
   await page.getByTestId('tab-queue').click();
