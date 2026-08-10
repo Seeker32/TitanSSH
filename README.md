@@ -1,5 +1,7 @@
 # TitanSSH
 
+[简体中文](README.zh-CN.md)
+
 TitanSSH is a desktop app for working with Linux servers over SSH. Keep your server connections in one place, open terminal sessions in tabs, transfer files, and check the essentials without leaving the app.
 
 ## What you can do
