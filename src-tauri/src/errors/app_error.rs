@@ -1,5 +1,5 @@
-use thiserror::Error;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// 跨 Tauri 边界的稳定错误 payload；detail 保留底层诊断供前端本地化摘要后展示。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,25 +68,50 @@ pub enum AppError {
     SftpTransferError(String),
 }
 
+impl AppError {
+    /// 返回用于日志与 IPC 的稳定英文错误代码。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SshConnectionError(_) => "SshConnectionError",
+            Self::AuthenticationError(_) => "AuthenticationError",
+            Self::SessionNotFound(_) => "SessionNotFound",
+            Self::InvalidHostConfig(_) => "InvalidHostConfig",
+            Self::StorageError(_) => "StorageError",
+            Self::IoError(_) => "IoError",
+            Self::SshProtocolError(_) => "SshProtocolError",
+            Self::SecureStoreError(_) => "SecureStoreError",
+            Self::CredentialNotFound(_) => "CredentialNotFound",
+            Self::SftpChannelError(_) => "SftpChannelError",
+            Self::SftpPermissionDenied(_) => "SftpPermissionDenied",
+            Self::SftpPathNotFound(_) => "SftpPathNotFound",
+            Self::SftpTransferError(_) => "SftpTransferError",
+        }
+    }
+}
+
 /// 将内部错误转换为语言无关的 IPC 错误。
 impl From<AppError> for AppErrorInfo {
     fn from(error: AppError) -> Self {
-        let (code, detail) = match error {
-            AppError::SshConnectionError(detail) => ("SshConnectionError", detail),
-            AppError::AuthenticationError(detail) => ("AuthenticationError", detail),
-            AppError::SessionNotFound(detail) => ("SessionNotFound", detail),
-            AppError::InvalidHostConfig(detail) => ("InvalidHostConfig", detail),
-            AppError::StorageError(detail) => ("StorageError", detail),
-            AppError::IoError(detail) => ("IoError", detail.to_string()),
-            AppError::SshProtocolError(detail) => ("SshProtocolError", detail),
-            AppError::SecureStoreError(detail) => ("SecureStoreError", detail),
-            AppError::CredentialNotFound(detail) => ("CredentialNotFound", detail),
-            AppError::SftpChannelError(detail) => ("SftpChannelError", detail),
-            AppError::SftpPermissionDenied(detail) => ("SftpPermissionDenied", detail),
-            AppError::SftpPathNotFound(detail) => ("SftpPathNotFound", detail),
-            AppError::SftpTransferError(detail) => ("SftpTransferError", detail),
+        let code = error.code();
+        let detail = match error {
+            AppError::SshConnectionError(detail)
+            | AppError::AuthenticationError(detail)
+            | AppError::SessionNotFound(detail)
+            | AppError::InvalidHostConfig(detail)
+            | AppError::StorageError(detail)
+            | AppError::SshProtocolError(detail)
+            | AppError::SecureStoreError(detail)
+            | AppError::CredentialNotFound(detail)
+            | AppError::SftpChannelError(detail)
+            | AppError::SftpPermissionDenied(detail)
+            | AppError::SftpPathNotFound(detail)
+            | AppError::SftpTransferError(detail) => detail,
+            AppError::IoError(detail) => detail.to_string(),
         };
-        Self { code: code.to_string(), detail: Some(detail) }
+        Self {
+            code: code.to_string(),
+            detail: Some(detail),
+        }
     }
 }
 
@@ -102,11 +127,25 @@ mod tests {
         assert_eq!(error.to_string(), "SSH 协议错误: channel failed");
     }
 
+    /// 日志错误代码始终使用稳定英文标识。
+    #[test]
+    fn app_error_code_is_english_and_stable() {
+        assert_eq!(
+            AppError::CredentialNotFound("主机密码".to_string()).code(),
+            "CredentialNotFound"
+        );
+    }
+
     /// IPC 错误使用稳定代码与 camelCase detail，不携带已本地化 UI 文案。
     #[test]
     fn app_error_info_serializes_as_structured_payload() {
-        let value = serde_json::to_value(AppErrorInfo::from(AppError::AuthenticationError("denied".to_string())))
-            .expect("错误 payload 应序列化");
-        assert_eq!(value, serde_json::json!({ "code": "AuthenticationError", "detail": "denied" }));
+        let value = serde_json::to_value(AppErrorInfo::from(AppError::AuthenticationError(
+            "denied".to_string(),
+        )))
+        .expect("错误 payload 应序列化");
+        assert_eq!(
+            value,
+            serde_json::json!({ "code": "AuthenticationError", "detail": "denied" })
+        );
     }
 }

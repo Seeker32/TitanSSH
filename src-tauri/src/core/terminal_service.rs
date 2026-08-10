@@ -85,17 +85,18 @@ pub fn start_terminal_session<R: Runtime>(
             session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
         );
         let host_for_credentials = host.clone();
+        let session_id_for_credentials = session_id.clone();
         let credentials = match run_phase_with_timeout(
             Duration::from_secs(CREDENTIAL_LOAD_TIMEOUT_SECS),
             move || {
                 eprintln!(
                     "[session:{}][diagnostic] Credential thread started",
-                    host_for_credentials.id
+                    session_id_for_credentials
                 );
                 let result = load_credentials(&host_for_credentials);
                 eprintln!(
                     "[session:{}][diagnostic] Credential thread completed: {:?}",
-                    host_for_credentials.id,
+                    session_id_for_credentials,
                     result.is_ok()
                 );
                 result
@@ -110,8 +111,9 @@ pub fn start_terminal_session<R: Runtime>(
             }
             PhaseOutcome::Completed(Err(error)) => {
                 eprintln!(
-                    "[session:{}][diagnostic] Credentials error: {}",
-                    session_id, error
+                    "[session:{}][diagnostic] Credential loading failed: error_code={}",
+                    session_id,
+                    error.code()
                 );
                 let (status, message) =
                     map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
@@ -313,10 +315,11 @@ pub fn start_terminal_session<R: Runtime>(
 /// # 返回
 /// `(password, passphrase)` 元组，均为 Option<String>
 fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>), AppError> {
-    eprintln!("[diagnostic] load_credentials called for host: {}", host.id);
+    eprintln!("[diagnostic] Loading credentials");
     eprintln!(
-        "[diagnostic] auth_type: {:?}, password_ref: {:?}",
-        host.auth_type, host.password_ref
+        "[diagnostic] Authentication type: {:?}, password_credential_present={}",
+        host.auth_type,
+        host.password_ref.is_some()
     );
 
     match host.auth_type {
@@ -326,10 +329,13 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
                 .password_ref
                 .as_deref()
                 .ok_or_else(|| AppError::InvalidHostConfig("密码为必填项".to_string()))?;
-            eprintln!("[diagnostic] Loading password with ref: {}", password_ref);
+            eprintln!("[diagnostic] Loading password credential");
 
             let password = secure_store::get_credential(password_ref).map_err(|e| {
-                eprintln!("[diagnostic] Failed to load password: {}", e);
+                eprintln!(
+                    "[diagnostic] Failed to load password: error_code={}",
+                    e.code()
+                );
                 e
             })?;
 
@@ -343,10 +349,7 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
             }
             // 私钥口令为可选项，若有引用键则读取
             let passphrase = if let Some(ref passphrase_ref) = host.passphrase_ref {
-                eprintln!(
-                    "[diagnostic] Loading passphrase with ref: {}",
-                    passphrase_ref
-                );
+                eprintln!("[diagnostic] Loading passphrase credential");
                 Some(secure_store::get_credential(passphrase_ref)?)
             } else {
                 None
@@ -412,7 +415,7 @@ fn current_phase_value(state: &Arc<Mutex<ConnectionPhase>>) -> ConnectionPhase {
 
 /// 返回连接阶段的默认中文进度文案
 ///
-/// 该文案会同时用于前端状态栏和后端控制台，保证诊断口径一致。
+/// 该文案用于前端状态栏。
 fn phase_message(phase: &ConnectionPhase) -> &'static str {
     match phase {
         ConnectionPhase::LoadingCredentials => "正在读取凭据...",
@@ -486,15 +489,14 @@ fn is_timeout_message(message: &str) -> bool {
 
 /// 派发连接阶段进度事件，并在控制台打印结构化日志
 ///
-/// 控制台日志用于 `pnpm tauri dev` 诊断，前端事件用于状态栏显示当前卡点。
+/// 控制台日志使用英文阶段枚举，前端事件用于状态栏显示本地化当前卡点。
 fn emit_connection_progress<R: Runtime>(
     app: &AppHandle<R>,
     session_id: &str,
     phase: ConnectionPhase,
 ) {
-    let message = phase_message(&phase).to_string();
     let timestamp = chrono::Utc::now().timestamp_millis();
-    eprintln!("[session:{}][phase:{:?}] {}", session_id, phase, message);
+    eprintln!("[session:{}][phase:{:?}]", session_id, phase);
     let _ = app.emit(
         "session:progress",
         ConnectionProgressEvent {
@@ -520,8 +522,10 @@ fn emit_session_status<R: tauri::Runtime>(
     message: Option<String>,
 ) {
     eprintln!(
-        "[session:{}][diagnostic] emit_session_status: {:?}, message: {:?}",
-        session_id, status, message
+        "[session:{}][diagnostic] Emitting session status: {:?}, has_message={}",
+        session_id,
+        status,
+        message.is_some()
     );
     *runtime_status
         .lock()
@@ -531,13 +535,16 @@ fn emit_session_status<R: tauri::Runtime>(
         SessionStatusEvent {
             session_id: session_id.to_string(),
             status,
-            error: message.map(|detail| AppErrorInfo { code: "Unknown".to_string(), detail: Some(detail) }),
+            error: message.map(|detail| AppErrorInfo {
+                code: "Unknown".to_string(),
+                detail: Some(detail),
+            }),
         },
     );
-    if let Err(ref e) = result {
+    if result.is_err() {
         eprintln!(
-            "[session:{}][diagnostic] emit_session_status FAILED: {}",
-            session_id, e
+            "[session:{}][diagnostic] Session status event emission failed",
+            session_id
         );
     } else {
         eprintln!(
@@ -551,8 +558,8 @@ fn emit_session_status<R: tauri::Runtime>(
 mod tests {
     use crate::models::session::TerminalDataEvent;
     use proptest::prelude::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// 生成非空字母数字字符串的策略（1-64 个字符）
     fn arb_session_id() -> impl Strategy<Value = String> {
