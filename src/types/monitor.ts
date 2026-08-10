@@ -7,6 +7,16 @@ export interface NetworkInterface {
   transmitBytesPerSecond: number | null;
 }
 
+/** 所选网卡在一个监控快照时刻的双向速率样本。 */
+export interface NetworkTrendSample {
+  /** 监控快照的 Unix 毫秒时间戳。 */
+  timestamp: number;
+  /** 下行速率；null 用于展示真实的数据缺口。 */
+  receiveBytesPerSecond: number | null;
+  /** 上行速率；null 用于展示真实的数据缺口。 */
+  transmitBytesPerSecond: number | null;
+}
+
 /** 网络采集状态，可区分不可用与成功但没有候选接口。 */
 export interface NetworkSnapshot {
   available: boolean;

@@ -1,11 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
-import type { MonitorSnapshot, TaskInfo, TaskStatusEvent } from '@/types/monitor';
+import type { MonitorSnapshot, NetworkTrendSample, TaskInfo, TaskStatusEvent } from '@/types/monitor';
+
+/** 所选网卡趋势保留的真实时间窗口。 */
+const TREND_WINDOW_MILLIS = 60_000;
 
 interface MonitorState {
   snapshots: Map<string, MonitorSnapshot>;
   selectedInterfaces: Map<string, string>;
+  networkTrends: Map<string, NetworkTrendSample[]>;
   tasks: Map<string, TaskInfo>;
   sessionTaskMap: Map<string, string>;
   /** invoke 返回前到达的任务状态事件缓存，任务元数据到达后补投 */
@@ -24,6 +28,7 @@ interface MonitorState {
 export const useMonitorStore = create<MonitorState>((set, get) => ({
   snapshots: new Map(),
   selectedInterfaces: new Map(),
+  networkTrends: new Map(),
   tasks: new Map(),
   sessionTaskMap: new Map(),
   pendingTaskEvents: new Map(),
@@ -34,22 +39,43 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     return taskId ? get().tasks.get(taskId) ?? null : null;
   },
 
-  /** 写入指定会话快照，并按可用候选接口维护该会话的选择。 */
+  /** 写入指定会话快照，维护接口选择并采集最近一分钟趋势。 */
   applySnapshot(snapshot) {
     set((state) => {
       const selectedInterfaces = new Map(state.selectedInterfaces);
+      const networkTrends = new Map(state.networkTrends);
+      let selected = selectedInterfaces.get(snapshot.sessionId);
       if (snapshot.network.available) {
         const interfaces = snapshot.network.interfaces;
-        const selected = selectedInterfaces.get(snapshot.sessionId);
         if (interfaces.length === 0) {
           selectedInterfaces.delete(snapshot.sessionId);
-        } else if (!interfaces.some((item) => item.name === selected)) {
-          selectedInterfaces.set(snapshot.sessionId, interfaces[0].name);
+          networkTrends.delete(snapshot.sessionId);
+          selected = undefined;
+        } else {
+          const nextSelected = interfaces.some((item) => item.name === selected) ? selected! : interfaces[0].name;
+          if (nextSelected !== selected) {
+            selectedInterfaces.set(snapshot.sessionId, nextSelected);
+            networkTrends.delete(snapshot.sessionId);
+          }
+          selected = nextSelected;
         }
+      }
+      if (selected) {
+        const current = snapshot.network.available
+          ? snapshot.network.interfaces.find((item) => item.name === selected)
+          : undefined;
+        const sample: NetworkTrendSample = {
+          timestamp: snapshot.timestamp,
+          receiveBytesPerSecond: current?.receiveBytesPerSecond ?? null,
+          transmitBytesPerSecond: current?.transmitBytesPerSecond ?? null,
+        };
+        networkTrends.set(snapshot.sessionId, [...(networkTrends.get(snapshot.sessionId) ?? []), sample]
+          .filter((item) => item.timestamp >= snapshot.timestamp - TREND_WINDOW_MILLIS));
       }
       return {
         snapshots: new Map(state.snapshots).set(snapshot.sessionId, snapshot),
         selectedInterfaces,
+        networkTrends,
       };
     });
   },
@@ -58,7 +84,12 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   selectNetworkInterface(sessionId, interfaceName) {
     const snapshot = get().snapshots.get(sessionId);
     if (!snapshot?.network.available || !snapshot.network.interfaces.some((item) => item.name === interfaceName)) return;
-    set((state) => ({ selectedInterfaces: new Map(state.selectedInterfaces).set(sessionId, interfaceName) }));
+    if (get().selectedInterfaces.get(sessionId) === interfaceName) return;
+    set((state) => {
+      const networkTrends = new Map(state.networkTrends);
+      networkTrends.delete(sessionId);
+      return { selectedInterfaces: new Map(state.selectedInterfaces).set(sessionId, interfaceName), networkTrends };
+    });
   },
 
   /** 应用长任务状态事件；未知任务缓存最新事件，元数据到达后补投。 */
@@ -118,11 +149,13 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
       const snapshots = new Map(state.snapshots);
       const tasks = new Map(state.tasks);
       const selectedInterfaces = new Map(state.selectedInterfaces);
+      const networkTrends = new Map(state.networkTrends);
       sessionTaskMap.delete(sessionId);
       snapshots.delete(sessionId);
       selectedInterfaces.delete(sessionId);
+      networkTrends.delete(sessionId);
       if (taskId) tasks.delete(taskId);
-      return { sessionTaskMap, snapshots, tasks, selectedInterfaces };
+      return { sessionTaskMap, snapshots, tasks, selectedInterfaces, networkTrends };
     });
   },
 

@@ -1,6 +1,6 @@
 import { Card, Col, Empty, Progress, Row, Statistic, Typography } from 'antd';
 import { ChevronDown, ChevronUp } from 'lucide-react';
-import type { MonitorSnapshot } from '@/types/monitor';
+import type { MonitorSnapshot, NetworkTrendSample } from '@/types/monitor';
 
 interface Props {
   snapshot: MonitorSnapshot | null;
@@ -8,6 +8,8 @@ interface Props {
   selectedInterfaceName?: string | null;
   /** 请求切换当前 Session 的网卡接口。 */
   onInterfaceChange?: (interfaceName: string) => void;
+  /** 当前 Session 已选网卡的最近一分钟趋势。 */
+  trendSamples?: NetworkTrendSample[];
   /** 是否折叠为状态点窄条 */
   collapsed: boolean;
   /** 请求切换折叠状态 */
@@ -52,8 +54,40 @@ function progressColor(value: number) {
   return '#ef4444';
 }
 
+/** 将单个方向的有效样本连接为 SVG 路径，null 样本保留为断点。 */
+function trendPath(samples: NetworkTrendSample[], latestTimestamp: number, maximum: number, key: 'receiveBytesPerSecond' | 'transmitBytesPerSecond') {
+  let connected = false;
+  return samples.map((sample) => {
+    const value = sample[key];
+    if (value === null) {
+      connected = false;
+      return '';
+    }
+    const x = Math.max(0, Math.min(280, ((sample.timestamp - (latestTimestamp - 60_000)) / 60_000) * 280));
+    const y = 84 - (value / maximum) * 76;
+    const command = connected ? 'L' : 'M';
+    connected = true;
+    return `${command}${x} ${y}`;
+  }).join(' ');
+}
+
+/** 渲染零基准、双方向且不掩盖不可用样本的原生一分钟趋势图。 */
+function NetworkTrendChart({ samples }: { samples: NetworkTrendSample[] }) {
+  const latestTimestamp = samples[samples.length - 1]?.timestamp ?? 0;
+  const maximum = Math.max(1, ...samples.flatMap((sample) => [sample.receiveBytesPerSecond, sample.transmitBytesPerSecond]).filter((value): value is number => value !== null));
+  return <div className="network-trend">
+    <div className="network-trend-legend" aria-label="趋势图例"><span className="network-trend-down">下行趋势</span><span className="network-trend-up">上行趋势</span></div>
+    <svg role="img" aria-label="最近一分钟网卡速率趋势" viewBox="0 0 280 96" preserveAspectRatio="none">
+      <line x1="0" y1="84" x2="280" y2="84" stroke="currentColor" opacity="0.3" />
+      <path d={trendPath(samples, latestTimestamp, maximum, 'receiveBytesPerSecond')} stroke="#38bdf8" strokeWidth="2" fill="none" />
+      <path d={trendPath(samples, latestTimestamp, maximum, 'transmitBytesPerSecond')} stroke="#f59e0b" strokeWidth="2" fill="none" />
+    </svg>
+    <div className="network-trend-boundary" aria-hidden="true"><span>60 秒前</span><span>现在</span></div>
+  </div>;
+}
+
 /** 渲染后端单次推送的服务器监控快照；折叠态只显示状态点窄条。 */
-export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, collapsed, onToggle }: Props) {
+export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], collapsed, onToggle }: Props) {
   if (collapsed) {
     return (
       <div className="monitor-strip" data-testid="monitor-strip" role="button" aria-expanded="false" onClick={onToggle}>
@@ -96,6 +130,7 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
             onChange={(event) => onInterfaceChange?.(event.target.value)}>{snapshot.network.interfaces.map((item) => (
               <option key={item.name} value={item.name}>{item.name}</option>
             ))}</select></label></Col>
+          <Col span={24}><NetworkTrendChart samples={trendSamples} /></Col>
           <Col span={12}><Statistic title={`下行 · ${selectedInterface.name}`} value={formatRate(selectedInterface.receiveBytesPerSecond)} /></Col>
           <Col span={12}><Statistic title={`上行 · ${selectedInterface.name}`} value={formatRate(selectedInterface.transmitBytesPerSecond)} /></Col>
         </>)}

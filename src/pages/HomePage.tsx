@@ -26,6 +26,7 @@ export default function HomePage() {
   const activeView = useSessionStore((state) => state.activeView);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
   const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
+  const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
   const sftpStates = useSftpStore((state) => state.sessionStates);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
   const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
@@ -170,6 +171,7 @@ export default function HomePage() {
           <div className="sidebar-footer-row">
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
               onInterfaceChange={(name) => activeView && useMonitorStore.getState().selectNetworkInterface(activeView, name)}
+              trendSamples={trendSamples}
               collapsed onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
             <FooterActions theme={theme} />
           </div>
@@ -177,6 +179,7 @@ export default function HomePage() {
           <>
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
               onInterfaceChange={(name) => activeView && useMonitorStore.getState().selectNetworkInterface(activeView, name)}
+              trendSamples={trendSamples}
               collapsed={false} onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
             <div className="sidebar-footer-row sidebar-footer-row--right"><FooterActions theme={theme} /></div>
           </>
