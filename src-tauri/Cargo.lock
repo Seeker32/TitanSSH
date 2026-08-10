@@ -3505,28 +3505,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssh-terminal-manager"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "chrono",
- "keyring",
- "mockall",
- "proptest",
- "security-framework 3.7.0",
- "serde",
- "serde_json",
- "ssh2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "ssh2"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4121,6 +4099,28 @@ checksum = "42d3e9c45c09de15d06dd8acf5f4e0e399e85927b7f00711024eb7ae10fa4869"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "titanssh"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "keyring",
+ "mockall",
+ "proptest",
+ "security-framework 3.7.0",
+ "serde",
+ "serde_json",
+ "ssh2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-shell",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

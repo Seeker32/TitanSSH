@@ -1,5 +1,5 @@
 [package]
-name = "ssh-terminal-manager"
+name = "titanssh"
 version = "0.1.2"
 description = "A SSH Client"
 authors = ["Seeker32"]
