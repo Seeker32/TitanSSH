@@ -541,6 +541,22 @@ mod tests {
         assert_eq!(snapshot.disk_usage, 65.0);
     }
 
+    /// 验证畸形网卡记录只让网络区域不可用，其他指标仍正常返回。
+    #[test]
+    fn parse_snapshot_treats_malformed_network_records_as_unavailable() {
+        let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nNETWORK_STATUS=available\nNET=eth0,not-a-number,200";
+        let (snapshot, _, network_sample) =
+            parse_snapshot_at("session-1", raw, Some((100, 20)), None, 2_000)
+                .expect("畸形网络记录不应使整个快照失败");
+
+        assert!(!snapshot.network.available);
+        assert!(snapshot.network.interfaces.is_empty());
+        assert_eq!(network_sample, None);
+        assert!((snapshot.cpu_usage - 83.3).abs() < 0.01);
+        assert!((snapshot.memory_usage - 50.0).abs() < 0.01);
+        assert_eq!(snapshot.disk_usage, 65.0);
+    }
+
     /// 验证网络采集成功但只有 lo 时仍返回可用的空候选列表。
     #[test]
     fn parse_snapshot_distinguishes_no_network_interfaces_from_unavailable() {

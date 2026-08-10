@@ -189,6 +189,12 @@ describe('React components', () => {
     expect(screen.getByText('1.5 KB/s')).toBeInTheDocument();
     expect(screen.getByText('0 B/s')).toBeInTheDocument();
 
+    rerender(<ServerStatusPanel snapshot={makeSnapshot({ network: {
+      available: true,
+      interfaces: [{ name: 'eth0', receiveBytesPerSecond: null, transmitBytesPerSecond: null }],
+    } })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getAllByText('--')).toHaveLength(2);
+
     rerender(<ServerStatusPanel snapshot={makeSnapshot({ network: { available: true, interfaces: [] } })} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getByText('无可用网卡')).toBeInTheDocument();
 
