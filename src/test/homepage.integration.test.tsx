@@ -9,6 +9,7 @@ import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
+import { useLogLevelStore } from '@/stores/log-level';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { SessionStatus } from '@/types/session';
 import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
@@ -24,6 +25,7 @@ function resetStores() {
   useMonitorStore.setState(useMonitorStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
+  useLogLevelStore.setState(useLogLevelStore.getInitialState(), true);
   useTerminalThemeStore.setState(useTerminalThemeStore.getInitialState(), true);
 }
 
@@ -140,17 +142,24 @@ describe('HomePage integration', () => {
     expect(document.documentElement.dataset.theme).not.toBe(before);
   });
 
-  it('设置对话框提供六个可访问的 SSH 终端主题，并保存选择', async () => {
+  it('设置对话框通过左侧导航切换内容，并保存日志等级', async () => {
     const user = userEvent.setup();
     render(<HomePage />);
     await user.click(await screen.findByRole('button', { name: '设置' }));
     const dialog = screen.getByRole('dialog', { name: '设置' });
+    expect(within(dialog).getByTestId('settings-section-general')).toBeInTheDocument();
+    await user.click(within(dialog).getByTestId('settings-section-terminal'));
     expect(within(dialog).getAllByRole('button', { name: /SSH 终端主题/ })).toHaveLength(6);
     const applicationTheme = document.documentElement.dataset.theme;
     await user.click(within(dialog).getByRole('button', { name: /Dracula/ }));
     expect(useTerminalThemeStore.getState().terminalTheme).toBe('dracula');
     expect(localStorage.getItem('terminal-theme')).toBe('dracula');
     expect(document.documentElement.dataset.theme).toBe(applicationTheme);
+    await user.click(within(dialog).getByTestId('settings-section-logging'));
+    await user.selectOptions(within(dialog).getByLabelText('日志等级'), 'debug');
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('set_log_level', { level: 'debug' }));
+    expect(useLogLevelStore.getState().logLevel).toBe('debug');
+    expect(localStorage.getItem('log-level')).toBe('debug');
   });
 
   it('侧栏拖拽区同时承载尺寸调整光标与拖动事件', async () => {

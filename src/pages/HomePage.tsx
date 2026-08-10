@@ -2,6 +2,7 @@ import { Moon, Settings, Sun } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal, Select, Typography } from 'antd';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
+import { LOG_LEVELS, useLogLevelStore, type LogLevel } from '@/stores/log-level';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
 import SftpPanel from '@/components/sftp/SftpPanel';
@@ -212,8 +213,17 @@ export default function HomePage() {
 /** 侧栏底部全局入口：应用主题切换与 SSH 终端主题设置。 */
 function FooterActions({ theme }: { theme: string }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<'general' | 'terminal' | 'logging'>('general');
   const terminalTheme = useTerminalThemeStore((state) => state.terminalTheme);
+  const logLevel = useLogLevelStore((state) => state.logLevel);
   const locale = useLocaleStore((state) => state.locale);
+
+  useEffect(() => { void useLogLevelStore.getState().setLogLevel(logLevel); }, []);
+
+  /** 保存日志等级并立即同步后端日志过滤器。 */
+  function setLogLevel(level: LogLevel) {
+    void useLogLevelStore.getState().setLogLevel(level);
+  }
 
   return (
     <div className="sidebar-footer-actions">
@@ -222,24 +232,40 @@ function FooterActions({ theme }: { theme: string }) {
       <button type="button" className="sidebar-footer-btn" aria-label={translate(locale, 'settings.title')} title={translate(locale, 'settings.title')} onClick={() => setSettingsOpen(true)}>
         <Settings size={14} />
       </button>
-      <Modal open={settingsOpen} title={translate(locale, 'settings.title')} footer={null} onCancel={() => setSettingsOpen(false)}>
-        <div className="terminal-theme-options">
-          <label>{translate(locale, 'settings.language')} <Select value={locale} onChange={(value) => useLocaleStore.getState().setLocale(value)}
-            options={[{ value: 'zh-CN', label: translate(locale, 'locale.zh-CN') }, { value: 'en-US', label: translate(locale, 'locale.en-US') }]} /></label>
-          <Typography.Text type="secondary">{translate(locale, 'settings.terminalTheme')}</Typography.Text>
-          {TERMINAL_THEME_NAMES.map((name) => {
-            const palette = terminalThemes[name];
-            const selected = name === terminalTheme;
-            return <button key={name} type="button" aria-pressed={selected}
-              aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
-              onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
-              <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
-                <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
-              </span>
-              <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
-              {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
-            </button>;
-          })}
+      <Modal open={settingsOpen} title={translate(locale, 'settings.title')} footer={null} width={680} onCancel={() => setSettingsOpen(false)}>
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label={translate(locale, 'settings.title')}>
+            {(['general', 'terminal', 'logging'] as const).map((section) => <button key={section} type="button" data-testid={`settings-section-${section}`}
+              className={settingsSection === section ? 'settings-nav-btn settings-nav-btn--active' : 'settings-nav-btn'}
+              aria-current={settingsSection === section ? 'page' : undefined} onClick={() => setSettingsSection(section)}>
+              {translate(locale, `settings.${section}` as Parameters<typeof translate>[1])}
+            </button>)}
+          </nav>
+          <section className="settings-content">
+            {settingsSection === 'general' && <label className="settings-field">{translate(locale, 'settings.language')} <Select value={locale} onChange={(value) => useLocaleStore.getState().setLocale(value)}
+              options={[{ value: 'zh-CN', label: translate(locale, 'locale.zh-CN') }, { value: 'en-US', label: translate(locale, 'locale.en-US') }]} /></label>}
+            {settingsSection === 'terminal' && <div className="terminal-theme-options">
+              <Typography.Text type="secondary">{translate(locale, 'settings.terminalTheme')}</Typography.Text>
+              {TERMINAL_THEME_NAMES.map((name) => {
+                const palette = terminalThemes[name];
+                const selected = name === terminalTheme;
+                return <button key={name} type="button" aria-pressed={selected}
+                  aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
+                  onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
+                  <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
+                    <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
+                  </span>
+                  <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
+                  {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
+                </button>;
+              })}
+            </div>}
+            {settingsSection === 'logging' && <label className="settings-field">{translate(locale, 'settings.logLevel')}
+              <select value={logLevel} onChange={(event) => setLogLevel(event.target.value as LogLevel)}>
+                {LOG_LEVELS.map((level) => <option key={level} value={level}>{translate(locale, `settings.logLevel.${level}` as Parameters<typeof translate>[1])}</option>)}
+              </select>
+            </label>}
+          </section>
         </div>
       </Modal>
     </div>

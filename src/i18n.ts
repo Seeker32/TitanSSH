@@ -8,7 +8,7 @@ export interface AppErrorInfo {
 }
 
 const zhCN = {
-  'settings.title': '设置', 'settings.language': '语言', 'settings.terminalTheme': 'SSH 终端主题', 'settings.selected': '已选择',
+  'settings.title': '设置', 'settings.general': '常规', 'settings.terminal': '终端', 'settings.logging': '日志', 'settings.language': '语言', 'settings.terminalTheme': 'SSH 终端主题', 'settings.logLevel': '日志等级', 'settings.logLevel.error': '错误', 'settings.logLevel.warn': '警告', 'settings.logLevel.info': '信息', 'settings.logLevel.debug': '调试', 'settings.logLevel.trace': '追踪', 'settings.selected': '已选择',
   'terminalTheme.light': '浅色', 'terminalTheme.dark': '深色', 'terminalTheme.oneDark': 'One Dark', 'terminalTheme.dracula': 'Dracula', 'terminalTheme.solarizedLight': 'Solarized Light', 'terminalTheme.solarizedDark': 'Solarized Dark',
   'locale.zh-CN': '简体中文', 'locale.en-US': 'English',
   'theme.toggle': '切换主题', 'host.search': '搜索主机…', 'host.create': '新建主机', 'host.createFirst': '新建第一个主机',
@@ -39,7 +39,7 @@ const zhCN = {
 } as const;
 
 const enUS: Record<keyof typeof zhCN, string> = {
-  'settings.title': 'Settings', 'settings.language': 'Language', 'settings.terminalTheme': 'SSH Terminal Theme', 'settings.selected': 'Selected',
+  'settings.title': 'Settings', 'settings.general': 'General', 'settings.terminal': 'Terminal', 'settings.logging': 'Logging', 'settings.language': 'Language', 'settings.terminalTheme': 'SSH Terminal Theme', 'settings.logLevel': 'Log level', 'settings.logLevel.error': 'Error', 'settings.logLevel.warn': 'Warning', 'settings.logLevel.info': 'Info', 'settings.logLevel.debug': 'Debug', 'settings.logLevel.trace': 'Trace', 'settings.selected': 'Selected',
   'terminalTheme.light': 'Light', 'terminalTheme.dark': 'Dark', 'terminalTheme.oneDark': 'One Dark', 'terminalTheme.dracula': 'Dracula', 'terminalTheme.solarizedLight': 'Solarized Light', 'terminalTheme.solarizedDark': 'Solarized Dark',
   'locale.zh-CN': 'Simplified Chinese', 'locale.en-US': 'English', 'theme.toggle': 'Toggle theme', 'host.search': 'Search hosts…', 'host.create': 'New host', 'host.createFirst': 'Create first host',
   'host.empty': 'No hosts yet. Add your first SSH connection below.', 'host.noMatch': 'No matching hosts', 'host.ungrouped': 'Ungrouped',

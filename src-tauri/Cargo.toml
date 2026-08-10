@@ -22,6 +22,8 @@ chrono = { version = "0.4", features = ["serde"] }
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 thiserror = "1.0"
 anyhow = "1.0"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
 tauri-plugin-dialog = "2.6.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]

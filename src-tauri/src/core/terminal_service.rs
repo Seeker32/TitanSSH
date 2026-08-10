@@ -5,6 +5,7 @@ use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::session::{SessionStatus, SessionStatusEvent, TerminalDataEvent};
 use crate::storage::secure_store;
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -80,7 +81,7 @@ pub fn start_terminal_session<R: Runtime>(
     thread::spawn(move || {
         // 从安全存储读取运行时凭据，并对钥匙串阻塞设置独立超时
         emit_connection_progress(&app, &session_id, ConnectionPhase::LoadingCredentials);
-        eprintln!(
+        info!(
             "[session:{}][diagnostic] Starting credential load with {}s timeout",
             session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
         );
@@ -89,12 +90,12 @@ pub fn start_terminal_session<R: Runtime>(
         let credentials = match run_phase_with_timeout(
             Duration::from_secs(CREDENTIAL_LOAD_TIMEOUT_SECS),
             move || {
-                eprintln!(
+                debug!(
                     "[session:{}][diagnostic] Credential thread started",
                     session_id_for_credentials
                 );
                 let result = load_credentials(&host_for_credentials);
-                eprintln!(
+                debug!(
                     "[session:{}][diagnostic] Credential thread completed: {:?}",
                     session_id_for_credentials,
                     result.is_ok()
@@ -103,14 +104,14 @@ pub fn start_terminal_session<R: Runtime>(
             },
         ) {
             PhaseOutcome::Completed(Ok(creds)) => {
-                eprintln!(
+                info!(
                     "[session:{}][diagnostic] Credentials loaded successfully",
                     session_id
                 );
                 creds
             }
             PhaseOutcome::Completed(Err(error)) => {
-                eprintln!(
+                error!(
                     "[session:{}][diagnostic] Credential loading failed: error_code={}",
                     session_id,
                     error.code()
@@ -121,7 +122,7 @@ pub fn start_terminal_session<R: Runtime>(
                 return;
             }
             PhaseOutcome::TimedOut => {
-                eprintln!(
+                warn!(
                     "[session:{}][diagnostic] Credentials timed out after {}s",
                     session_id, CREDENTIAL_LOAD_TIMEOUT_SECS
                 );
@@ -132,7 +133,7 @@ pub fn start_terminal_session<R: Runtime>(
                     SessionStatus::Timeout,
                     Some(phase_timeout_message(&ConnectionPhase::LoadingCredentials)),
                 );
-                eprintln!("[session:{}][diagnostic] Timeout event emitted", session_id);
+                debug!("[session:{}][diagnostic] Timeout event emitted", session_id);
                 return;
             }
         };
@@ -315,8 +316,8 @@ pub fn start_terminal_session<R: Runtime>(
 /// # 返回
 /// `(password, passphrase)` 元组，均为 Option<String>
 fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>), AppError> {
-    eprintln!("[diagnostic] Loading credentials");
-    eprintln!(
+    debug!("[diagnostic] Loading credentials");
+    debug!(
         "[diagnostic] Authentication type: {:?}, password_credential_present={}",
         host.auth_type,
         host.password_ref.is_some()
@@ -329,17 +330,17 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
                 .password_ref
                 .as_deref()
                 .ok_or_else(|| AppError::InvalidHostConfig("密码为必填项".to_string()))?;
-            eprintln!("[diagnostic] Loading password credential");
+            debug!("[diagnostic] Loading password credential");
 
             let password = secure_store::get_credential(password_ref).map_err(|e| {
-                eprintln!(
+                error!(
                     "[diagnostic] Failed to load password: error_code={}",
                     e.code()
                 );
                 e
             })?;
 
-            eprintln!("[diagnostic] Password loaded successfully");
+            debug!("[diagnostic] Password loaded successfully");
             Ok((Some(password), None))
         }
         AuthType::PrivateKey => {
@@ -349,7 +350,7 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
             }
             // 私钥口令为可选项，若有引用键则读取
             let passphrase = if let Some(ref passphrase_ref) = host.passphrase_ref {
-                eprintln!("[diagnostic] Loading passphrase credential");
+                debug!("[diagnostic] Loading passphrase credential");
                 Some(secure_store::get_credential(passphrase_ref)?)
             } else {
                 None
@@ -496,7 +497,7 @@ fn emit_connection_progress<R: Runtime>(
     phase: ConnectionPhase,
 ) {
     let timestamp = chrono::Utc::now().timestamp_millis();
-    eprintln!("[session:{}][phase:{:?}]", session_id, phase);
+    info!("[session:{}][phase:{:?}]", session_id, phase);
     let _ = app.emit(
         "session:progress",
         ConnectionProgressEvent {
@@ -521,7 +522,7 @@ fn emit_session_status<R: tauri::Runtime>(
     status: SessionStatus,
     message: Option<String>,
 ) {
-    eprintln!(
+    debug!(
         "[session:{}][diagnostic] Emitting session status: {:?}, has_message={}",
         session_id,
         status,
@@ -542,12 +543,12 @@ fn emit_session_status<R: tauri::Runtime>(
         },
     );
     if result.is_err() {
-        eprintln!(
+        error!(
             "[session:{}][diagnostic] Session status event emission failed",
             session_id
         );
     } else {
-        eprintln!(
+        debug!(
             "[session:{}][diagnostic] emit_session_status SUCCESS",
             session_id
         );
@@ -558,8 +559,8 @@ fn emit_session_status<R: tauri::Runtime>(
 mod tests {
     use crate::models::session::TerminalDataEvent;
     use proptest::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// 生成非空字母数字字符串的策略（1-64 个字符）
     fn arb_session_id() -> impl Strategy<Value = String> {

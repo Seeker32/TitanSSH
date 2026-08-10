@@ -103,6 +103,13 @@ button { cursor: pointer; }
 .sidebar-footer-btn:hover:not(:disabled) { border-color: var(--color-border-focus); color: var(--color-accent); }
 .sidebar-footer-btn:disabled { opacity: .4; cursor: default; }
 .terminal-theme-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.settings-layout { display: flex; min-height: 280px; }
+.settings-nav { display: flex; flex: 0 0 120px; flex-direction: column; gap: 4px; padding-right: 12px; border-right: 1px solid var(--color-border); }
+.settings-nav-btn { padding: 7px 10px; border: 0; border-radius: 6px; background: none; color: var(--color-text-secondary); text-align: left; }
+.settings-nav-btn:hover, .settings-nav-btn--active { background: var(--color-card-bg-hover); color: var(--color-text-primary); }
+.settings-content { flex: 1; min-width: 0; padding-left: 20px; }
+.settings-field { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; color: var(--color-text-secondary); font-size: 12px; }
+.settings-field select { min-width: 180px; padding: 5px 8px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card-bg); color: var(--color-text-primary); }
 .terminal-theme-card { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 8px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-card-bg); color: var(--color-text-primary); text-align: left; }
 .terminal-theme-card[aria-pressed="true"] { border-color: var(--color-accent); box-shadow: inset 0 0 0 1px var(--color-accent); }
 .terminal-theme-preview { display: flex; flex-direction: column; gap: 2px; min-height: 42px; padding: 6px; border-radius: 4px; font: 10px monospace; }
