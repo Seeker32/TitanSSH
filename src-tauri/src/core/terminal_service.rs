@@ -366,31 +366,14 @@ where
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
-    eprintln!(
-        "[diagnostic] Spawning timeout thread with timeout {:?}",
-        timeout
-    );
     thread::spawn(move || {
-        eprintln!("[diagnostic] Timeout thread spawned, running operation");
         let result = operation();
-        eprintln!("[diagnostic] Operation completed, sending result");
         let _ = tx.send(result);
     });
 
-    eprintln!("[diagnostic] Waiting for result with recv_timeout");
     match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            eprintln!("[diagnostic] recv_timeout received result successfully");
-            PhaseOutcome::Completed(result)
-        }
-        Err(RecvTimeoutError::Timeout) => {
-            eprintln!("[diagnostic] recv_timeout timed out!");
-            PhaseOutcome::TimedOut
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            eprintln!("[diagnostic] recv_timeout channel disconnected");
-            PhaseOutcome::TimedOut
-        }
+        Ok(result) => PhaseOutcome::Completed(result),
+        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => PhaseOutcome::TimedOut,
     }
 }
 
@@ -1048,33 +1031,33 @@ mod integration_tests {
     /// 验证 run_phase_with_timeout 在操作超时时正确返回 TimedOut
     #[test]
     fn run_phase_with_timeout_returns_timed_out_for_slow_operation() {
-        use std::thread;
-        use std::time::{Duration, Instant};
+        use std::{sync::mpsc, thread, time::Duration};
 
-        let start = Instant::now();
-        let result = run_phase_with_timeout(
-            Duration::from_millis(100), // 100ms timeout
-            || {
-                // Simulate a slow operation that takes 500ms
-                thread::sleep(Duration::from_millis(500));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_phase_with_timeout(Duration::from_millis(100), move || {
+                started_tx.send(()).expect("操作线程应启动");
+                release_rx.recv().expect("测试应释放操作线程");
                 Ok::<_, AppError>("should not complete")
-            },
-        );
-        let elapsed = start.elapsed();
+            });
+            result_tx.send(result).expect("超时结果应返回");
+        });
 
-        // Should return TimedOut, not Completed
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("操作线程应在测试超时前启动");
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("超时必须在阻塞操作完成前返回");
+
         assert!(
             matches!(result, PhaseOutcome::TimedOut),
             "Expected TimedOut when operation exceeds timeout, got {:?}",
             result
         );
-
-        // Should return quickly (within 200ms), not wait for the slow operation
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "Timeout should return quickly, not wait for slow operation. Elapsed: {:?}",
-            elapsed
-        );
+        release_tx.send(()).expect("应释放操作线程");
     }
 
     /// 验证 run_phase_with_timeout 在操作成功时正确返回 Completed
