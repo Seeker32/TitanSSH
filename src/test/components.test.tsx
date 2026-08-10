@@ -178,6 +178,7 @@ describe('React components', () => {
     rerender(<ServerStatusPanel snapshot={makeSnapshot()} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getByText('21.5%')).toBeInTheDocument();
     expect(screen.getByText(/剩余 300.0 GB \/ 总量 500.0 GB/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Updated:/)).not.toBeInTheDocument();
   });
 
   it('服务器状态显示默认网卡速率，并区分无网卡和网络不可用', () => {

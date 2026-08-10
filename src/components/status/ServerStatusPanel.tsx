@@ -134,9 +134,6 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
           <Col span={12}><Statistic title={`下行 · ${selectedInterface.name}`} value={formatRate(selectedInterface.receiveBytesPerSecond)} /></Col>
           <Col span={12}><Statistic title={`上行 · ${selectedInterface.name}`} value={formatRate(selectedInterface.transmitBytesPerSecond)} /></Col>
         </>)}
-        <Col span={24}><Typography.Text type="secondary" className="updated">
-          Updated: {snapshot ? new Date(snapshot.timestamp).toLocaleTimeString() : '--'}
-        </Typography.Text></Col>
         {!snapshot && <Col span={24}><Empty description="连接建立后，这里会每 2 秒刷新一次服务器状态" /></Col>}
       </Row>
     </Card>
