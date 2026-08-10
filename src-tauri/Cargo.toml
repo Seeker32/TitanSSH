@@ -1,6 +1,6 @@
 [package]
 name = "ssh-terminal-manager"
-version = "0.1.1"
+version = "0.1.2"
 description = "A SSH Client"
 authors = ["Seeker32"]
 edition = "2024"
