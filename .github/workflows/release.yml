@@ -38,7 +38,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
+      # Tauri's Windows test binaries omit the Common Controls v6 manifest and cannot start.
+      # Rust tests run on both macOS builders; Windows still compiles and packages the app.
       - run: cargo test --manifest-path src-tauri/Cargo.toml
+        if: runner.os != 'Windows'
       - run: pnpm tauri build
       - uses: actions/upload-artifact@v4
         with:

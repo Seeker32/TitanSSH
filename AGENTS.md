@@ -35,6 +35,7 @@ JSON-serializable, camelCase, timestamps in ms. Models: HostConfig, SessionInfo,
 - Rust: no excessive unwrap, proper Result, clear module boundaries
 - Frontend: React function components + Hooks, immutable Zustand updates, strict TS
 - Every method: Chinese comment (purpose, key params, side effects)
+- Dependencies: enable only the features used by the code; do not use umbrella features such as `full` unless every included feature is required and the reason is documented.
 
 ## Performance
 
