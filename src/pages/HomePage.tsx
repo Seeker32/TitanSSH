@@ -9,7 +9,7 @@ import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
 import { filterHosts, useHostStore } from '@/stores/host';
-import { clampSidebarWidth, MAX_SIDEBAR_WIDTH, useLayoutStore } from '@/stores/layout';
+import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
@@ -37,7 +37,6 @@ export default function HomePage() {
   const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
-  const [resizing, setResizing] = useState(false);
   const resizingRef = useRef(false);
 
   useEffect(() => {
@@ -54,7 +53,6 @@ export default function HomePage() {
     /** 停止侧栏拖动并清理全局样式。 */
     function stop() {
       resizingRef.current = false;
-      setResizing(false);
       document.body.classList.remove('sidebar-resizing');
     }
     /** 窗口变化时重新限制侧栏宽度。 */
@@ -124,8 +122,8 @@ export default function HomePage() {
 
   /** 启动侧栏宽度拖动。 */
   function startSidebarResize(event: React.PointerEvent) {
+    if (event.clientX < event.currentTarget.getBoundingClientRect().right - 8) return;
     resizingRef.current = true;
-    setResizing(true);
     document.body.classList.add('sidebar-resizing');
     useLayoutStore.getState().setSidebarWidth(event.clientX);
   }
@@ -153,8 +151,8 @@ export default function HomePage() {
     }
   }
 
-  return <div className={`page-shell ${resizing ? 'page-shell--resizing' : ''}`}>
-    <aside className="sidebar" style={{ width: sidebarWidth }}>
+  return <div className="page-shell">
+    <aside className="sidebar" style={{ width: sidebarWidth }} onPointerDown={startSidebarResize}>
       <div className="sidebar-header">
         <Typography.Text type="secondary" className="brand">Titan SSH</Typography.Text>
       </div>
@@ -186,8 +184,6 @@ export default function HomePage() {
         )}
       </div>
     </aside>
-    <div className="sidebar-resizer" role="separator" aria-orientation="vertical" aria-valuenow={sidebarWidth}
-      aria-valuemin={220} aria-valuemax={clampSidebarWidth(MAX_SIDEBAR_WIDTH, window.innerWidth)} onPointerDown={startSidebarResize} />
     <section className="main-panel">
       {sessions.length > 0 && <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
         onActivate={(view) => useSessionStore.getState().setActiveView(view)}
