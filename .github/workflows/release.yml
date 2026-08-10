@@ -17,8 +17,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS
-            os: macos-latest
+          - name: macOS-arm64
+            os: macos-15
+            artifacts: src-tauri/target/release/bundle/dmg/*.dmg
+          - name: macOS-x64
+            os: macos-15-intel
             artifacts: src-tauri/target/release/bundle/dmg/*.dmg
           - name: Windows
             os: windows-latest
