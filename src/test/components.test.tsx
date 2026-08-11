@@ -265,6 +265,48 @@ describe('React components', () => {
     expect(download).toHaveBeenCalledWith(['/var/log/syslog']);
   });
 
+  it('文件浏览器刷新当前目录', async () => {
+    const user = userEvent.setup();
+    const navigate = vi.fn();
+    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    render(<FileExplorer state={state} onNavigate={navigate} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+
+    expect(navigate).toHaveBeenCalledWith('/var/log');
+  });
+
+  it('文件浏览器加载目录时禁用刷新', () => {
+    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map() };
+    render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+
+    expect(screen.getByRole('button', { name: '刷新' })).toBeDisabled();
+  });
+
+  it('文件浏览器右键文件可下载该文件', async () => {
+    const user = userEvent.setup();
+    const download = vi.fn();
+    const state = { currentPath: '/var/log', entries: [makeRemoteEntry()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={download} />);
+
+    fireEvent.contextMenu(screen.getByText('syslog'));
+    await user.click(await screen.findByRole('menuitem', { name: '下载' }));
+
+    expect(download).toHaveBeenCalledWith(['/var/log/syslog']);
+  });
+
+  it('文件浏览器右键空白区域可刷新当前目录', async () => {
+    const user = userEvent.setup();
+    const navigate = vi.fn();
+    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const { container } = render(<FileExplorer state={state} onNavigate={navigate} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+
+    fireEvent.contextMenu(container.querySelector('.file-explorer')!);
+    await user.click(await screen.findByRole('menuitem', { name: '刷新' }));
+
+    expect(navigate).toHaveBeenCalledWith('/var/log');
+  });
+
   it('文件浏览器显示 loading、error 与空目录状态', () => {
     const props = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn() };
     const base = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map() };
