@@ -53,8 +53,9 @@ export default function SftpPanel(props: Props) {
     };
   }, []);
 
-  /** 启动 SFTP 面板高度拖动。 */
+  /** 启动 SFTP 面板高度拖动：阻止默认行为防止拖动过程中文本被选中。 */
   function startResize(event: ReactPointerEvent) {
+    event.preventDefault();
     dragging.current = true;
     startY.current = event.clientY;
     startHeight.current = height;

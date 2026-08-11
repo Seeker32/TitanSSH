@@ -47,7 +47,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     activeView: null,
     statusMessage: translate(useLocaleStore.getState().locale, 'session.ready'),
 
-    /** 打开 SSH 会话，并启动关联监控任务。 */
+    /** 打开 SSH 会话，初始化文件传输并启动关联监控任务。 */
     async openSession(hostId) {
       const session = await invoke<SessionInfo>('open_session', { hostId });
       set((state) => ({
@@ -55,6 +55,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         activeView: session.sessionId,
         statusMessage: translate(useLocaleStore.getState().locale, 'session.connecting', { name: `${session.username}@${session.host}` }),
       }));
+      void useSftpStore.getState().listDir(session.sessionId, '/');
       try {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
       } catch {
@@ -90,7 +91,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set({ activeView });
     },
 
-    /** 应用后端权威会话状态；连接成功时初始化该会话的远程目录。 */
+    /** 应用后端权威会话状态。 */
     applySessionStatus(payload) {
       const current = get().sessions.get(payload.sessionId);
       set((state) => ({
@@ -99,9 +100,6 @@ export const useSessionStore = create<SessionState>((set, get) => {
           : state.sessions,
         statusMessage: statusLabel(payload.status, payload.error),
       }));
-      if (current && payload.status === SessionStatus.Connected) {
-        useSftpStore.getState().listDir(payload.sessionId, '/').catch(() => {});
-      }
     },
 
     /** 仅在连接中应用阶段诊断信息。 */

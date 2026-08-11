@@ -1,6 +1,6 @@
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useEffect, useState } from 'react';
-import { AutoComplete, Button, Form, Input, InputNumber, Modal, Select } from 'antd';
+import { AutoComplete, Button, Form, Input, InputNumber, Modal, Select, Space } from 'antd';
 import { AuthType, type HostConfig, type SaveHostRequest } from '@/types/host';
 import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
@@ -76,8 +76,13 @@ export default function HostEditorDialog({ open, editingHost, groups, onClose, o
         options={[{ label: t('host.passwordAuth'), value: AuthType.Password }, { label: t('host.privateKeyAuth'), value: AuthType.PrivateKey }]} /></Form.Item>
       {form.authType === AuthType.Password ? <Form.Item label={t('host.password')}><Input.Password {...textProps} value={form.password}
         placeholder={t('host.passwordPlaceholder')} onChange={(event) => update('password', event.target.value)} /></Form.Item>
-        : <Form.Item label={t('host.privateKeyPath')} help={!form.privateKeyPath ? t('host.keyRequired') : undefined}><Input {...textProps} readOnly value={form.privateKeyPath}
-          placeholder={t('host.keyPlaceholder')} addonAfter={<Button onClick={pickPrivateKey}>{t('host.browse')}</Button>} /></Form.Item>}
+        : <Form.Item label={t('host.privateKeyPath')}>
+          <Space.Compact block>
+            <Input {...textProps} readOnly value={form.privateKeyPath}
+              placeholder={t('host.keyPlaceholder')} />
+            <Button onClick={pickPrivateKey}>{t('host.browse')}</Button>
+          </Space.Compact>
+        </Form.Item>}
       {form.authType === AuthType.PrivateKey && <Form.Item label={t('host.passphrase')}><Input.Password {...textProps}
         value={form.passphrase} placeholder={t('host.passphrasePlaceholder')} onChange={(event) => update('passphrase', event.target.value)} /></Form.Item>}
       <Form.Item label={t('host.group')}><AutoComplete aria-label={t('host.group')} value={form.group} placeholder={t('host.groupPlaceholder')}

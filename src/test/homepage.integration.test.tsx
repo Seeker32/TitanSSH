@@ -177,4 +177,18 @@ describe('HomePage integration', () => {
     fireEvent(window, move);
     expect(useLayoutStore.getState().sidebarWidth).toBe(220);
   });
+
+  it('侧栏拖动阻止文本选中：阻止默认行为并仅拖动期间加禁选类', async () => {
+    render(<HomePage />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));
+    const resizer = screen.getByTestId('sidebar-resizer');
+    const start = new Event('pointerdown', { bubbles: true, cancelable: true });
+    const preventDefault = vi.spyOn(start, 'preventDefault');
+    Object.defineProperty(start, 'clientX', { value: 300 });
+    fireEvent(resizer, start);
+    expect(preventDefault).toHaveBeenCalled();
+    expect(document.body.classList.contains('sidebar-resizing')).toBe(true);
+    fireEvent(window, new Event('pointerup'));
+    expect(document.body.classList.contains('sidebar-resizing')).toBe(false);
+  });
 });

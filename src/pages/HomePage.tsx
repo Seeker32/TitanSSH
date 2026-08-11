@@ -125,8 +125,9 @@ export default function HomePage() {
     useLayoutStore.getState().removeCollapsedGroup(name);
   }
 
-  /** 启动侧栏宽度拖动。 */
-  function startSidebarResize() {
+  /** 启动侧栏宽度拖动：阻止默认行为防止拖动过程中文本被选中。 */
+  function startSidebarResize(event: React.PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
     resizingRef.current = true;
     document.body.classList.add('sidebar-resizing');
   }

@@ -303,6 +303,20 @@ describe('React components', () => {
     expect(screen.getByTestId('sftp-resizer')).toHaveAttribute('aria-orientation', 'horizontal');
   });
 
+  it('SFTP 高度拖动阻止文本选中：阻止默认行为并仅拖动期间加禁选类', () => {
+    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn() };
+    render(<SftpPanel sessionId="session-1" state={null} {...handlers} />);
+    const resizer = screen.getByTestId('sftp-resizer');
+    const start = new Event('pointerdown', { bubbles: true, cancelable: true });
+    const preventDefault = vi.spyOn(start, 'preventDefault');
+    Object.defineProperty(start, 'clientY', { value: 400 });
+    fireEvent(resizer, start);
+    expect(preventDefault).toHaveBeenCalled();
+    expect(document.body.classList.contains('sftp-resizing')).toBe(true);
+    fireEvent(window, new Event('pointerup'));
+    expect(document.body.classList.contains('sftp-resizing')).toBe(false);
+  });
+
   it('主机表单编辑时不回填密码，并按认证方式清理字段', async () => {
     const user = userEvent.setup();
     const save = vi.fn();
@@ -360,9 +374,9 @@ describe('React components', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
-  it('私钥路径为空时禁用保存并显示引导文案', () => {
+  it('私钥路径为空时禁用保存', () => {
     render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} groups={[]} onClose={vi.fn()} onSave={vi.fn()} />);
-    expect(screen.getByText('请先选择私钥文件')).toBeInTheDocument();
+    expect(screen.queryByText('请先选择私钥文件')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /保存连接/ })).toBeDisabled();
   });
 });

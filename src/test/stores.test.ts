@@ -199,7 +199,7 @@ describe('Zustand stores', () => {
     cleanup();
   });
 
-  it('会话状态只消费后端事实并在连接成功时初始化文件传输', async () => {
+  it('打开会话时初始化文件传输且连接成功事件不重复请求目录', async () => {
     mockInvoke.mockImplementation(async (command) => {
       if (command === 'open_session') return makeSession();
       if (command === 'start_monitoring') return makeTaskInfo();
@@ -207,6 +207,7 @@ describe('Zustand stores', () => {
       return undefined;
     });
     await useSessionStore.getState().openSession('host-1');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/' });
     const cleanup = await useSessionStore.getState().initListeners();
     mockInvoke.mockClear();
 
@@ -214,8 +215,30 @@ describe('Zustand stores', () => {
       sessionId: 'session-1', status: SessionStatus.Connected, error: null,
     });
 
-    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/' });
+    expect(mockInvoke).not.toHaveBeenCalledWith('sftp_list_dir', expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith('sync_session_status', expect.anything());
+    cleanup();
+  });
+
+  it('open_session 返回前到达连接成功事件时仍初始化文件传输', async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') {
+        emitMockEvent('session:status', {
+          sessionId: 'session-1', status: SessionStatus.Connected, error: null,
+        });
+        return makeSession();
+      }
+      if (command === 'start_monitoring') return makeTaskInfo();
+      if (command === 'sftp_list_dir') return [makeRemoteEntry()];
+      return undefined;
+    });
+    const cleanup = await useSessionStore.getState().initListeners();
+
+    await useSessionStore.getState().openSession('host-1');
+
+    await vi.waitFor(() => {
+      expect(useSftpStore.getState().getState('session-1')?.entries).toHaveLength(1);
+    });
     cleanup();
   });
 
