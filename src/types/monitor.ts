@@ -28,11 +28,16 @@ export interface MonitorSnapshot {
   sessionId: string;
   /** Unix 毫秒时间戳 */
   timestamp: number;
-  cpuUsage: number;
-  memoryUsage: number;
-  diskUsage: number;
-  diskAvailableBytes: number;
-  diskTotalBytes: number;
+  /** 0.0 ~ 100.0；无基线或采集缺失时为 null（未知） */
+  cpuUsage: number | null;
+  /** 0.0 ~ 100.0；MemTotal/MemAvailable 缺失时为 null（未知） */
+  memoryUsage: number | null;
+  /** 0.0 ~ 100.0；df 采集失败时为 null（未知） */
+  diskUsage: number | null;
+  /** 根分区剩余容量；df 采集失败时为 null */
+  diskAvailableBytes: number | null;
+  /** 根分区总容量；df 采集失败时为 null */
+  diskTotalBytes: number | null;
   network: NetworkSnapshot;
 }
 

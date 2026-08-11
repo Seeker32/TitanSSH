@@ -29,16 +29,16 @@ pub struct MonitorSnapshot {
     pub session_id: String,
     /// 采集时间，Unix 毫秒时间戳
     pub timestamp: i64,
-    /// CPU 使用率，0.0 ~ 100.0
-    pub cpu_usage: f64,
-    /// 内存使用率，0.0 ~ 100.0
-    pub memory_usage: f64,
-    /// 磁盘使用率，0.0 ~ 100.0
-    pub disk_usage: f64,
-    /// 根分区剩余容量，单位字节
-    pub disk_available_bytes: u64,
-    /// 根分区总容量，单位字节
-    pub disk_total_bytes: u64,
+    /// CPU 使用率，0.0 ~ 100.0；无基线或采集缺失时为 null（未知）
+    pub cpu_usage: Option<f64>,
+    /// 内存使用率，0.0 ~ 100.0；MemTotal/MemAvailable 缺失时为 null（未知）
+    pub memory_usage: Option<f64>,
+    /// 磁盘使用率，0.0 ~ 100.0；df 采集失败时为 null（未知）
+    pub disk_usage: Option<f64>,
+    /// 根分区剩余容量，单位字节；df 采集失败时为 null
+    pub disk_available_bytes: Option<u64>,
+    /// 根分区总容量，单位字节；df 采集失败时为 null
+    pub disk_total_bytes: Option<u64>,
     /// 网络采集状态与全部候选网卡接口速率。
     pub network: NetworkSnapshot,
 }
@@ -132,11 +132,11 @@ mod tests {
                 )| MonitorSnapshot {
                     session_id,
                     timestamp,
-                    cpu_usage,
-                    memory_usage,
-                    disk_usage,
-                    disk_available_bytes,
-                    disk_total_bytes,
+                    cpu_usage: Some(cpu_usage),
+                    memory_usage: Some(memory_usage),
+                    disk_usage: Some(disk_usage),
+                    disk_available_bytes: Some(disk_available_bytes),
+                    disk_total_bytes: Some(disk_total_bytes),
                     network: NetworkSnapshot {
                         available: true,
                         interfaces: vec![],

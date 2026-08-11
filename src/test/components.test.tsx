@@ -181,6 +181,18 @@ describe('React components', () => {
     expect(screen.queryByText(/^Updated:/)).not.toBeInTheDocument();
   });
 
+  it('指标缺失时显示未知（--）而非伪造 0%', () => {
+    render(<ServerStatusPanel snapshot={makeSnapshot({
+      cpuUsage: null,
+      memoryUsage: null,
+      diskUsage: null,
+      diskAvailableBytes: null,
+      diskTotalBytes: null,
+    })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getAllByText('--')).toHaveLength(3);
+    expect(screen.queryByText('0.0%')).not.toBeInTheDocument();
+  });
+
   it('服务器状态显示默认网卡速率，并区分无网卡和网络不可用', () => {
     const { rerender } = render(<ServerStatusPanel snapshot={makeSnapshot({ network: {
       available: true,

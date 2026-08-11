@@ -569,11 +569,11 @@ mod service_tests {
                 MonitorSnapshot {
                     session_id: session_id.to_string(),
                     timestamp: 1_710_000_000_000,
-                    cpu_usage: 10.0,
-                    memory_usage: 20.0,
-                    disk_usage: 30.0,
-                    disk_available_bytes: 40,
-                    disk_total_bytes: 50,
+                    cpu_usage: Some(10.0),
+                    memory_usage: Some(20.0),
+                    disk_usage: Some(30.0),
+                    disk_available_bytes: Some(40),
+                    disk_total_bytes: Some(50),
                     network: crate::models::monitor::NetworkSnapshot {
                         available: true,
                         interfaces: vec![],

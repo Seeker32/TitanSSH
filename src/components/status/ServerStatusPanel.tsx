@@ -18,13 +18,13 @@ interface Props {
   onToggle: () => void;
 }
 
-/** 将监控数值格式化为百分比文本。 */
-function formatPercent(value: number | undefined) {
+/** 将监控数值格式化为百分比文本；null/undefined 表示未知。 */
+function formatPercent(value: number | null | undefined) {
   return typeof value === 'number' ? `${value.toFixed(1)}%` : '--';
 }
 
-/** 将字节容量格式化为易读文本。 */
-function formatBytes(bytes: number | undefined) {
+/** 将字节容量格式化为易读文本；null/undefined 表示未知。 */
+function formatBytes(bytes: number | null | undefined) {
   if (typeof bytes !== 'number' || bytes <= 0) return '--';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
