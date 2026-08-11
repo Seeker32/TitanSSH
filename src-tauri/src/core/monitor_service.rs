@@ -127,11 +127,13 @@ impl MonitorService {
             let session_id_for_snap = session_id.clone();
 
             monitor_worker::run_monitor_loop(
-                host,
-                password,
-                passphrase,
-                session_id,
-                shutdown,
+                monitor_worker::MonitorLoopParams {
+                    host,
+                    password,
+                    passphrase,
+                    session_id,
+                    shutdown,
+                },
                 move |snapshot| {
                     // 更新快照缓存
                     {

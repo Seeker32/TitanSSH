@@ -58,33 +58,47 @@ impl NetworkSample {
     }
 }
 
+/// 监控循环的输入参数（不含回调），集中传递避免过长参数列表。
+pub struct MonitorLoopParams {
+    /// 主机配置（不含明文凭据）
+    pub host: HostConfig,
+    /// 运行时密码（Password 认证时必须提供）
+    pub password: Option<String>,
+    /// 运行时私钥口令（PrivateKey 认证时可选）
+    pub passphrase: Option<String>,
+    /// 关联的会话 ID
+    pub session_id: String,
+    /// 关闭标志，true 时退出循环
+    pub shutdown: Arc<AtomicBool>,
+}
+
 /// 监控采集主循环（可注入 connect_fn，便于单元测试）
 ///
 /// 在调用方线程内运行，持有独立 SSH 长连接，每 2 秒采集一次快照。
 /// 连接失败或采集出错时调用 on_error 后退出，不自动重连。
-/// shutdown=true 时正常退出，不调用 on_error。
+/// params.shutdown 为 true 时正常退出，不调用 on_error。
 ///
 /// # 参数
 /// - `connect_fn`: SSH 连接函数，可注入 mock 供测试使用
-/// - `host`: 主机配置（不含明文凭据）
-/// - `password`: 运行时密码（Password 认证时必须提供）
-/// - `passphrase`: 运行时私钥口令（PrivateKey 认证时可选）
-/// - `session_id`: 关联的会话 ID
-/// - `shutdown`: 关闭标志，true 时退出循环
+/// - `params`: 循环输入参数（主机配置、运行时凭据、会话 ID、关闭标志）
 /// - `on_snapshot`: 采集成功回调
 /// - `on_error`: 采集失败回调，调用后循环退出
 pub fn run_monitor_loop_with<ConnFn>(
     connect_fn: ConnFn,
-    host: HostConfig,
-    password: Option<String>,
-    passphrase: Option<String>,
-    session_id: String,
-    shutdown: Arc<AtomicBool>,
+    params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) where
     ConnFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<ExecTransport, AppError>,
 {
+    let MonitorLoopParams {
+        host,
+        password,
+        passphrase,
+        session_id,
+        shutdown,
+    } = params;
+
     // 保存上一轮 CPU 原始计数，用于根据 /proc/stat 增量计算使用率
     let mut previous_cpu_sample = None;
     // 保存上一轮网卡累计计数，用于根据真实采样间隔计算速率。
@@ -137,24 +151,11 @@ pub fn run_monitor_loop_with<ConnFn>(
 ///
 /// 是 run_monitor_loop_with 的薄包装，生产代码使用此函数。
 pub fn run_monitor_loop(
-    host: HostConfig,
-    password: Option<String>,
-    passphrase: Option<String>,
-    session_id: String,
-    shutdown: Arc<AtomicBool>,
+    params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) {
-    run_monitor_loop_with(
-        ssh_transport::connect_exec,
-        host,
-        password,
-        passphrase,
-        session_id,
-        shutdown,
-        on_snapshot,
-        on_error,
-    )
+    run_monitor_loop_with(ssh_transport::connect_exec, params, on_snapshot, on_error)
 }
 
 /// 通过已建立的 SSH session 执行一次采集，返回 MonitorSnapshot
@@ -231,7 +232,7 @@ fn parse_snapshot_at(
     let current_cpu_sample = cpu_total.zip(cpu_idle);
     let cpu_usage = compute_cpu_usage(previous_cpu_sample, current_cpu_sample);
     let memory_usage = resolve_memory_usage(memory_total_kb, memory_available_kb);
-    let current_network_sample = network_available.then(|| NetworkSample {
+    let current_network_sample = network_available.then_some(NetworkSample {
         timestamp,
         interfaces: network_interfaces,
     });
@@ -339,7 +340,10 @@ fn rate_between(
 ///
 /// 首轮无基线样本或字段缺失时返回 None（未知，与网络首轮 null 语义一致）；
 /// 计数未增长视为真实空闲，返回 Some(0.0)。
-fn compute_cpu_usage(previous_sample: Option<CpuSample>, current_sample: Option<CpuSample>) -> Option<f64> {
+fn compute_cpu_usage(
+    previous_sample: Option<CpuSample>,
+    current_sample: Option<CpuSample>,
+) -> Option<f64> {
     let (previous_total, previous_idle) = previous_sample?;
     let (current_total, current_idle) = current_sample?;
 
@@ -454,7 +458,10 @@ mod tests {
     #[test]
     fn compute_cpu_usage_defaults_on_missing_or_invalid_delta() {
         assert_eq!(compute_cpu_usage(None, Some((160, 30))), None);
-        assert_eq!(compute_cpu_usage(Some((200, 50)), Some((200, 60))), Some(0.0));
+        assert_eq!(
+            compute_cpu_usage(Some((200, 50)), Some((200, 60))),
+            Some(0.0)
+        );
         assert_eq!(compute_cpu_usage(Some((200, 50)), None), None);
     }
 
@@ -471,7 +478,10 @@ mod tests {
             "CPU 累计应只含 $2..$9（guest 已计入 user），实际: {cpu_line}"
         );
         assert!(!cpu_line.contains("$10"), "CPU 累计不得包含 guest($10)");
-        assert!(!cpu_line.contains("$11"), "CPU 累计不得包含 guest_nice($11)");
+        assert!(
+            !cpu_line.contains("$11"),
+            "CPU 累计不得包含 guest_nice($11)"
+        );
     }
 
     /// 验证网络接口保留远端顺序、跳过 lo，并按真实采样间隔计算双向速率。
@@ -633,6 +643,17 @@ mod loop_tests {
         }
     }
 
+    /// 构造测试用监控循环参数
+    fn make_params(shutdown: Arc<AtomicBool>) -> MonitorLoopParams {
+        MonitorLoopParams {
+            host: make_host(),
+            password: Some("pw".to_string()),
+            passphrase: None,
+            session_id: "session-1".to_string(),
+            shutdown,
+        }
+    }
+
     /// 连接失败时 on_error 被调用，on_snapshot 不被调用
     #[test]
     fn connect_failure_calls_on_error_not_on_snapshot() {
@@ -651,11 +672,7 @@ mod loop_tests {
 
         run_monitor_loop_with(
             connect_fn,
-            make_host(),
-            Some("pw".to_string()),
-            None,
-            "session-1".to_string(),
-            shutdown,
+            make_params(shutdown),
             move |snap| {
                 snap_ref.lock().unwrap().push(snap);
             },
@@ -690,11 +707,7 @@ mod loop_tests {
 
         run_monitor_loop_with(
             connect_fn,
-            make_host(),
-            None,
-            None,
-            "session-1".to_string(),
-            shutdown,
+            make_params(shutdown),
             |_| {},
             move |err| {
                 err_ref.lock().unwrap().push(err.to_string());
@@ -723,11 +736,7 @@ mod loop_tests {
                     shutdown_for_transport,
                 ))
             },
-            make_host(),
-            Some("pw".to_string()),
-            None,
-            "session-1".to_string(),
-            shutdown,
+            make_params(shutdown),
             move |snapshot| snapshots_for_callback.lock().unwrap().push(snapshot),
             |_| panic!("采集成功时不应调用 on_error"),
         );
