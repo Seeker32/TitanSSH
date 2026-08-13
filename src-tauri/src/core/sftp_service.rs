@@ -165,6 +165,21 @@ impl SftpConnection {
         }
     }
 
+    /// 仅当当前 Ready 连接正是本次操作使用的 transport 时将其淘汰；
+    /// 已被其他操作重建的新连接不受影响，保证同一失效连接只触发一次重建。
+    fn invalidate_if_ready(&self, transport: &Arc<Mutex<SftpTransport>>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let ConnectionState::Ready(current) = &*state
+            && Arc::ptr_eq(current, transport)
+        {
+            *state = ConnectionState::Idle;
+        }
+        self.ready.notify_all();
+    }
+
     /// 关闭状态槽并丢弃任何迟到连接结果。
     fn close(&self) {
         *self
@@ -243,6 +258,8 @@ impl SftpService {
 
     /// 列举远程目录内容，按目录优先、名称排序
     ///
+    /// 操作发现 Ready 控制连接失效时自动淘汰并重连一次；第二次失败原样返回结构化错误。
+    ///
     /// # 参数
     /// - `session_id`: 关联的 SSH 会话 ID
     /// - `path`: 远程目录绝对路径
@@ -250,11 +267,8 @@ impl SftpService {
     /// # 返回
     /// 成功返回 RemoteEntry 列表，失败返回 AppError
     pub fn list_dir(&self, session_id: &str, path: &str) -> Result<Vec<RemoteEntry>, AppError> {
-        let transport = self.handle(session_id)?.connection.get()?;
-        let mut entries: Vec<RemoteEntry> = transport
-            .lock()
-            .map_err(|error| AppError::SftpChannelError(error.to_string()))?
-            .list_dir(path)?
+        let (entries, _transport) = self.run_control_op(session_id, |sftp| sftp.list_dir(path))?;
+        let mut entries: Vec<RemoteEntry> = entries
             .into_iter()
             .map(|entry| {
                 let name = Path::new(&entry.path)
@@ -279,6 +293,36 @@ impl SftpService {
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
 
         Ok(entries)
+    }
+
+    /// 持锁执行一次目录/元数据操作；操作错误为失效连接信号时淘汰旧连接并自动重连一次。
+    ///
+    /// # 参数
+    /// - `session_id`: 关联会话 ID
+    /// - `op`: 在控制连接上执行的操作（目录列举、远端文件大小查询等只读操作）
+    ///
+    /// # 返回
+    /// 成功返回 (操作结果, 本次操作实际使用的 transport)；失败返回结构化错误。
+    /// 域错误（路径不存在、权限拒绝）不触发重连；连接类错误只重试一次，
+    /// 第二次失败（含重连失败）原样返回，不无限重试。
+    fn run_control_op<T>(
+        &self,
+        session_id: &str,
+        op: impl Fn(&mut SftpTransport) -> Result<T, AppError>,
+    ) -> Result<(T, Arc<Mutex<SftpTransport>>), AppError> {
+        let handle = self.handle(session_id)?;
+        let transport = handle.connection.get()?;
+        match run_op_locked(&transport, &op) {
+            Ok(value) => Ok((value, transport)),
+            Err(error) if is_control_connection_failure(&error) => {
+                // 淘汰本次操作实际使用的失效连接并自动重连一次；第二次失败原样返回。
+                // 只淘汰该连接本身：并发操作可能已重建新连接，不得误淘汰健康连接。
+                handle.connection.invalidate_if_ready(&transport);
+                let transport = handle.connection.get()?;
+                run_op_locked(&transport, &op).map(|value| (value, transport))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// 发起下载任务，立即返回 status = Pending 的 TransferTask
@@ -313,11 +357,9 @@ impl SftpService {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| remote_path.clone());
 
-        let transport = handle.connection.get()?;
-        let total_bytes = transport
-            .lock()
-            .map_err(|error| AppError::SftpChannelError(error.to_string()))?
-            .file_size(&remote_path)?;
+        // 元数据操作复用控制连接：失效时淘汰并自动重连一次，第二次失败原样返回
+        let (total_bytes, transport) =
+            self.run_control_op(&session_id, |sftp| sftp.file_size(&remote_path))?;
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -714,6 +756,28 @@ fn is_terminal(status: &SftpTaskStatus) -> bool {
     )
 }
 
+/// 判断目录/元数据操作错误是否为失效控制连接信号，值得淘汰并自动重连一次。
+///
+/// 通道错误来自底层 ssh2 会话级失败（如连接已被服务端断开），连接错误为适配器
+/// 上报的连接类失败；域错误（路径不存在、权限拒绝等）说明连接本身健康，不触发重连。
+fn is_control_connection_failure(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::SftpChannelError(_) | AppError::SshConnectionError(_)
+    )
+}
+
+/// 持锁执行一次 SFTP 操作；锁中毒保持结构化通道错误语义，不触发重连。
+fn run_op_locked<T>(
+    transport: &Arc<Mutex<SftpTransport>>,
+    op: &impl Fn(&mut SftpTransport) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let mut sftp = transport
+        .lock()
+        .map_err(|error| AppError::SftpChannelError(error.to_string()))?;
+    op(&mut sftp)
+}
+
 /// 从 secure storage 读取运行时凭据并建立独立 SFTP transport。
 fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
     let (password, passphrase) = match host.auth_type {
@@ -928,8 +992,8 @@ fn format_permissions(perm: u32) -> String {
 mod tests {
     use super::*;
     use crate::core::ssh_transport::test_support::{
-        blocking_sftp, drop_signal_sftp, empty_sftp, failing_read_sftp, failing_write_sftp,
-        memory_sftp,
+        blocking_sftp, drop_signal_sftp, empty_sftp, failing_channel_sftp, failing_read_sftp,
+        failing_write_sftp, memory_sftp, path_not_found_sftp,
     };
     use crate::models::host::{AuthType, HostConfig};
     use std::sync::atomic::Ordering;
@@ -973,6 +1037,180 @@ mod tests {
         assert!(first.unwrap_err().to_string().contains("first failure"));
         assert!(second.is_ok());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // ─── 失效控制连接自动重连一次 contract ──────────────────────────────────
+
+    /// 目录操作发现 Ready 连接失效后淘汰旧连接并自动重连一次；重连成功返回结果。
+    #[test]
+    fn list_dir_evicts_stale_ready_connection_and_reconnects_once() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let service = SftpService::with_connector(move |_| {
+            if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(failing_channel_sftp())
+            } else {
+                Ok(empty_sftp())
+            }
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        assert!(
+            service.list_dir("session-1", "/").is_ok(),
+            "重连后的目录操作应成功"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "失效连接应恰好淘汰并重连一次"
+        );
+    }
+
+    /// 重连后的目录操作再次失败时返回第二次的结构化错误，且不进行无限重试。
+    #[test]
+    fn list_dir_second_failure_returns_structured_error_without_retry_loop() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let service = SftpService::with_connector(move |_| {
+            attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(failing_channel_sftp())
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let error = service.list_dir("session-1", "/").unwrap_err();
+        assert!(
+            matches!(&error, AppError::SftpChannelError(message) if message.contains("connection lost")),
+            "第二次失败应保留结构化通道错误，实际: {:?}",
+            error
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "第二次失败后不得无限重连"
+        );
+    }
+
+    /// 域错误（路径不存在）不触发淘汰重连，避免为健康连接支付重连成本。
+    #[test]
+    fn list_dir_domain_error_does_not_evict_connection() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let service = SftpService::with_connector(move |_| {
+            attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(path_not_found_sftp())
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let error = service.list_dir("session-1", "/ghost").unwrap_err();
+        assert!(
+            matches!(error, AppError::SftpPathNotFound(path) if path == "/ghost"),
+            "域错误应原样返回"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "域错误不得触发淘汰重连"
+        );
+    }
+
+    /// invalidate_if_ready 只淘汰本次操作实际使用的连接；其他操作刚重建的
+    /// 健康新连接不得被迟到旧操作的淘汰请求误杀（同一失效连接只允许一次重建）。
+    #[test]
+    fn invalidate_if_ready_only_evicts_the_given_transport() {
+        let connector: SftpConnector = Arc::new(|_| Ok(empty_sftp()));
+        let connection = Arc::new(SftpConnection::new(make_host(), connector));
+        connection.connect_eager();
+
+        let first = connection.get().unwrap();
+        // 旧操作使用的连接被淘汰后，其他操作已重建新连接
+        connection.invalidate_if_ready(&first);
+        let second = connection.get().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second), "淘汰后 get 应重建新连接");
+
+        // 迟到的旧操作失败只能淘汰它自己使用过的连接，不得误杀新连接
+        connection.invalidate_if_ready(&first);
+        let current = connection.get().unwrap();
+        assert!(
+            Arc::ptr_eq(&current, &second),
+            "新连接不得被旧操作的淘汰请求误杀"
+        );
+    }
+
+    /// 元数据操作（file_size）发现失效连接时同样淘汰并重连一次，传输随后正常完成。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enqueue_download_evicts_stale_connection_for_file_size() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let service = SftpService::with_connector(move |_| {
+            if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(failing_channel_sftp())
+            } else {
+                Ok(memory_sftp(vec![1u8, 2, 3]))
+            }
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-reconnect-{}.bin", Uuid::new_v4()));
+        let task = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .expect("重连后的元数据操作应成功入队");
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "file_size 失效连接应恰好淘汰并重连一次"
+        );
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done,
+            "重连后的传输应正常完成"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// file_size 重连后仍失败：enqueue_download 直接返回结构化错误，不无限重试。
+    #[test]
+    fn enqueue_download_second_file_size_failure_returns_structured_error() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let service = SftpService::with_connector(move |_| {
+            attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(failing_channel_sftp())
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-reconnect-fail-{}.bin", Uuid::new_v4()));
+        let error = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::SftpChannelError(message) if message.contains("connection lost")),
+            "第二次元数据失败应保留结构化通道错误，实际: {:?}",
+            error
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "第二次失败后不得无限重连"
+        );
     }
 
     /// 一个 Session 的慢目录读取不得持有其他 Session 所需的 registry 锁。

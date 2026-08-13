@@ -682,6 +682,66 @@ pub(crate) mod test_support {
         }
     }
 
+    /// 目录与元数据操作持续返回通道错误的 SFTP adapter，模拟已失效的控制连接。
+    struct FailingChannelSftp;
+
+    impl SftpOps for FailingChannelSftp {
+        /// 模拟失效连接：目录列举失败。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Err(AppError::SftpChannelError("connection lost".to_string()))
+        }
+
+        /// 模拟失效连接：元数据查询失败。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Err(AppError::SftpChannelError("connection lost".to_string()))
+        }
+
+        /// 本 adapter 不打开远端读文件。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 本 adapter 不创建远端文件。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 本 adapter 无需删除远端文件。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 目录列举返回域错误（路径不存在）的 SFTP adapter，连接本身健康。
+    struct PathNotFoundSftp;
+
+    impl SftpOps for PathNotFoundSftp {
+        /// 返回稳定的路径不存在域错误，供“域错误不触发重连”测试。
+        fn list_dir(&mut self, path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Err(AppError::SftpPathNotFound(path.to_string()))
+        }
+
+        /// 元数据查询返回同样的域错误。
+        fn file_size(&mut self, path: &str) -> Result<u64, AppError> {
+            Err(AppError::SftpPathNotFound(path.to_string()))
+        }
+
+        /// 本 adapter 不打开远端读文件。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 本 adapter 不创建远端文件。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 本 adapter 无需删除远端文件。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
     /// 远端读取在打开后失败的 SFTP adapter。
     struct FailingReadSftp;
 
@@ -759,6 +819,16 @@ pub(crate) mod test_support {
     /// 创建创建成功但写入失败的 SFTP 测试 capability，供运行时写入失败测试。
     pub(crate) fn failing_write_sftp() -> SftpTransport {
         SftpTransport::from_backend(FailingWriteSftp)
+    }
+
+    /// 创建目录/元数据操作持续返回通道错误的 SFTP 测试 capability，模拟失效控制连接。
+    pub(crate) fn failing_channel_sftp() -> SftpTransport {
+        SftpTransport::from_backend(FailingChannelSftp)
+    }
+
+    /// 创建目录/元数据操作返回路径不存在域错误的 SFTP 测试 capability。
+    pub(crate) fn path_not_found_sftp() -> SftpTransport {
+        SftpTransport::from_backend(PathNotFoundSftp)
     }
 
     /// 创建可控制阻塞时序的 SFTP 测试 capability。

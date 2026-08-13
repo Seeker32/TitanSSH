@@ -32,7 +32,7 @@ interface SftpState {
 function emptySessionState(): SftpSessionState {
   return {
     currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null, tasks: new Map(),
-    taskActionErrors: new Map(),
+    taskActionErrors: new Map(), dirRequestSeq: 0,
   };
 }
 
@@ -72,6 +72,25 @@ function recordStartError(
     : { ...state, error: appError });
 }
 
+/** 递增指定会话的目录请求序号并置 loading；返回本次请求序号。
+ *  Zustand 的 set 同步应用 updater，返回前序号已落库，后续异步结果据此判断新旧。 */
+function startDirRequest(
+  set: (updater: (state: SftpState) => Partial<SftpState>) => void,
+  sessionId: string,
+): number {
+  let requestSeq = 0;
+  set((state) => {
+    const current = state.sessionStates.get(sessionId) ?? emptySessionState();
+    requestSeq = current.dirRequestSeq + 1;
+    return {
+      sessionStates: new Map(state.sessionStates).set(sessionId, {
+        ...current, dirRequestSeq: requestSeq, loading: true, error: null,
+      }),
+    };
+  });
+  return requestSeq;
+}
+
 export const useSftpStore = create<SftpState>((set, get) => ({
   sessionStates: new Map(),
   pendingTaskEvents: new Map(),
@@ -90,20 +109,25 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     return created;
   },
 
-  /** 列举远程目录并更新当前路径、条目与错误状态。 */
+  /** 列举远程目录并更新当前路径、条目与错误状态。
+   *  同会话请求携带单调递增序号：只有最新请求可更新 entries、currentPath、error 与
+   *  loading，旧请求完成或失败不得让投影倒退或提前结束最新请求的加载。 */
   async listDir(sessionId, path) {
-    updateSession(set, sessionId, (state) => ({ ...state, loading: true, error: null }));
+    const requestSeq = startDirRequest(set, sessionId);
     try {
       const entries = await invoke<RemoteEntry[]>('sftp_list_dir', { sessionId, path });
-      updateSession(set, sessionId, (state) => ({
-        ...state, entries: Array.isArray(entries) ? entries : [], currentPath: path, selectedPaths: new Set(),
-      }));
+      updateSession(set, sessionId, (state) => {
+        if (state.dirRequestSeq !== requestSeq) return state; // 旧请求不得覆盖最新投影
+        return {
+          ...state, entries: Array.isArray(entries) ? entries : [], currentPath: path,
+          selectedPaths: new Set(), loading: false,
+        };
+      });
     } catch (error) {
-      updateSession(set, sessionId, (state) => ({
-        ...state, error: toAppError(error),
-      }));
-    } finally {
-      updateSession(set, sessionId, (state) => ({ ...state, loading: false }));
+      updateSession(set, sessionId, (state) => {
+        if (state.dirRequestSeq !== requestSeq) return state; // 旧请求失败不得结束最新 loading
+        return { ...state, error: toAppError(error), loading: false };
+      });
     }
   },
 

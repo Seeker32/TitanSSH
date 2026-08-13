@@ -57,5 +57,7 @@ export interface SftpSessionState {
   tasks: Map<string, TransferTask>;
   /** 任务行级操作错误（取消失败、重试失败）；键为 taskId，任务到达终态时清除 */
   taskActionErrors: Map<string, AppErrorInfo>;
+  /** 本会话最新目录请求序号（单调递增）；旧请求据此判定为过期，不得更新投影 */
+  dirRequestSeq: number;
 }
 import type { AppErrorInfo } from '@/i18n';

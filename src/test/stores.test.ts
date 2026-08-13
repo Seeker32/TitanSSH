@@ -8,6 +8,7 @@ import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { TaskStatus } from '@/types/monitor';
+import type { RemoteEntry } from '@/types/sftp';
 import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
@@ -396,11 +397,133 @@ describe('Zustand stores', () => {
     expect(useSftpStore.getState().getState('b')?.entries).toHaveLength(0);
   });
 
+  it('SFTP 同会话乱序目录响应仅最新请求可更新路径、条目、loading 与 error', async () => {
+    let resolveOld!: (entries: RemoteEntry[]) => void;
+    let resolveNew!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveNew = resolve; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 新请求先完成
+    resolveNew([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await newRequest;
+    // 旧请求后完成，不得让投影倒退
+    resolveOld([makeRemoteEntry({ name: 'old.txt', path: '/old/old.txt' })]);
+    await oldRequest;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.currentPath).toBe('/new');
+    expect(state?.entries).toEqual([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    expect(state?.loading).toBe(false);
+    expect(state?.error).toBeNull();
+  });
+
+  it('SFTP 旧目录请求失败不得结束最新请求的 loading 或写入错误', async () => {
+    let rejectOld!: (error: unknown) => void;
+    let resolveNew!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((_, reject) => { rejectOld = reject; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveNew = resolve; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 旧请求失败，最新请求仍挂起
+    rejectOld({ code: 'SftpPermissionDenied', detail: '/old' });
+    await oldRequest;
+
+    const pending = useSftpStore.getState().getState('session-1');
+    expect(pending?.loading).toBe(true);
+    expect(pending?.error).toBeNull();
+
+    resolveNew([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await newRequest;
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.loading).toBe(false);
+    expect(state?.error).toBeNull();
+    expect(state?.currentPath).toBe('/new');
+  });
+
+  it('SFTP 旧目录请求成功不得结束最新请求的 loading 或写入投影', async () => {
+    let resolveOld!: (entries: RemoteEntry[]) => void;
+    let resolveNew!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveNew = resolve; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 旧请求成功，最新请求仍挂起
+    resolveOld([makeRemoteEntry({ name: 'old.txt', path: '/old/old.txt' })]);
+    await oldRequest;
+
+    const pending = useSftpStore.getState().getState('session-1');
+    expect(pending?.loading).toBe(true);
+    expect(pending?.entries).toHaveLength(0);
+    expect(pending?.currentPath).toBe('/');
+
+    resolveNew([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await newRequest;
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.loading).toBe(false);
+    expect(state?.currentPath).toBe('/new');
+    expect(state?.entries.map((entry) => entry.name)).toEqual(['new.txt']);
+  });
+
+  it('SFTP 最新目录请求失败后旧请求成功不得倒退错误与路径', async () => {
+    let resolveOld!: (entries: RemoteEntry[]) => void;
+    let rejectNew!: (error: unknown) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((_, reject) => { rejectNew = reject; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 最新请求失败：错误按既有契约展示，路径停留在最后成功加载的位置
+    rejectNew({ code: 'SftpPathNotFound', detail: '/new' });
+    await newRequest;
+    // 旧请求成功后不得覆盖最新投影（错误、路径、条目均不得倒退）
+    resolveOld([makeRemoteEntry({ name: 'old.txt', path: '/old/old.txt' })]);
+    await oldRequest;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.currentPath).toBe('/');
+    expect(state?.error).toEqual({ code: 'SftpPathNotFound', detail: '/new' });
+    expect(state?.entries).toHaveLength(0);
+    expect(state?.loading).toBe(false);
+  });
+
+  it('SFTP 不同会话的目录请求序号互不影响', async () => {
+    let resolveAOld!: (entries: RemoteEntry[]) => void;
+    let resolveANew!: (entries: RemoteEntry[]) => void;
+    let resolveB!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveAOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveB = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveANew = resolve; }));
+
+    const aOld = useSftpStore.getState().listDir('a', '/a-old');
+    const b = useSftpStore.getState().listDir('b', '/b');
+    const aNew = useSftpStore.getState().listDir('a', '/a-new');
+    resolveB([makeRemoteEntry({ name: 'b.txt', path: '/b/b.txt' })]);
+    await b;
+    resolveANew([makeRemoteEntry({ name: 'a-new.txt', path: '/a-new/a-new.txt' })]);
+    await aNew;
+    resolveAOld([makeRemoteEntry({ name: 'a-old.txt', path: '/a-old/a-old.txt' })]);
+    await aOld;
+
+    expect(useSftpStore.getState().getState('a')?.currentPath).toBe('/a-new');
+    expect(useSftpStore.getState().getState('a')?.entries.map((entry) => entry.name)).toEqual(['a-new.txt']);
+    expect(useSftpStore.getState().getState('b')?.currentPath).toBe('/b');
+    expect(useSftpStore.getState().getState('b')?.entries.map((entry) => entry.name)).toEqual(['b.txt']);
+  });
+
   it('SFTP 进度、完成和失败事件更新对应任务', () => {
     const task = makeTransferTask();
     useSftpStore.setState({ sessionStates: new Map([['session-1', {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
-      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(),
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
     }]]) });
     useSftpStore.getState().applyProgress({ taskId: task.taskId, sessionId: 'session-1', transferredBytes: 20, totalBytes: 100, speedBps: 5 });
     expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.speedBps).toBe(5);
@@ -441,7 +564,7 @@ describe('Zustand stores', () => {
     const task = makeTransferTask({ status: 'Failed' });
     useSftpStore.setState({ sessionStates: new Map([['session-1', {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
-      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(),
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
     }]]) });
     mockInvoke.mockRejectedValueOnce({ code: 'SftpPermissionDenied', detail: '/var/log' });
     await expect(
@@ -460,6 +583,7 @@ describe('Zustand stores', () => {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
       tasks: new Map([[task.taskId, task]]),
       taskActionErrors: new Map([[task.taskId, { code: 'SftpPermissionDenied', detail: '/var/log' }]]),
+      dirRequestSeq: 0,
     }]]) });
     mockInvoke.mockResolvedValueOnce(makeTransferTask({ taskId: 'task-retry-2' }));
     await useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId);
@@ -472,7 +596,7 @@ describe('Zustand stores', () => {
     const task = makeTransferTask({ status: 'Running' });
     useSftpStore.setState({ sessionStates: new Map([['session-1', {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
-      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(),
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
     }]]) });
     mockInvoke.mockRejectedValueOnce({ code: 'SftpTaskNotFound', detail: task.taskId });
     await expect(
@@ -489,6 +613,7 @@ describe('Zustand stores', () => {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
       tasks: new Map([[task.taskId, task]]),
       taskActionErrors: new Map([[task.taskId, { code: 'SftpTaskNotFound', detail: task.taskId }]]),
+      dirRequestSeq: 0,
     }]]) });
     useSftpStore.getState().applyTaskStatus({
       taskId: task.taskId, sessionId: 'session-1', status: 'Cancelled', error: null,
