@@ -400,7 +400,7 @@ describe('Zustand stores', () => {
     const task = makeTransferTask();
     useSftpStore.setState({ sessionStates: new Map([['session-1', {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
-      tasks: new Map([[task.taskId, task]]),
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(),
     }]]) });
     useSftpStore.getState().applyProgress({ taskId: task.taskId, sessionId: 'session-1', transferredBytes: 20, totalBytes: 100, speedBps: 5 });
     expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.speedBps).toBe(5);
@@ -412,10 +412,88 @@ describe('Zustand stores', () => {
     mockInvoke.mockResolvedValue(undefined);
     useSftpStore.getState().toggleSelect('session-1', '/a');
     expect(useSftpStore.getState().getState('session-1')?.selectedPaths.has('/a')).toBe(true);
-    await useSftpStore.getState().cancelTask('task-1');
+    await useSftpStore.getState().cancelTask('task-1', 'session-1');
     expect(mockInvoke).toHaveBeenCalledWith('sftp_cancel_task', { taskId: 'task-1' });
     useSftpStore.getState().clearSession('session-1');
     expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
+  });
+
+  it('SFTP 下载 invoke 失败时错误写入文件浏览器错误区且不抛出未处理异常', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpPathNotFound', detail: '/var/log/missing' });
+    await expect(
+      useSftpStore.getState().download('session-1', '/var/log/missing', '/tmp/missing'),
+    ).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error).toEqual({
+      code: 'SftpPathNotFound', detail: '/var/log/missing',
+    });
+    expect(useSftpStore.getState().getState('session-1')?.tasks.size).toBe(0);
+  });
+
+  it('SFTP 上传 invoke 失败时错误写入文件浏览器错误区', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpTransferError', detail: '本地文件不存在' });
+    await expect(
+      useSftpStore.getState().upload('session-1', '/tmp/ghost', '/var/log'),
+    ).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error?.code).toBe('SftpTransferError');
+  });
+
+  it('SFTP 重试 invoke 失败时仅在原任务行记录 actionError，不写入文件浏览器错误区', async () => {
+    const task = makeTransferTask({ status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(),
+    }]]) });
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpPermissionDenied', detail: '/var/log' });
+    await expect(
+      useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId),
+    ).resolves.toBeUndefined();
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.get(task.taskId)).toEqual({
+      code: 'SftpPermissionDenied', detail: '/var/log',
+    });
+    expect(state?.error).toBeNull();
+  });
+
+  it('SFTP 重试 invoke 成功时清除原任务行的 actionError', async () => {
+    const task = makeTransferTask({ status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpPermissionDenied', detail: '/var/log' }]]),
+    }]]) });
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ taskId: 'task-retry-2' }));
+    await useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId);
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.has(task.taskId)).toBe(false);
+    expect(state?.tasks.has('task-retry-2')).toBe(true);
+  });
+
+  it('SFTP 取消 invoke 失败时在对应任务行记录 actionError', async () => {
+    const task = makeTransferTask({ status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(),
+    }]]) });
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpTaskNotFound', detail: task.taskId });
+    await expect(
+      useSftpStore.getState().cancelTask(task.taskId, 'session-1'),
+    ).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.taskActionErrors.get(task.taskId)).toEqual({
+      code: 'SftpTaskNotFound', detail: task.taskId,
+    });
+  });
+
+  it('SFTP 任务到达终态时清除对应任务行的 actionError', () => {
+    const task = makeTransferTask({ status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpTaskNotFound', detail: task.taskId }]]),
+    }]]) });
+    useSftpStore.getState().applyTaskStatus({
+      taskId: task.taskId, sessionId: 'session-1', status: 'Cancelled', error: null,
+    });
+    expect(useSftpStore.getState().getState('session-1')?.taskActionErrors.has(task.taskId)).toBe(false);
   });
 
   it('监控任务事件先于 invoke 返回时补投最新状态，终态不丢失', async () => {

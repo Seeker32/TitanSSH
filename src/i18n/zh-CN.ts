@@ -137,6 +137,11 @@ export const zhCN = {
   'error.SftpPermissionDenied': 'SFTP 权限拒绝',
   'error.SftpPathNotFound': 'SFTP 路径不存在',
   'error.SftpTransferError': 'SFTP 传输错误',
+  'error.SftpOpenError': 'SFTP 打开失败',
+  'error.SftpReadError': 'SFTP 读取失败',
+  'error.SftpWriteError': 'SFTP 写入失败',
+  'error.SftpCreateError': 'SFTP 创建失败',
+  'error.SftpTaskNotFound': 'SFTP 任务不存在',
   'error.MonitorError': '监控错误',
   'error.Unknown': '未知错误',
 } as const;

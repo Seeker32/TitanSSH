@@ -57,7 +57,7 @@ pub fn sftp_upload(
         .map_err(AppErrorInfo::from)
 }
 
-/// 取消指定传输任务；若任务已为终态则静默成功
+/// 取消指定传输任务；任务不存在时拒绝并返回结构化错误，已终态任务静默成功
 ///
 /// # 参数
 /// - `task_id`: 要取消的任务 ID（全局唯一 UUID）
@@ -66,6 +66,7 @@ pub fn sftp_cancel_task(
     task_id: String,
     sftp_service: State<'_, SftpService>,
 ) -> Result<(), AppErrorInfo> {
-    sftp_service.cancel_task(&task_id);
-    Ok(())
+    sftp_service
+        .cancel_task(&task_id)
+        .map_err(AppErrorInfo::from)
 }

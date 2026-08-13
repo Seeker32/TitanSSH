@@ -66,6 +66,26 @@ pub enum AppError {
     /// 传输中断（含传输中通道断开）
     #[error("SFTP 传输错误: {0}")]
     SftpTransferError(String),
+
+    /// 本地文件打开失败（上传读取源）
+    #[error("SFTP 打开失败: {0}")]
+    SftpOpenError(String),
+
+    /// 传输读取失败（远端读取或本地读取）
+    #[error("SFTP 读取失败: {0}")]
+    SftpReadError(String),
+
+    /// 传输写入失败（远端写入或本地写入）
+    #[error("SFTP 写入失败: {0}")]
+    SftpWriteError(String),
+
+    /// 目标文件创建失败（本地或远端）
+    #[error("SFTP 创建失败: {0}")]
+    SftpCreateError(String),
+
+    /// 取消目标任务不存在（未入队或已从 registry 移除）
+    #[error("SFTP 任务不存在: {0}")]
+    SftpTaskNotFound(String),
 }
 
 impl AppError {
@@ -85,6 +105,11 @@ impl AppError {
             Self::SftpPermissionDenied(_) => "SftpPermissionDenied",
             Self::SftpPathNotFound(_) => "SftpPathNotFound",
             Self::SftpTransferError(_) => "SftpTransferError",
+            Self::SftpOpenError(_) => "SftpOpenError",
+            Self::SftpReadError(_) => "SftpReadError",
+            Self::SftpWriteError(_) => "SftpWriteError",
+            Self::SftpCreateError(_) => "SftpCreateError",
+            Self::SftpTaskNotFound(_) => "SftpTaskNotFound",
         }
     }
 }
@@ -105,7 +130,12 @@ impl From<AppError> for AppErrorInfo {
             | AppError::SftpChannelError(detail)
             | AppError::SftpPermissionDenied(detail)
             | AppError::SftpPathNotFound(detail)
-            | AppError::SftpTransferError(detail) => detail,
+            | AppError::SftpTransferError(detail)
+            | AppError::SftpOpenError(detail)
+            | AppError::SftpReadError(detail)
+            | AppError::SftpWriteError(detail)
+            | AppError::SftpCreateError(detail)
+            | AppError::SftpTaskNotFound(detail) => detail,
             AppError::IoError(detail) => detail.to_string(),
         };
         Self {

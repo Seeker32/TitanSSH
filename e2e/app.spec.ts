@@ -12,7 +12,10 @@ test.beforeEach(async ({ page }) => {
     let hostsStore = [host, groupedHost];
     const session = { sessionId: 'session-1', hostId: 'host-1', host: '10.0.0.8', port: 22, username: 'root', status: 'Connecting', createdAt: Date.now() };
     const task = { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: 'Pending', createdAt: Date.now() };
-    const transfer = { taskId: 'transfer-1', sessionId: 'session-1', transferType: 'Download', remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'syslog', totalBytes: 100, transferredBytes: 0, speedBps: 0, status: 'Pending', errorMessage: null, createdAt: Date.now() };
+    // 与正式 typed event contract（src/types/sftp.ts TransferTask）一致：结构化 error 字段
+    const transfer = { taskId: 'transfer-1', sessionId: 'session-1', transferType: 'Download', remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'syslog', totalBytes: 100, transferredBytes: 0, speedBps: 0, status: 'Pending', error: null, createdAt: Date.now() };
+    // 待消费的失败注入队列：按 command 匹配，命中则让 invoke 以结构化错误拒绝
+    const failQueue: Array<{ command: string; error: { code: string; detail?: string } }> = [];
     const internals = {
       /** 注册 Tauri 回调并返回数字句柄。 */
       transformCallback(callback?: (event: unknown) => void) {
@@ -25,6 +28,11 @@ test.beforeEach(async ({ page }) => {
       /** 模拟应用使用的 Tauri command 与插件调用。 */
       async invoke(command: string, args: Record<string, unknown> = {}) {
         calls.push({ command, args });
+        const failIndex = failQueue.findIndex((entry) => entry.command === command);
+        if (failIndex >= 0) {
+          const { error } = failQueue.splice(failIndex, 1)[0];
+          throw error;
+        }
         if (command === 'plugin:event|listen') {
           const id = ++listenerId;
           const set = listeners.get(String(args.event)) ?? new Set<number>();
@@ -65,6 +73,10 @@ test.beforeEach(async ({ page }) => {
         /** 向所有已注册监听器派发结构化 Tauri 事件。 */
         emit(name: string, payload: unknown) {
           listeners.get(name)?.forEach((id) => callbacks.get(id)?.({ event: name, id, payload }));
+        },
+        /** 让下一次匹配 command 的 invoke 以结构化错误拒绝（与后端 AppErrorInfo 契约一致）。 */
+        failNext(command: string, error: { code: string; detail?: string }) {
+          failQueue.push({ command, error });
         },
       },
     });
@@ -241,10 +253,56 @@ test('失败状态可见且传输任务可以重试', async ({ page }) => {
   await emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null });
   await page.getByText('syslog').click();
   await page.getByRole('button', { name: '下载' }).click();
-  await emit('sftp:task_status', { taskId: 'transfer-1', sessionId: 'session-1', status: 'Failed', errorMessage: 'network' });
+  // 与正式 typed event contract 一致：结构化 error 字段
+  await emit('sftp:task_status', { taskId: 'transfer-1', sessionId: 'session-1', status: 'Failed', error: { code: 'SftpTransferError', detail: 'network' } });
   await page.getByTestId('tab-queue').click();
   await expect(page.getByText('network')).toBeVisible();
   await page.getByTestId('retry-btn').click();
   const count = await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string }> } }).__TAURI_TEST__.calls.filter((call) => call.command === 'sftp_download').length);
   expect(count).toBe(2);
+});
+
+test('下载启动失败显示在文件浏览器错误区且不产生未处理异常', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null }));
+  await page.getByText('syslog').click();
+  // 下一次 sftp_download invoke 以结构化错误拒绝
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { failNext: (command: string, error: unknown) => void } }).__TAURI_TEST__.failNext('sftp_download', { code: 'SftpPathNotFound', detail: '/syslog' }));
+  await page.getByRole('button', { name: '下载' }).click();
+  await expect(page.locator('.state-msg--error')).toHaveText(/SFTP 路径不存在: \/syslog/);
+  await page.getByTestId('tab-queue').click();
+  await expect(page.getByText('暂无传输任务')).toBeVisible();
+});
+
+test('取消 invoke 失败显示在对应任务行', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null }));
+  await page.getByText('syslog').click();
+  await page.getByRole('button', { name: '下载' }).click();
+  await page.getByTestId('tab-queue').click();
+  await expect(page.getByText('等待中')).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { failNext: (command: string, error: unknown) => void } }).__TAURI_TEST__.failNext('sftp_cancel_task', { code: 'SftpTaskNotFound', detail: 'transfer-1' }));
+  await page.getByTestId('cancel-btn').click();
+  await expect(page.getByTestId('task-action-error')).toHaveText(/SFTP 任务不存在: transfer-1/);
+});
+
+test('重试 invoke 失败仅显示在原任务行，不写入文件浏览器错误区', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const emit = (name: string, payload: unknown) => page.evaluate(([eventName, eventPayload]) => {
+    (window as unknown as { __TAURI_TEST__: { emit: (event: string, value: unknown) => void } }).__TAURI_TEST__.emit(eventName as string, eventPayload);
+  }, [name, payload] as const);
+  await emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null });
+  await page.getByText('syslog').click();
+  await page.getByRole('button', { name: '下载' }).click();
+  await emit('sftp:task_status', { taskId: 'transfer-1', sessionId: 'session-1', status: 'Failed', error: { code: 'SftpTransferError', detail: 'network' } });
+  await page.getByTestId('tab-queue').click();
+  await expect(page.getByText('network')).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { failNext: (command: string, error: unknown) => void } }).__TAURI_TEST__.failNext('sftp_download', { code: 'SftpPermissionDenied', detail: '/var/log' }));
+  await page.getByTestId('retry-btn').click();
+  await expect(page.getByTestId('task-action-error')).toHaveText(/SFTP 权限拒绝: \/var\/log/);
+  await page.getByTestId('tab-explorer').click();
+  await expect(page.locator('.state-msg--error')).toHaveCount(0);
 });

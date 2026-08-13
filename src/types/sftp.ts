@@ -52,7 +52,10 @@ export interface SftpSessionState {
   entries: RemoteEntry[];
   selectedPaths: Set<string>;
   loading: boolean;
+  /** 文件浏览器级错误（目录列举、上传/下载/重试 invoke 拒绝） */
   error: AppErrorInfo | null;
   tasks: Map<string, TransferTask>;
+  /** 任务行级操作错误（取消失败、重试失败）；键为 taskId，任务到达终态时清除 */
+  taskActionErrors: Map<string, AppErrorInfo>;
 }
 import type { AppErrorInfo } from '@/i18n';

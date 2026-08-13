@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
-import { toAppError } from '@/i18n';
+import { toAppError, type AppErrorInfo } from '@/i18n';
 import type {
   RemoteEntry,
   SftpProgressEvent,
@@ -17,9 +17,9 @@ interface SftpState {
   getState: (sessionId: string) => SftpSessionState | undefined;
   ensureState: (sessionId: string) => SftpSessionState;
   listDir: (sessionId: string, path: string) => Promise<void>;
-  download: (sessionId: string, remotePath: string, localPath: string) => Promise<void>;
-  upload: (sessionId: string, localPath: string, remotePath: string) => Promise<void>;
-  cancelTask: (taskId: string) => Promise<void>;
+  download: (sessionId: string, remotePath: string, localPath: string, parentTaskId?: string) => Promise<void>;
+  upload: (sessionId: string, localPath: string, remotePath: string, parentTaskId?: string) => Promise<void>;
+  cancelTask: (taskId: string, sessionId: string) => Promise<void>;
   toggleSelect: (sessionId: string, path: string) => void;
   clearSession: (sessionId: string) => void;
   applyProgress: (event: SftpProgressEvent) => void;
@@ -32,6 +32,7 @@ interface SftpState {
 function emptySessionState(): SftpSessionState {
   return {
     currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null, tasks: new Map(),
+    taskActionErrors: new Map(),
   };
 }
 
@@ -45,6 +46,30 @@ function updateSession(
     const current = state.sessionStates.get(sessionId) ?? emptySessionState();
     return { sessionStates: new Map(state.sessionStates).set(sessionId, update(current)) };
   });
+}
+
+/** 清除指定任务的操作错误；无 taskId 或不存在时原样返回。 */
+function clearActionError(
+  taskActionErrors: Map<string, AppErrorInfo>,
+  taskId: string | undefined,
+): Map<string, AppErrorInfo> {
+  if (!taskId || !taskActionErrors.has(taskId)) return taskActionErrors;
+  const next = new Map(taskActionErrors);
+  next.delete(taskId);
+  return next;
+}
+
+/** 记录传输启动 invoke 拒绝：重试场景写原任务行 actionError，否则写文件浏览器错误区。 */
+function recordStartError(
+  set: (updater: (state: SftpState) => Partial<SftpState>) => void,
+  sessionId: string,
+  parentTaskId: string | undefined,
+  error: unknown,
+) {
+  const appError = toAppError(error);
+  updateSession(set, sessionId, (state) => parentTaskId
+    ? { ...state, taskActionErrors: new Map(state.taskActionErrors).set(parentTaskId, appError) }
+    : { ...state, error: appError });
 }
 
 export const useSftpStore = create<SftpState>((set, get) => ({
@@ -82,23 +107,51 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     }
   },
 
-  /** 发起下载任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。 */
-  async download(sessionId, remotePath, localPath) {
-    const task = await invoke<TransferTask>('sftp_download', { sessionId, remotePath, localPath });
-    updateSession(set, sessionId, (state) => ({ ...state, tasks: new Map(state.tasks).set(task.taskId, task) }));
-    get().applyBufferedTaskStatus(task.taskId);
+  /** 发起下载任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。
+   *  invoke 拒绝（启动失败）不向外抛出：重试场景（parentTaskId）只在原任务行
+   *  标注 actionError，否则写入文件浏览器错误区；成功后清除原任务行的旧操作错误。 */
+  async download(sessionId, remotePath, localPath, parentTaskId) {
+    try {
+      const task = await invoke<TransferTask>('sftp_download', { sessionId, remotePath, localPath });
+      updateSession(set, sessionId, (state) => ({
+        ...state,
+        tasks: new Map(state.tasks).set(task.taskId, task),
+        taskActionErrors: clearActionError(state.taskActionErrors, parentTaskId),
+      }));
+      get().applyBufferedTaskStatus(task.taskId);
+    } catch (error) {
+      recordStartError(set, sessionId, parentTaskId, error);
+    }
   },
 
-  /** 发起上传任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。 */
-  async upload(sessionId, localPath, remotePath) {
-    const task = await invoke<TransferTask>('sftp_upload', { sessionId, localPath, remotePath });
-    updateSession(set, sessionId, (state) => ({ ...state, tasks: new Map(state.tasks).set(task.taskId, task) }));
-    get().applyBufferedTaskStatus(task.taskId);
+  /** 发起上传任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。
+   *  invoke 拒绝（启动失败）不向外抛出：重试场景（parentTaskId）只在原任务行
+   *  标注 actionError，否则写入文件浏览器错误区；成功后清除原任务行的旧操作错误。 */
+  async upload(sessionId, localPath, remotePath, parentTaskId) {
+    try {
+      const task = await invoke<TransferTask>('sftp_upload', { sessionId, localPath, remotePath });
+      updateSession(set, sessionId, (state) => ({
+        ...state,
+        tasks: new Map(state.tasks).set(task.taskId, task),
+        taskActionErrors: clearActionError(state.taskActionErrors, parentTaskId),
+      }));
+      get().applyBufferedTaskStatus(task.taskId);
+    } catch (error) {
+      recordStartError(set, sessionId, parentTaskId, error);
+    }
   },
 
-  /** 取消指定传输任务。 */
-  async cancelTask(taskId) {
-    await invoke('sftp_cancel_task', { taskId });
+  /** 取消指定传输任务；invoke 拒绝（取消失败）在对应任务行标注 actionError。 */
+  async cancelTask(taskId, sessionId) {
+    try {
+      await invoke('sftp_cancel_task', { taskId });
+    } catch (error) {
+      const appError = toAppError(error);
+      updateSession(set, sessionId, (state) => ({
+        ...state,
+        taskActionErrors: new Map(state.taskActionErrors).set(taskId, appError),
+      }));
+    }
   },
 
   /** 切换指定远程路径的选中状态。 */
@@ -136,7 +189,8 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     }));
   },
 
-  /** 应用传输任务终态；完成时强制进度为总大小。未知任务缓存最新事件。 */
+  /** 应用传输任务终态；完成时强制进度为总大小。未知任务缓存最新事件。
+   *  任务到达终态时同步清除对应任务行的 actionError（取消失败等操作错误已失去意义）。 */
   applyTaskStatus(event) {
     const state = get().sessionStates.get(event.sessionId);
     const task = state?.tasks.get(event.taskId);
@@ -146,15 +200,25 @@ export const useSftpStore = create<SftpState>((set, get) => ({
       }));
       return;
     }
-    updateSession(set, event.sessionId, (current) => ({
-      ...current,
-      tasks: new Map(current.tasks).set(event.taskId, {
-        ...task,
-        status: event.status,
-        error: event.error,
-        transferredBytes: event.status === 'Done' ? task.totalBytes : task.transferredBytes,
-      }),
-    }));
+    updateSession(set, event.sessionId, (current) => {
+      const taskActionErrors = ['Done', 'Failed', 'Cancelled'].includes(event.status)
+        ? (() => {
+            const next = new Map(current.taskActionErrors);
+            next.delete(event.taskId);
+            return next;
+          })()
+        : current.taskActionErrors;
+      return {
+        ...current,
+        tasks: new Map(current.tasks).set(event.taskId, {
+          ...task,
+          status: event.status,
+          error: event.error,
+          transferredBytes: event.status === 'Done' ? task.totalBytes : task.transferredBytes,
+        }),
+        taskActionErrors,
+      };
+    });
   },
 
   /** 任务元数据到达后补投缓存的状态事件；事件不再落回缓存。 */

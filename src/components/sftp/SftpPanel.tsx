@@ -76,6 +76,7 @@ export default function SftpPanel(props: Props) {
         onSelect={(path) => props.onSelect(props.sessionId, path)}
         onUpload={() => props.onUpload(props.sessionId, props.state!.currentPath)}
         onDownload={(paths) => props.onDownload(props.sessionId, paths)} />
-        : <TransferQueue tasks={props.state.tasks} onCancel={props.onCancel} onRetry={props.onRetry} />}
+        : <TransferQueue tasks={props.state.tasks} actionErrors={props.state.taskActionErrors}
+          onCancel={props.onCancel} onRetry={props.onRetry} />}
   </div>;
 }

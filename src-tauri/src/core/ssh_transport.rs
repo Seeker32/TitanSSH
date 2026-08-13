@@ -632,9 +632,133 @@ pub(crate) mod test_support {
         }
     }
 
+    /// 首读即失败的远端读句柄，供运行时读取失败测试。
+    struct FailingReadFile;
+
+    impl std::io::Read for FailingReadFile {
+        /// 每次读取都返回连接重置错误。
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "remote read reset",
+            ))
+        }
+    }
+
+    impl std::io::Write for FailingReadFile {
+        /// 本句柄不写入。
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        /// 本句柄不刷新。
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 首次写入即失败的远端写句柄，供运行时写入失败测试。
+    struct FailingWriteFile;
+
+    impl std::io::Read for FailingWriteFile {
+        /// 本句柄不产生输入。
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl std::io::Write for FailingWriteFile {
+        /// 每次写入都返回连接重置错误。
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "remote write reset",
+            ))
+        }
+
+        /// 本句柄不刷新。
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 远端读取在打开后失败的 SFTP adapter。
+    struct FailingReadSftp;
+
+    impl SftpOps for FailingReadSftp {
+        /// 返回空目录。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Ok(Vec::new())
+        }
+
+        /// 返回非零大小使下载 worker 进入读取循环。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Ok(64)
+        }
+
+        /// 打开成功，但读取立即失败。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(FailingReadFile),
+            })
+        }
+
+        /// 本 adapter 不创建远端文件。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 删除操作直接成功。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 远端写入在创建后失败的 SFTP adapter。
+    struct FailingWriteSftp;
+
+    impl SftpOps for FailingWriteSftp {
+        /// 返回空目录。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Ok(Vec::new())
+        }
+
+        /// 返回零长度。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Ok(0)
+        }
+
+        /// 本 adapter 不打开远端读文件。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 创建成功，但写入立即失败。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(FailingWriteFile),
+            })
+        }
+
+        /// 删除操作直接成功。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
     /// 创建返回空目录的 SFTP 测试 capability。
     pub(crate) fn empty_sftp() -> SftpTransport {
         SftpTransport::from_backend(EmptySftp)
+    }
+
+    /// 创建打开成功但读取失败的 SFTP 测试 capability，供运行时读取失败测试。
+    pub(crate) fn failing_read_sftp() -> SftpTransport {
+        SftpTransport::from_backend(FailingReadSftp)
+    }
+
+    /// 创建创建成功但写入失败的 SFTP 测试 capability，供运行时写入失败测试。
+    pub(crate) fn failing_write_sftp() -> SftpTransport {
+        SftpTransport::from_backend(FailingWriteSftp)
     }
 
     /// 创建可控制阻塞时序的 SFTP 测试 capability。

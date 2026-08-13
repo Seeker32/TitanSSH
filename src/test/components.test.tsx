@@ -160,13 +160,13 @@ describe('React components', () => {
   });
 
   it('文件行与传输队列使用 lucide 图标而非 emoji', () => {
-    const state = { currentPath: '/', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map() };
     const { container } = render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
     const rows = container.querySelectorAll('.file-row');
     expect(rows[0].querySelector('svg')).not.toBeNull();
     expect(rows[1].querySelector('svg')).not.toBeNull();
     const tasks = new Map([[makeTransferTask().taskId, makeTransferTask()]]);
-    render(<TransferQueue tasks={tasks} onCancel={vi.fn()} onRetry={vi.fn()} />);
+    render(<TransferQueue tasks={tasks} actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} />);
     expect(container.querySelectorAll('svg').length).toBeGreaterThan(0);
     expect(screen.queryByText('📁')).not.toBeInTheDocument();
     expect(screen.queryByText('⬇')).not.toBeInTheDocument();
@@ -266,7 +266,7 @@ describe('React components', () => {
     const navigate = vi.fn();
     const select = vi.fn();
     const download = vi.fn();
-    const state = { currentPath: '/var/log', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/var/log', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map() };
     render(<FileExplorer state={state} onNavigate={navigate} onSelect={select} onUpload={vi.fn()} onDownload={download} />);
     expect(screen.getAllByTestId('file-row')[0]).toHaveTextContent('nginx');
     await user.click(screen.getByText('syslog'));
@@ -280,7 +280,7 @@ describe('React components', () => {
   it('文件浏览器刷新当前目录', async () => {
     const user = userEvent.setup();
     const navigate = vi.fn();
-    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map() };
     render(<FileExplorer state={state} onNavigate={navigate} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
 
     await user.click(screen.getByRole('button', { name: '刷新' }));
@@ -289,7 +289,7 @@ describe('React components', () => {
   });
 
   it('文件浏览器加载目录时禁用刷新', () => {
-    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map() };
+    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map(), taskActionErrors: new Map() };
     render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
 
     expect(screen.getByRole('button', { name: '刷新' })).toBeDisabled();
@@ -298,7 +298,7 @@ describe('React components', () => {
   it('文件浏览器右键文件可下载该文件', async () => {
     const user = userEvent.setup();
     const download = vi.fn();
-    const state = { currentPath: '/var/log', entries: [makeRemoteEntry()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/var/log', entries: [makeRemoteEntry()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map() };
     render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={download} />);
 
     fireEvent.contextMenu(screen.getByText('syslog'));
@@ -310,7 +310,7 @@ describe('React components', () => {
   it('文件浏览器右键空白区域可刷新当前目录', async () => {
     const user = userEvent.setup();
     const navigate = vi.fn();
-    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map() };
     const { container } = render(<FileExplorer state={state} onNavigate={navigate} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
 
     fireEvent.contextMenu(container.querySelector('.file-explorer')!);
@@ -321,7 +321,7 @@ describe('React components', () => {
 
   it('文件浏览器显示 loading、error 与空目录状态', () => {
     const props = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn() };
-    const base = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map() };
+    const base = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map(), taskActionErrors: new Map() };
     const { rerender } = render(<FileExplorer state={base} {...props} />);
     expect(screen.getByText('加载中...')).toBeInTheDocument();
     rerender(<FileExplorer state={{ ...base, loading: false, error: { code: 'Unknown', detail: 'denied' } }} {...props} />);
@@ -336,7 +336,7 @@ describe('React components', () => {
     const retry = vi.fn();
     const running = makeTransferTask({ transferredBytes: 25600, speedBps: 1024, status: 'Running' });
     const failed = makeTransferTask({ taskId: 'task-2', status: 'Failed', error: { code: 'SftpTransferError', detail: 'network' } });
-    render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} onCancel={cancel} onRetry={retry} />);
+    render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} actionErrors={new Map()} onCancel={cancel} onRetry={retry} />);
     expect(screen.getByText('50%')).toBeInTheDocument();
     expect(screen.getByText(/network/)).toBeInTheDocument();
     await user.click(screen.getByTestId('cancel-btn'));
@@ -345,12 +345,20 @@ describe('React components', () => {
     expect(retry).toHaveBeenCalledWith(failed);
   });
 
+  it('任务行渲染取消/重试操作失败的结构化错误', () => {
+    const task = makeTransferTask({ status: 'Running' });
+    const actionErrors = new Map([[task.taskId, { code: 'SftpTaskNotFound', detail: task.taskId }]]);
+    render(<TransferQueue tasks={new Map([[task.taskId, task]])} actionErrors={actionErrors} onCancel={vi.fn()} onRetry={vi.fn()} />);
+    expect(screen.getByTestId('task-action-error')).toHaveTextContent('SFTP 任务不存在');
+    expect(screen.getByTestId('task-action-error')).toHaveTextContent(task.taskId);
+  });
+
   it('SFTP 面板在浏览器和队列间切换并保留占位', async () => {
     const user = userEvent.setup();
     const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn() };
     const { rerender } = render(<SftpPanel sessionId="session-1" state={null} {...handlers} />);
     expect(screen.getByText('请选择会话')).toBeInTheDocument();
-    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map() };
     rerender(<SftpPanel sessionId="session-1" state={state} {...handlers} />);
     await user.click(screen.getByTestId('tab-queue'));
     expect(screen.getByText('暂无传输任务')).toBeInTheDocument();

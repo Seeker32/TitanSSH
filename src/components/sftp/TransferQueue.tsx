@@ -1,10 +1,13 @@
 import { Download, RotateCcw, Upload, X } from 'lucide-react';
+import type { AppErrorInfo } from '@/i18n';
 import type { SftpTaskStatus, TransferTask } from '@/types/sftp';
 import { formatAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 
 interface Props {
   tasks: Map<string, TransferTask>;
+  /** 任务行级操作错误（取消/重试 invoke 拒绝）；键为 taskId */
+  actionErrors: Map<string, AppErrorInfo>;
   onCancel: (taskId: string) => void;
   onRetry: (task: TransferTask) => void;
 }
@@ -28,12 +31,13 @@ function taskStatusLabel(status: SftpTaskStatus, locale: ReturnType<typeof useLo
 }
 
 /** 渲染当前会话的传输任务列表。 */
-export default function TransferQueue({ tasks, onCancel, onRetry }: Props) {
+export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   if (tasks.size === 0) return <div className="empty-msg">{translate(locale, 'sftp.noTasks')}</div>;
   return <div className="transfer-queue">{[...tasks.values()].map((task) => {
     const active = task.status === 'Pending' || task.status === 'Running';
     const percent = progressPct(task);
+    const actionError = actionErrors.get(task.taskId);
     return <div key={task.taskId} className="task-item">
       <div className="task-top">
         <span className="task-direction">{task.transferType === 'Download' ? <Download size={13} /> : <Upload size={13} />}</span>
@@ -49,6 +53,7 @@ export default function TransferQueue({ tasks, onCancel, onRetry }: Props) {
       </div>
       <div className="task-meta"><span>{formatSpeed(task.speedBps)}</span><span>{percent}%</span></div>
       {task.status === 'Failed' && task.error && <div className="task-error">{formatAppError(locale, task.error)}</div>}
+      {actionError && <div data-testid="task-action-error" className="task-error">{formatAppError(locale, actionError)}</div>}
     </div>;
   })}</div>;
 }

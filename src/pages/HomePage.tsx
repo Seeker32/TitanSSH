@@ -146,12 +146,12 @@ export default function HomePage() {
     if (typeof localPath === 'string') await useSftpStore.getState().upload(sessionId, localPath, remotePath);
   }
 
-  /** 根据原任务方向重新发起传输。 */
+  /** 根据原任务方向重新发起传输；失败在原任务行与文件浏览器错误区可见。 */
   async function retry(task: TransferTask) {
     if (task.transferType === 'Download') {
-      await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath);
+      await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId);
     } else {
-      await useSftpStore.getState().upload(task.sessionId, task.localPath, task.remotePath);
+      await useSftpStore.getState().upload(task.sessionId, task.localPath, task.remotePath, task.taskId);
     }
   }
 
@@ -202,7 +202,7 @@ export default function HomePage() {
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
-          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId)} onRetry={retry} />}
+          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry} />}
       </div>
     </section>
     <HostEditorDialog open={editorOpen} editingHost={editingHost} groups={useMemo(

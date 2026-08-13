@@ -139,6 +139,11 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.SftpPermissionDenied': 'SFTP permission denied',
   'error.SftpPathNotFound': 'SFTP path not found',
   'error.SftpTransferError': 'SFTP transfer error',
+  'error.SftpOpenError': 'SFTP open failed',
+  'error.SftpReadError': 'SFTP read failed',
+  'error.SftpWriteError': 'SFTP write failed',
+  'error.SftpCreateError': 'SFTP create failed',
+  'error.SftpTaskNotFound': 'SFTP task not found',
   'error.MonitorError': 'Monitor error',
   'error.Unknown': 'Unknown error',
 };

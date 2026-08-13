@@ -441,11 +441,15 @@ impl SftpService {
         Ok(task)
     }
 
-    /// 取消指定传输任务；若任务已为终态则静默成功
+    /// 取消指定传输任务；任务不存在时返回结构化错误，已终态任务静默成功
     ///
     /// # 参数
     /// - `task_id`: 要取消的任务 ID
-    pub fn cancel_task(&self, task_id: &str) {
+    ///
+    /// # 返回
+    /// Ok(()) 表示取消令牌已触发或任务已为终态；Err(SftpTaskNotFound) 表示
+    /// 任务从未入队（取消失败必须对用户可见，不再静默吞掉）
+    pub fn cancel_task(&self, task_id: &str) -> Result<(), AppError> {
         // 找到对应 session 的取消令牌并触发取消
         let handles: Vec<_> = self
             .handles
@@ -462,10 +466,20 @@ impl SftpService {
                 .get(task_id)
             {
                 token.cancel();
-                return;
+                return Ok(());
             }
         }
-        // 任务已为终态，静默成功
+        // 令牌缺失：registry 为权威状态，区分“已终态”与“任务不存在”
+        let task = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(task_id)
+            .cloned();
+        match task {
+            Some(task) if is_terminal(&task.status) => Ok(()),
+            _ => Err(AppError::SftpTaskNotFound(task_id.to_string())),
+        }
     }
 
     /// 迁移任务状态：registry 先更新，再发布事件；任务不存在或迁移非法时拒绝。
@@ -479,7 +493,8 @@ impl SftpService {
     /// - `task_id`: 任务 ID
     /// - `session_id`: 关联会话 ID
     /// - `status`: 目标状态
-    /// - `error_message`: 失败原因；Failed 时为具体错误描述，其余为 None
+    /// - `error`: 结构化失败原因；Failed 时为具体应用错误，其余为 None，
+    ///   registry 与事件 payload 各写入一份相同副本
     ///
     /// # 返回
     /// true 表示迁移成功且已发布事件；false 表示被拒绝（未知任务或非法迁移）
@@ -489,7 +504,7 @@ impl SftpService {
         task_id: &str,
         session_id: &str,
         status: SftpTaskStatus,
-        error_message: Option<String>,
+        error: Option<AppErrorInfo>,
     ) -> bool {
         let mut tasks = self
             .tasks
@@ -510,10 +525,7 @@ impl SftpService {
             return false;
         }
         task.status = status.clone();
-        task.error = error_message.clone().map(|detail| AppErrorInfo {
-            code: "SftpTransferError".to_string(),
-            detail: Some(detail),
-        });
+        task.error = error.clone();
         drop(tasks);
 
         // 终态后移除取消令牌；session 已关闭时（cleanup 后）跳过
@@ -533,10 +545,7 @@ impl SftpService {
                 task_id: task_id.to_string(),
                 session_id: session_id.to_string(),
                 status,
-                error: error_message.map(|detail| AppErrorInfo {
-                    code: "SftpTransferError".to_string(),
-                    detail: Some(detail),
-                }),
+                error,
             },
         );
         true
@@ -653,7 +662,7 @@ impl SftpService {
             .await;
 
             match result {
-                Ok(Ok(())) => {
+                Ok(TransferOutcome::Done) => {
                     service.transition_task(
                         &app,
                         &task_id,
@@ -662,7 +671,7 @@ impl SftpService {
                         None,
                     );
                 }
-                Ok(Err(true)) => {
+                Ok(TransferOutcome::Cancelled) => {
                     service.transition_task(
                         &app,
                         &task_id,
@@ -671,22 +680,25 @@ impl SftpService {
                         None,
                     );
                 }
-                Ok(Err(false)) => {
+                Ok(TransferOutcome::Failed(error)) => {
                     service.transition_task(
                         &app,
                         &task_id,
                         &session_id,
                         SftpTaskStatus::Failed,
-                        Some("传输中断".to_string()),
+                        Some(error),
                     );
                 }
                 Err(e) => {
+                    // spawn_blocking 本身失败（panic / join 失败）：折叠为结构化传输错误
                     service.transition_task(
                         &app,
                         &task_id,
                         &session_id,
                         SftpTaskStatus::Failed,
-                        Some(e.to_string()),
+                        Some(AppErrorInfo::from(AppError::SftpTransferError(
+                            e.to_string(),
+                        ))),
                     );
                 }
             }
@@ -724,12 +736,19 @@ fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
     ssh_transport::connect_sftp(host, password.as_deref(), passphrase.as_deref())
 }
 
-/// 阻塞执行实际传输，每 500ms 推送进度
+/// 传输 worker 的终态结果；失败携带结构化应用错误，不再用布尔折叠失败原因。
+enum TransferOutcome {
+    Done,
+    Cancelled,
+    Failed(AppErrorInfo),
+}
+
+/// 阻塞执行实际传输，每 500ms 推送进度；各阶段失败保留具体结构化错误。
 ///
 /// # 返回
-/// - `Ok(())`: 传输成功
-/// - `Err(true)`: 主动取消
-/// - `Err(false)`: 传输失败
+/// - `Done`: 传输成功
+/// - `Cancelled`: 主动取消（含残留文件清理）
+/// - `Failed(error)`: 打开/读取/写入/创建任一阶段失败，携带阶段对应的应用错误
 fn run_transfer_blocking<R: Runtime>(
     task_id: &str,
     session_id: &str,
@@ -740,16 +759,24 @@ fn run_transfer_blocking<R: Runtime>(
     transport: &Arc<Mutex<SftpTransport>>,
     cancel_token: &CancelToken,
     app: &AppHandle<R>,
-) -> Result<(), bool> {
+) -> TransferOutcome {
     use std::io::{Read, Write};
     use std::time::Instant;
 
-    let mut sftp = transport.lock().map_err(|_| false)?;
+    let mut sftp = match transport.lock() {
+        Ok(sftp) => sftp,
+        Err(error) => {
+            return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpChannelError(
+                error.to_string(),
+            )));
+        }
+    };
 
     const CHUNK: usize = 32 * 1024; // 32KB chunks
     let mut transferred: u64 = 0;
     let mut last_report = Instant::now();
     let mut last_transferred: u64 = 0;
+    let mut buf = vec![0u8; CHUNK];
 
     /// 内联辅助：推送进度事件
     macro_rules! emit_progress {
@@ -775,10 +802,19 @@ fn run_transfer_blocking<R: Runtime>(
 
     match transfer_type {
         TransferType::Download => {
-            let mut remote_file = sftp.open_read(remote_path).map_err(|_| false)?;
+            let mut remote_file = match sftp.open_read(remote_path) {
+                Ok(file) => file,
+                Err(error) => return TransferOutcome::Failed(AppErrorInfo::from(error)),
+            };
             // 创建本地文件；失败或取消时通过 cleanup_local 删除残留
-            let mut local_file = std::fs::File::create(local_path).map_err(|_| false)?;
-            let mut buf = vec![0u8; CHUNK];
+            let mut local_file = match std::fs::File::create(local_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpCreateError(
+                        error.to_string(),
+                    )));
+                }
+            };
 
             /// 关闭本地文件句柄并删除残留文件（取消或 IO 失败时调用）
             macro_rules! cleanup_local {
@@ -790,34 +826,47 @@ fn run_transfer_blocking<R: Runtime>(
 
             loop {
                 if cancel_token.is_cancelled() {
-                    // 主动取消：删除本地残留文件后返回取消标志
+                    // 主动取消：删除本地残留文件后返回取消结果
                     cleanup_local!();
-                    return Err(true);
+                    return TransferOutcome::Cancelled;
                 }
                 let n = match remote_file.read(&mut buf) {
                     Ok(n) => n,
-                    Err(_) => {
-                        // IO 失败：同样删除本地残留文件
+                    Err(error) => {
+                        // 运行时读取失败：同样删除本地残留文件，保留结构化读取错误
                         cleanup_local!();
-                        return Err(false);
+                        return TransferOutcome::Failed(AppErrorInfo::from(
+                            AppError::SftpReadError(error.to_string()),
+                        ));
                     }
                 };
                 if n == 0 {
                     break;
                 }
-                if local_file.write_all(&buf[..n]).is_err() {
+                if let Err(error) = local_file.write_all(&buf[..n]) {
                     cleanup_local!();
-                    return Err(false);
+                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpWriteError(
+                        error.to_string(),
+                    )));
                 }
                 transferred += n as u64;
                 emit_progress!();
             }
         }
         TransferType::Upload => {
-            let mut local_file = std::fs::File::open(local_path).map_err(|_| false)?;
+            let mut local_file = match std::fs::File::open(local_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpOpenError(
+                        error.to_string(),
+                    )));
+                }
+            };
             // 创建远端文件；失败或取消时通过 cleanup_remote 删除残留
-            let mut remote_file = sftp.create(remote_path).map_err(|_| false)?;
-            let mut buf = vec![0u8; CHUNK];
+            let mut remote_file = match sftp.create(remote_path) {
+                Ok(file) => file,
+                Err(error) => return TransferOutcome::Failed(AppErrorInfo::from(error)),
+            };
 
             /// 关闭远端文件句柄并删除残留文件（取消或 IO 失败时调用）
             macro_rules! cleanup_remote {
@@ -829,30 +878,34 @@ fn run_transfer_blocking<R: Runtime>(
 
             loop {
                 if cancel_token.is_cancelled() {
-                    // 主动取消：删除远端残留文件后返回取消标志
+                    // 主动取消：删除远端残留文件后返回取消结果
                     cleanup_remote!();
-                    return Err(true);
+                    return TransferOutcome::Cancelled;
                 }
                 let n = match local_file.read(&mut buf) {
                     Ok(n) => n,
-                    Err(_) => {
+                    Err(error) => {
                         cleanup_remote!();
-                        return Err(false);
+                        return TransferOutcome::Failed(AppErrorInfo::from(
+                            AppError::SftpReadError(error.to_string()),
+                        ));
                     }
                 };
                 if n == 0 {
                     break;
                 }
-                if remote_file.write_all(&buf[..n]).is_err() {
+                if let Err(error) = remote_file.write_all(&buf[..n]) {
                     cleanup_remote!();
-                    return Err(false);
+                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpWriteError(
+                        error.to_string(),
+                    )));
                 }
                 transferred += n as u64;
                 emit_progress!();
             }
         }
     }
-    Ok(())
+    TransferOutcome::Done
 }
 
 /// 将 Unix 权限位转换为 "rwxr-xr-x" 格式字符串
@@ -875,7 +928,8 @@ fn format_permissions(perm: u32) -> String {
 mod tests {
     use super::*;
     use crate::core::ssh_transport::test_support::{
-        blocking_sftp, drop_signal_sftp, empty_sftp, memory_sftp,
+        blocking_sftp, drop_signal_sftp, empty_sftp, failing_read_sftp, failing_write_sftp,
+        memory_sftp,
     };
     use crate::models::host::{AuthType, HostConfig};
     use std::sync::atomic::Ordering;
@@ -1006,11 +1060,19 @@ mod tests {
         assert!(service.has_session("session-1"));
     }
 
-    /// 验证 cancel_task 对不存在的 task_id 静默成功（不 panic）
+    /// 验证 cancel_task 对不存在的 task_id 返回结构化 SftpTaskNotFound 错误。
     #[test]
-    fn cancel_nonexistent_task_is_silent() {
+    fn cancel_unknown_task_returns_structured_error() {
         let service = SftpService::new();
-        service.cancel_task("nonexistent-task-id"); // 不应 panic
+        let error = service.cancel_task("nonexistent-task-id").unwrap_err();
+        assert!(
+            matches!(&error, AppError::SftpTaskNotFound(id) if id == "nonexistent-task-id"),
+            "未知任务应返回 SftpTaskNotFound，实际: {:?}",
+            error
+        );
+        let info = AppErrorInfo::from(error);
+        assert_eq!(info.code, "SftpTaskNotFound");
+        assert_eq!(info.detail.as_deref(), Some("nonexistent-task-id"));
     }
 
     /// 验证 cleanup_session 移除 session handle
@@ -1230,7 +1292,10 @@ mod tests {
             .unwrap()
             .insert(task_id.clone(), cancel_token);
 
-        service.cancel_task(&task_id);
+        assert!(
+            service.cancel_task(&task_id).is_ok(),
+            "活跃任务的取消应成功"
+        );
 
         assert!(
             cloned_token.is_cancelled(),
@@ -1238,15 +1303,51 @@ mod tests {
         );
     }
 
-    /// 验证终态任务调用 cancel_task 静默成功（令牌已不在 handles 中）
+    /// 验证终态任务调用 cancel_task 静默成功（令牌已不在 handles 中，registry 兜底）。
     #[test]
     fn cancel_task_on_completed_task_is_silent() {
-        let service = SftpService::new();
-        service.cancel_task("task-already-done");
-        // 不 panic 即通过
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        // 与真实终态一致：任务只存在于 registry，取消令牌已被移除
+        service.tasks.lock().unwrap().insert(
+            "task-already-done".to_string(),
+            TransferTask {
+                task_id: "task-already-done".to_string(),
+                session_id: "session-1".to_string(),
+                transfer_type: TransferType::Download,
+                remote_path: "/tmp/file".to_string(),
+                local_path: "/local/file".to_string(),
+                file_name: "file".to_string(),
+                total_bytes: 1024,
+                transferred_bytes: 1024,
+                speed_bps: 0,
+                status: SftpTaskStatus::Done,
+                error: None,
+                created_at: 0,
+            },
+        );
+        assert!(service.cancel_task("task-already-done").is_ok());
     }
 
     // ─── 任务状态迁移权威化测试 ──────────────────────────────────────────────
+
+    /// 订阅 sftp:task_status 并收集结构化事件 payload，供断言 registry 与事件一致性。
+    fn capture_task_status_events<R: Runtime>(
+        app: &AppHandle<R>,
+    ) -> Arc<std::sync::Mutex<Vec<SftpTaskStatusEvent>>> {
+        use tauri::Listener;
+
+        let captured: Arc<std::sync::Mutex<Vec<SftpTaskStatusEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_ref = captured.clone();
+        app.listen("sftp:task_status", move |event| {
+            captured_ref.lock().unwrap().push(
+                serde_json::from_str(event.payload())
+                    .expect("事件 payload 应反序列化为结构化任务状态"),
+            );
+        });
+        captured
+    }
 
     /// 构造已注册的传输任务，同时注册取消令牌，返回令牌供断言。
     fn insert_task(service: &SftpService, task_id: &str, status: SftpTaskStatus) -> CancelToken {
@@ -1403,6 +1504,46 @@ mod tests {
         assert_eq!(emitted.load(Ordering::Relaxed), 0);
     }
 
+    /// Failed 迁移必须把结构化应用错误原样写入 registry，并在事件 payload 中携带一致副本。
+    #[test]
+    fn failed_transition_carries_structured_error_in_registry_and_event() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        insert_task(&service, "task-1", SftpTaskStatus::Running);
+
+        let captured = capture_task_status_events(app.handle());
+
+        let error = AppErrorInfo {
+            code: "SftpReadError".to_string(),
+            detail: Some("read reset".to_string()),
+        };
+        assert!(service.transition_task(
+            app.handle(),
+            "task-1",
+            "session-1",
+            SftpTaskStatus::Failed,
+            Some(error.clone()),
+        ));
+
+        let registry_task = service.tasks.lock().unwrap().get("task-1").unwrap().clone();
+        assert_eq!(
+            registry_task.error,
+            Some(error.clone()),
+            "registry 中的任务必须保留结构化错误"
+        );
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1, "Failed 迁移应恰好发布一次事件");
+        assert_eq!(events[0].status, SftpTaskStatus::Failed);
+        assert_eq!(
+            events[0].error,
+            Some(error),
+            "事件 payload 必须携带与 registry 一致的结构化错误"
+        );
+    }
+
     /// cleanup_session 不得重复取消已终态任务，也不得发矛盾事件；任务随后从 registry 移除。
     #[test]
     fn cleanup_session_skips_terminal_tasks() {
@@ -1545,7 +1686,8 @@ mod tests {
         let _ = std::fs::remove_file(&local_path);
     }
 
-    /// 传输失败时 worker 把 registry 更新为 Failed。
+    /// 传输启动失败（远端 create 拒绝）时 worker 把 registry 更新为 Failed，
+    /// 且 registry 与事件 payload 携带同一份结构化创建错误。
     #[tokio::test(flavor = "multi_thread")]
     async fn failing_worker_updates_registry_to_failed() {
         use tauri::test::mock_app;
@@ -1553,6 +1695,8 @@ mod tests {
         let app = mock_app();
         let service = make_service(); // empty_sftp：open_read/create 失败
         service.register_session("session-1".to_string(), make_host());
+
+        let captured = capture_task_status_events(app.handle());
 
         let local_path = std::env::temp_dir().join(format!("titan-fail-{}.bin", Uuid::new_v4()));
         std::fs::write(&local_path, b"x").unwrap();
@@ -1569,6 +1713,246 @@ mod tests {
             wait_for_terminal(&service, &task.task_id),
             SftpTaskStatus::Failed
         );
+        let expected = Some(AppErrorInfo {
+            code: "SftpTransferError".to_string(),
+            detail: Some("unused".to_string()),
+        });
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            registry_task.error, expected,
+            "registry 必须保留启动失败的具体错误"
+        );
+        let events = captured.lock().unwrap();
+        let failed_events: Vec<&SftpTaskStatusEvent> = events
+            .iter()
+            .filter(|event| event.status == SftpTaskStatus::Failed)
+            .collect();
+        assert_eq!(failed_events.len(), 1, "启动失败应发布一次 Failed 事件");
+        assert_eq!(failed_events[0].error, expected);
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 下载运行时读取失败：worker 保留 SftpReadError 结构化错误，且事件与 registry 一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_read_failure_keeps_structured_read_error() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(failing_read_sftp()));
+        service.register_session("session-1".to_string(), make_host());
+
+        let captured = capture_task_status_events(app.handle());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-readfail-{}.bin", Uuid::new_v4()));
+        let task = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            registry_task.error,
+            Some(AppErrorInfo {
+                code: "SftpReadError".to_string(),
+                detail: Some("remote read reset".to_string()),
+            }),
+            "运行时读取失败必须保留 SftpReadError 与底层诊断"
+        );
+        assert!(
+            !std::path::Path::new(&local_path).exists(),
+            "读取失败后本地残留文件应被清理"
+        );
+        let events = captured.lock().unwrap();
+        let failed_events: Vec<&SftpTaskStatusEvent> = events
+            .iter()
+            .filter(|event| event.status == SftpTaskStatus::Failed)
+            .collect();
+        assert_eq!(failed_events.len(), 1);
+        assert_eq!(failed_events[0].error, registry_task.error);
+    }
+
+    /// 上传运行时写入失败：worker 保留 SftpWriteError 结构化错误，且事件与 registry 一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_write_failure_keeps_structured_write_error() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(failing_write_sftp()));
+        service.register_session("session-1".to_string(), make_host());
+
+        let captured = capture_task_status_events(app.handle());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-writefail-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            registry_task.error,
+            Some(AppErrorInfo {
+                code: "SftpWriteError".to_string(),
+                detail: Some("remote write reset".to_string()),
+            }),
+            "运行时写入失败必须保留 SftpWriteError 与底层诊断"
+        );
+        let events = captured.lock().unwrap();
+        let failed_events: Vec<&SftpTaskStatusEvent> = events
+            .iter()
+            .filter(|event| event.status == SftpTaskStatus::Failed)
+            .collect();
+        assert_eq!(failed_events.len(), 1);
+        assert_eq!(failed_events[0].error, registry_task.error);
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 下载本地目标创建失败（目标路径已存在且是目录）：任务 Failed 且保留 SftpCreateError。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_local_create_failure_keeps_structured_create_error() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![7u8; 4096])));
+        service.register_session("session-1".to_string(), make_host());
+
+        // 本地目标指向已存在的目录：File::create 必然失败
+        let local_dir = std::env::temp_dir().join(format!("titan-createfail-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let task = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_dir.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task
+            .error
+            .as_ref()
+            .expect("本地创建失败必须携带结构化错误");
+        assert_eq!(error.code, "SftpCreateError");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| !detail.is_empty()),
+            "创建失败必须保留底层诊断"
+        );
+        let _ = std::fs::remove_dir(&local_dir);
+    }
+
+    /// 上传本地文件打开失败（权限拒绝）：任务 Failed 且保留 SftpOpenError。
+    /// root 环境不受权限位约束，无法模拟时跳过断言。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_local_open_failure_keeps_structured_open_error() {
+        use std::os::unix::fs::PermissionsExt;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_| Ok(memory_sftp(Vec::new())));
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-openfail-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let mut permissions = std::fs::metadata(&local_path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&local_path, permissions).unwrap();
+
+        // root 用户不受权限位限制，该环境无法模拟本地打开失败：清理后跳过断言
+        if std::fs::File::open(&local_path).is_ok() {
+            let _ = std::fs::remove_file(&local_path);
+            return;
+        }
+
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task
+            .error
+            .as_ref()
+            .expect("本地打开失败必须携带结构化错误");
+        assert_eq!(error.code, "SftpOpenError");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| !detail.is_empty()),
+            "打开失败必须保留底层诊断"
+        );
+
+        // 恢复权限后清理临时文件
+        let mut permissions = std::fs::metadata(&local_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        let _ = std::fs::set_permissions(&local_path, permissions);
         let _ = std::fs::remove_file(&local_path);
     }
 

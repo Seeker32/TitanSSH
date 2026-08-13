@@ -83,7 +83,7 @@ pub struct SftpProgressEvent {
 }
 
 /// sftp:task_status 事件 payload，任务状态变更时推送
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SftpTaskStatusEvent {
     /// 任务 ID
