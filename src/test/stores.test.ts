@@ -327,6 +327,49 @@ describe('Zustand stores', () => {
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
   });
 
+  it('主机身份确认事件按 sessionId 投影，接受后调用后端并清除确认卡', async () => {
+    const challenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    mockInvoke.mockResolvedValue(undefined);
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('host-identity:challenge', challenge);
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+    expect(mockInvoke).toHaveBeenCalledWith('accept_host_identity', { challengeId: 'challenge-1' });
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    cleanup();
+  });
+
+  it('拒绝主机身份调用后端拒绝与关闭，并清理会话与 SFTP/监控投影', async () => {
+    const challenge = {
+      challengeId: 'challenge-2', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      activeView: 'session-1',
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    // 后端拒绝命令已 teardown，close_session 可能报 SessionNotFound
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'reject_host_identity') return undefined;
+      throw new Error('SessionNotFound');
+    });
+
+    await useSessionStore.getState().rejectHostIdentity('session-1');
+
+    expect(mockInvoke).toHaveBeenCalledWith('reject_host_identity', { challengeId: 'challenge-2' });
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
+    expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
+  });
+
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {
     const task = makeTaskInfo();
     useMonitorStore.setState({ tasks: new Map([[task.taskId, task]]) });

@@ -179,6 +179,51 @@ describe('HomePage integration', () => {
     act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
   });
 
+  it('首次主机身份确认：内联卡片、接受后续连、拒绝后关闭会话', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+
+    // 验证阶段进度与确认卡依次呈现；确认前终端不可交互
+    await act(async () => {
+      emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.VerifyingHostKey, timestamp: Date.now() });
+      emitMockEvent('host-identity:challenge', {
+        challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+        keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_000_000,
+      });
+    });
+    const card = screen.getByTestId('host-identity-card');
+    expect(card).toHaveTextContent('10.0.0.8:22');
+    expect(card).toHaveTextContent('ssh-ed25519');
+    expect(card).toHaveTextContent('SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD');
+    expect(screen.queryByRole('status')).toBeNull();
+
+    mockInvoke.mockClear();
+    mockInvoke.mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('accept_host_identity', { challengeId: 'challenge-1' }));
+    expect(screen.queryByTestId('host-identity-card')).toBeNull();
+
+    // 拒绝路径：新 challenge 拒绝后关闭整个会话
+    await act(async () => {
+      emitMockEvent('host-identity:challenge', {
+        challengeId: 'challenge-2', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+        keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:another', timestamp: 1_710_000_001_000,
+      });
+    });
+    mockInvoke.mockClear();
+    // 后端拒绝时已 teardown，close_session 可能报错（会话已移除）
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'reject_host_identity') return undefined;
+      throw new Error('SessionNotFound');
+    });
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('reject_host_identity', { challengeId: 'challenge-2' }));
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    await waitFor(() => expect(useSessionStore.getState().sessions.has('session-1')).toBe(false));
+    expect(screen.queryByTestId('host-identity-card')).toBeNull();
+  });
+
   it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {
     const user = userEvent.setup();
     const { container } = render(<HomePage />);

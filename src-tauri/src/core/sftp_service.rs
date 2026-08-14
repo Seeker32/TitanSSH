@@ -1,3 +1,4 @@
+use crate::core::host_identity::HostKeyVerifier;
 use crate::core::ssh_transport::{self, SftpTransport};
 use crate::core::transfer_pool::{
     CheckoutError, TRANSFER_IDLE_TIMEOUT, TransferCheckout, TransferClock, TransferPool,
@@ -92,8 +93,11 @@ pub(crate) enum SftpRole {
     Transfer,
 }
 
-pub(crate) type SftpConnector =
-    Arc<dyn Fn(&HostConfig, SftpRole) -> Result<SftpTransport, AppError> + Send + Sync>;
+pub(crate) type SftpConnector = Arc<
+    dyn Fn(&HostConfig, SftpRole, &HostKeyVerifier) -> Result<SftpTransport, AppError>
+        + Send
+        + Sync,
+>;
 
 enum ConnectionState {
     Idle,
@@ -107,6 +111,8 @@ enum ConnectionState {
 /// 同一 Session 的控制连接与传输连接各占一个状态槽，互不持锁。
 struct SftpConnection {
     host: HostConfig,
+    /// 主机身份统一校验器：握手后、认证前生效，与 Session 生命周期一致
+    verifier: HostKeyVerifier,
     connector: SftpConnector,
     role: SftpRole,
     state: Mutex<ConnectionState>,
@@ -115,9 +121,15 @@ struct SftpConnection {
 
 impl SftpConnection {
     /// 创建尚未开始连接的状态槽。
-    fn new(host: HostConfig, connector: SftpConnector, role: SftpRole) -> Self {
+    fn new(
+        host: HostConfig,
+        verifier: HostKeyVerifier,
+        connector: SftpConnector,
+        role: SftpRole,
+    ) -> Self {
         Self {
             host,
+            verifier,
             connector,
             role,
             state: Mutex::new(ConnectionState::Idle),
@@ -145,7 +157,8 @@ impl SftpConnection {
 
         let connection = self.clone();
         std::thread::spawn(move || {
-            let result = (connection.connector)(&connection.host, connection.role);
+            let result =
+                (connection.connector)(&connection.host, connection.role, &connection.verifier);
             let mut state = connection
                 .state
                 .lock()
@@ -187,7 +200,7 @@ impl SftpConnection {
                 ConnectionState::Idle => {
                     *state = ConnectionState::Connecting;
                     drop(state);
-                    let result = (self.connector)(&self.host, self.role);
+                    let result = (self.connector)(&self.host, self.role, &self.verifier);
                     let mut state = self
                         .state
                         .lock()
@@ -302,7 +315,7 @@ impl SftpService {
     /// 生产服务共享全局并发信号量：跨所有 Session 合计最多 5 个并发传输。
     pub fn new() -> Self {
         Self::with_connector_semaphore(
-            |host, _role| connect_sftp_for_host(host),
+            |host, _role, verifier| connect_sftp_for_host(host, verifier),
             TransferClock::system(),
             TRANSFER_IDLE_TIMEOUT,
             get_semaphore(),
@@ -325,11 +338,11 @@ impl SftpService {
         )
     }
 
-    /// 注入连接 adapter、时间源与空闲回收阈值，供传输连接池 contract 测试使用。
-    /// 每个测试服务持有独立全局信号量：并发测试互不占用 permit。
+    /// 注入携带主机身份校验器的三参连接 adapter 与时间源，
+    /// 供验证统一校验不绕过 SFTP 的测试使用。
     #[cfg(test)]
-    pub(crate) fn with_connector_clock_timeout(
-        connector: impl Fn(&HostConfig, SftpRole) -> Result<SftpTransport, AppError>
+    pub(crate) fn with_verifying_connector(
+        connector: impl Fn(&HostConfig, SftpRole, &HostKeyVerifier) -> Result<SftpTransport, AppError>
         + Send
         + Sync
         + 'static,
@@ -344,9 +357,28 @@ impl SftpService {
         )
     }
 
+    /// 注入连接 adapter、时间源与空闲回收阈值，供传输连接池 contract 测试使用。
+    /// 每个测试服务持有独立全局信号量：并发测试互不占用 permit。
+    #[cfg(test)]
+    pub(crate) fn with_connector_clock_timeout(
+        connector: impl Fn(&HostConfig, SftpRole) -> Result<SftpTransport, AppError>
+        + Send
+        + Sync
+        + 'static,
+        clock: TransferClock,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self::with_connector_semaphore(
+            move |host, role, _verifier| connector(host, role),
+            clock,
+            idle_timeout,
+            Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
+        )
+    }
+
     /// 装配 File Transfer module 的完整构造入口。
     fn with_connector_semaphore(
-        connector: impl Fn(&HostConfig, SftpRole) -> Result<SftpTransport, AppError>
+        connector: impl Fn(&HostConfig, SftpRole, &HostKeyVerifier) -> Result<SftpTransport, AppError>
         + Send
         + Sync
         + 'static,
@@ -366,14 +398,21 @@ impl SftpService {
 
     /// 注册 Session：并行启动独立控制连接；传输连接池零连接起步，
     /// 基础一条在首次传输时按需建立，不预建五条。
-    pub fn register_session(&self, session_id: String, host: HostConfig) {
+    pub fn register_session_with_verifier(
+        &self,
+        session_id: String,
+        host: HostConfig,
+        verifier: HostKeyVerifier,
+    ) {
         let control = Arc::new(SftpConnection::new(
             host.clone(),
+            verifier.clone(),
             self.connector.clone(),
             SftpRole::Control,
         ));
         let transfer_pool = TransferPool::new_cyclic(
             host,
+            verifier,
             self.connector.clone(),
             self.clock.clone(),
             self.idle_timeout,
@@ -391,6 +430,12 @@ impl SftpService {
                 }),
             );
         control.connect_eager();
+    }
+
+    /// 测试便捷入口：以总是放行的校验器注册 Session（生产必须走 register_session_with_verifier）。
+    #[cfg(test)]
+    pub(crate) fn register_session(&self, session_id: String, host: HostConfig) {
+        self.register_session_with_verifier(session_id, host, test_allow_all_verifier());
     }
 
     /// 判断指定 Session 是否仍注册在 File Transfer module。
@@ -1185,8 +1230,12 @@ fn run_op_locked<T>(
     op(&mut sftp)
 }
 
-/// 从 secure storage 读取运行时凭据并建立独立 SFTP transport。
-fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
+/// 从 secure storage 读取运行时凭据并建立独立 SFTP transport；
+/// 主机身份校验在 transport 握手后、认证前生效。
+fn connect_sftp_for_host(
+    host: &HostConfig,
+    verifier: &HostKeyVerifier,
+) -> Result<SftpTransport, AppError> {
     let (password, passphrase) = match host.auth_type {
         AuthType::Password => {
             let password_ref = host
@@ -1204,7 +1253,13 @@ fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
             (None, passphrase)
         }
     };
-    ssh_transport::connect_sftp(host, password.as_deref(), passphrase.as_deref())
+    ssh_transport::connect_sftp(host, password.as_deref(), passphrase.as_deref(), verifier)
+}
+
+/// 构建总是放行的主机身份校验器，仅供测试便捷入口使用。
+#[cfg(test)]
+fn test_allow_all_verifier() -> HostKeyVerifier {
+    Arc::new(|_presented| Ok(()))
 }
 
 /// 传输 worker 的终态结果；失败携带具体 AppError，供淘汰失效传输连接与事件序列化。
@@ -1658,6 +1713,109 @@ mod tests {
         }
     }
 
+    /// SFTP 控制连接与其他 capability 一样经过主机身份统一校验：
+    /// 未知主机在认证前阻塞等待用户决定，接受后才交付可用连接。
+    #[test]
+    fn sftp_control_connection_waits_for_host_identity_decision() {
+        use crate::core::host_identity::{HostIdentityService, PresentedHostKey};
+        use std::time::Instant;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let service = SftpService::with_verifying_connector(
+            |host, role, verifier| {
+                // 模拟 transport 顺序：握手后、认证前进入统一校验
+                verifier(&PresentedHostKey {
+                    host: host.host.clone(),
+                    port: host.port,
+                    algorithm: "ssh-ed25519".to_string(),
+                    fingerprint: "SHA256:sftp-identity".to_string(),
+                })?;
+                assert_eq!(role, SftpRole::Control, "Session 打开先建控制连接");
+                Ok(empty_sftp())
+            },
+            TransferClock::system(),
+            TRANSFER_IDLE_TIMEOUT,
+        );
+        service.register_session_with_verifier(
+            "session-identity".to_string(),
+            make_host(),
+            identity.verifier(app.handle().clone(), "session-identity".to_string()),
+        );
+
+        // 控制连接阻塞在主机身份确认：challenge 已产生
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity.pending_challenge("session-identity").is_none() && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity
+            .pending_challenge("session-identity")
+            .expect("SFTP 连接产生主机身份 challenge");
+
+        // 仅本次接受后控制连接交付，目录操作可用
+        identity.accept(&challenge.challenge_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if service.list_dir("session-identity", "/").is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "接受后 SFTP 控制连接应可用");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 拒绝后 SFTP 连接以 HostKeyRejected 失败，不进入认证。
+    #[test]
+    fn sftp_control_connection_fails_after_identity_rejection() {
+        use crate::core::host_identity::{HostIdentityService, PresentedHostKey};
+        use std::time::Instant;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let service = SftpService::with_verifying_connector(
+            |host, _role, verifier| {
+                verifier(&PresentedHostKey {
+                    host: host.host.clone(),
+                    port: host.port,
+                    algorithm: "ssh-ed25519".to_string(),
+                    fingerprint: "SHA256:sftp-deny".to_string(),
+                })?;
+                Ok(empty_sftp())
+            },
+            TransferClock::system(),
+            TRANSFER_IDLE_TIMEOUT,
+        );
+        service.register_session_with_verifier(
+            "session-deny".to_string(),
+            make_host(),
+            identity.verifier(app.handle().clone(), "session-deny".to_string()),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity.pending_challenge("session-deny").is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity.pending_challenge("session-deny").unwrap();
+        identity.reject(&challenge.challenge_id).unwrap();
+
+        // 拒绝后目录操作以 HostKeyRejected 语义失败（连接交付失败错误）
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Err(error) = service.list_dir("session-deny", "/") {
+                assert!(
+                    error.to_string().contains("主机身份"),
+                    "拒绝后 SFTP 失败应包含主机身份语义，实际: {error}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "拒绝后 SFTP 控制连接应失败");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// 后台 eager 失败只交付一次，下一次操作必须触发重连。
     #[test]
     fn eager_failure_is_reported_once_then_next_operation_retries() {
@@ -1758,9 +1916,10 @@ mod tests {
     /// 健康新连接不得被迟到旧操作的淘汰请求误杀（同一失效连接只允许一次重建）。
     #[test]
     fn invalidate_if_ready_only_evicts_the_given_transport() {
-        let connector: SftpConnector = Arc::new(|_, _| Ok(empty_sftp()));
+        let connector: SftpConnector = Arc::new(|_, _, _| Ok(empty_sftp()));
         let connection = Arc::new(SftpConnection::new(
             make_host(),
+            test_allow_all_verifier(),
             connector,
             SftpRole::Control,
         ));

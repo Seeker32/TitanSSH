@@ -120,10 +120,20 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'session.error': 'Connection error',
   'session.disconnected': 'Connection disconnected',
   'session.closeTab': 'Close Tab',
+
+  // Host identity verification
+  'hostIdentity.title': 'Cannot verify host identity',
+  'hostIdentity.hint': 'First connection to this host. Verify the host key fingerprint; trust applies to this session only and authentication will not start until confirmed.',
+  'hostIdentity.endpoint': 'Host address',
+  'hostIdentity.algorithm': 'Key algorithm',
+  'hostIdentity.fingerprint': 'SHA-256 fingerprint',
+  'hostIdentity.accept': 'Accept Once',
+  'hostIdentity.reject': 'Reject',
   'session.unknown': 'Connection failed',
   'phase.LoadingCredentials': 'Loading credentials...',
   'phase.ConnectingTcp': 'Establishing TCP connection...',
   'phase.SshHandshake': 'Performing SSH handshake...',
+  'phase.VerifyingHostKey': 'Verifying host identity...',
   'phase.Authenticating': 'Authenticating SSH...',
   'phase.OpeningChannel': 'Opening terminal channel...',
   'phase.RequestingPty': 'Requesting terminal PTY...',
@@ -152,6 +162,9 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.SftpTargetBusy': 'Target is being transferred by another task in this session',
   'error.SftpPublishError': 'Safe publish failed; the original file was left untouched',
   'error.MonitorError': 'Monitor error',
+  'error.HostKeyRejected': 'Unknown host identity rejected',
+  'error.HostKeyChallengeNotFound': 'Host identity challenge not found',
+  'error.HostKeyVerificationCancelled': 'Host identity verification cancelled',
   'error.Unknown': 'Unknown error',
 };
 

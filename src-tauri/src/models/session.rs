@@ -53,3 +53,18 @@ pub struct TaskStatusEvent {
     /// 可选的语言无关错误。
     pub error: Option<AppErrorInfo>,
 }
+
+/// 首次未知主机身份确认事件 Payload（host-identity:challenge）
+/// 指纹由 Rust 侧计算，前端不解析 SSH key 文本。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostIdentityChallenge {
+    pub challenge_id: String,
+    pub session_id: String,
+    pub host: String,
+    pub port: u16,
+    pub key_algorithm: String,
+    pub fingerprint: String,
+    /// 事件产生时间，Unix 毫秒时间戳
+    pub timestamp: i64,
+}

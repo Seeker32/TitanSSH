@@ -5,6 +5,7 @@
 //! 本模块只承载连接池的调度与回收逻辑：任务状态机、事件与安全发布仍属于
 //! sftp_service，池不接触任务 registry 与传输语义。
 
+use crate::core::host_identity::HostKeyVerifier;
 use crate::core::sftp_service::{SftpConnector, SftpRole};
 use crate::core::ssh_transport::SftpTransport;
 use crate::errors::app_error::AppError;
@@ -74,6 +75,8 @@ impl TransferClock {
 pub(crate) struct TransferPool {
     /// 建连所需主机配置
     host: HostConfig,
+    /// 主机身份统一校验器：每条传输连接握手后、认证前生效
+    verifier: HostKeyVerifier,
     /// 传输连接 adapter
     connector: SftpConnector,
     /// 单调时间源：决定空闲回收时机
@@ -143,12 +146,14 @@ impl TransferPool {
     /// 用 Arc::new_cyclic 构造连接池，使后台回收线程能持有自身引用。
     pub(crate) fn new_cyclic(
         host: HostConfig,
+        verifier: HostKeyVerifier,
         connector: SftpConnector,
         clock: Arc<TransferClock>,
         idle_timeout: Duration,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             host,
+            verifier,
             connector,
             clock,
             idle_timeout,
@@ -261,7 +266,7 @@ impl TransferPool {
 
     /// 建连并交付 checkout；建连失败只影响本次 checkout，唤醒队首等待者重试。
     fn create_connection(&self, seq: u64) -> Result<TransferCheckout, CheckoutError> {
-        let result = (self.connector)(&self.host, SftpRole::Transfer);
+        let result = (self.connector)(&self.host, SftpRole::Transfer, &self.verifier);
         let mut state = self
             .state
             .lock()

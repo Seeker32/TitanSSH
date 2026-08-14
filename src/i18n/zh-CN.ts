@@ -118,10 +118,20 @@ export const zhCN = {
   'session.error': '连接错误',
   'session.disconnected': '连接已断开',
   'session.closeTab': '关闭标签',
+
+  // 主机身份确认
+  'hostIdentity.title': '无法确认主机身份',
+  'hostIdentity.hint': '首次连接到该主机。请核对主机密钥指纹；仅在本次会话中信任，确认前不会进行认证。',
+  'hostIdentity.endpoint': '主机地址',
+  'hostIdentity.algorithm': '密钥算法',
+  'hostIdentity.fingerprint': 'SHA-256 指纹',
+  'hostIdentity.accept': '仅本次接受',
+  'hostIdentity.reject': '拒绝',
   'session.unknown': '连接异常',
   'phase.LoadingCredentials': '正在读取凭据...',
   'phase.ConnectingTcp': '正在建立 TCP 连接...',
   'phase.SshHandshake': '正在进行 SSH 握手...',
+  'phase.VerifyingHostKey': '正在验证主机身份...',
   'phase.Authenticating': '正在进行 SSH 认证...',
   'phase.OpeningChannel': '正在打开终端通道...',
   'phase.RequestingPty': '正在请求终端 PTY...',
@@ -150,6 +160,9 @@ export const zhCN = {
   'error.SftpTargetBusy': '目标正被同一会话的其他传输任务占用',
   'error.SftpPublishError': '安全发布失败，原文件未受影响',
   'error.MonitorError': '监控错误',
+  'error.HostKeyRejected': '已拒绝未知主机身份',
+  'error.HostKeyChallengeNotFound': '主机身份确认请求不存在',
+  'error.HostKeyVerificationCancelled': '主机身份验证已取消',
   'error.Unknown': '未知错误',
 } as const;
 

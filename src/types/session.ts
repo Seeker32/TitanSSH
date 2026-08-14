@@ -13,6 +13,7 @@ export enum ConnectionPhase {
   LoadingCredentials = "LoadingCredentials",
   ConnectingTcp = "ConnectingTcp",
   SshHandshake = "SshHandshake",
+  VerifyingHostKey = "VerifyingHostKey",
   Authenticating = "Authenticating",
   OpeningChannel = "OpeningChannel",
   RequestingPty = "RequestingPty",
@@ -29,6 +30,20 @@ export interface SessionStatusEvent {
   sessionId: string;
   status: SessionStatus;
   error?: AppErrorInfo | null;
+}
+
+/** 首次未知主机身份确认事件（host-identity:challenge）；指纹由后端计算，前端不解析 SSH key 文本 */
+export interface HostIdentityChallenge {
+  challengeId: string;
+  sessionId: string;
+  host: string;
+  port: number;
+  /** OpenSSH 风格算法名（如 ssh-ed25519） */
+  keyAlgorithm: string;
+  /** OpenSSH 风格 SHA-256 指纹 */
+  fingerprint: string;
+  /** Unix 毫秒时间戳 */
+  timestamp: number;
 }
 
 export enum SessionStatus {

@@ -98,6 +98,18 @@ pub enum AppError {
     /// 临时文件发布到最终目标失败（原目标文件不受影响）
     #[error("SFTP 发布失败: {0}")]
     SftpPublishError(String),
+
+    /// 用户拒绝了未知主机身份；detail 携带 endpoint 与指纹，连接不得进入认证
+    #[error("已拒绝未知主机身份: {0}")]
+    HostKeyRejected(String),
+
+    /// 主机身份确认请求不存在（已解决或从未创建）
+    #[error("主机身份确认请求不存在: {0}")]
+    HostKeyChallengeNotFound(String),
+
+    /// 等待主机身份确认期间会话被关闭，验证已取消
+    #[error("主机身份验证已取消: {0}")]
+    HostKeyVerificationCancelled(String),
 }
 
 impl AppError {
@@ -125,6 +137,9 @@ impl AppError {
             Self::SftpTargetExists(_) => "SftpTargetExists",
             Self::SftpTargetBusy(_) => "SftpTargetBusy",
             Self::SftpPublishError(_) => "SftpPublishError",
+            Self::HostKeyRejected(_) => "HostKeyRejected",
+            Self::HostKeyChallengeNotFound(_) => "HostKeyChallengeNotFound",
+            Self::HostKeyVerificationCancelled(_) => "HostKeyVerificationCancelled",
         }
     }
 
@@ -156,6 +171,9 @@ impl AppError {
             Self::SftpTargetExists(_) => Self::SftpTargetExists(merged),
             Self::SftpTargetBusy(_) => Self::SftpTargetBusy(merged),
             Self::SftpPublishError(_) => Self::SftpPublishError(merged),
+            Self::HostKeyRejected(_) => Self::HostKeyRejected(merged),
+            Self::HostKeyChallengeNotFound(_) => Self::HostKeyChallengeNotFound(merged),
+            Self::HostKeyVerificationCancelled(_) => Self::HostKeyVerificationCancelled(merged),
         }
     }
 }
@@ -185,6 +203,9 @@ impl From<AppError> for AppErrorInfo {
             | AppError::SftpTargetExists(detail)
             | AppError::SftpTargetBusy(detail)
             | AppError::SftpPublishError(detail) => detail,
+            AppError::HostKeyRejected(detail)
+            | AppError::HostKeyChallengeNotFound(detail)
+            | AppError::HostKeyVerificationCancelled(detail) => detail,
             AppError::IoError(detail) => detail.to_string(),
         };
         Self {
@@ -242,6 +263,23 @@ mod tests {
         assert_eq!(
             AppError::SftpPublishError("/tmp/a.txt".to_string()).code(),
             "SftpPublishError"
+        );
+    }
+
+    /// 主机身份错误使用稳定英文代码，供前端按 code 区分拒绝/取消/请求不存在。
+    #[test]
+    fn host_identity_errors_have_stable_codes() {
+        assert_eq!(
+            AppError::HostKeyRejected("10.0.0.8:22".to_string()).code(),
+            "HostKeyRejected"
+        );
+        assert_eq!(
+            AppError::HostKeyChallengeNotFound("challenge-1".to_string()).code(),
+            "HostKeyChallengeNotFound"
+        );
+        assert_eq!(
+            AppError::HostKeyVerificationCancelled("session-1".to_string()).code(),
+            "HostKeyVerificationCancelled"
         );
     }
 

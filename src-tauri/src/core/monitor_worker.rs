@@ -1,3 +1,4 @@
+use crate::core::host_identity::HostKeyVerifier;
 use crate::core::ssh_transport;
 use crate::core::ssh_transport::ExecTransport;
 use crate::errors::app_error::AppError;
@@ -147,15 +148,24 @@ pub fn run_monitor_loop_with<ConnFn>(
     }
 }
 
-/// 监控采集主循环（使用真实 ssh_client::connect）
+/// 监控采集主循环（使用真实 ssh transport）
 ///
 /// 是 run_monitor_loop_with 的薄包装，生产代码使用此函数。
+/// 监控连接与其他 capability 一样经过主机身份统一校验：握手后、认证前生效。
 pub fn run_monitor_loop(
+    verifier: HostKeyVerifier,
     params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) {
-    run_monitor_loop_with(ssh_transport::connect_exec, params, on_snapshot, on_error)
+    run_monitor_loop_with(
+        move |host, password, passphrase| {
+            ssh_transport::connect_exec(host, password, passphrase, &verifier)
+        },
+        params,
+        on_snapshot,
+        on_error,
+    )
 }
 
 /// 通过已建立的 SSH session 执行一次采集，返回 MonitorSnapshot
@@ -652,6 +662,51 @@ mod loop_tests {
             session_id: "session-1".to_string(),
             shutdown,
         }
+    }
+
+    /// 监控连接与其他 capability 一样先经过主机身份统一校验：
+    /// 校验被拒绝时监控连接失败（on_error 携带 HostKeyRejected），不进入采集。
+    #[test]
+    fn rejected_host_identity_fails_monitor_before_collection() {
+        use crate::core::host_identity::PresentedHostKey;
+        use std::sync::atomic::Ordering;
+
+        let snapshots: Arc<Mutex<Vec<MonitorSnapshot>>> = Arc::new(Mutex::new(vec![]));
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let snap_ref = Arc::clone(&snapshots);
+        let err_ref = Arc::clone(&errors);
+
+        // 模拟生产 transport 顺序：握手后、认证前调用统一校验器
+        let verifier: HostKeyVerifier = Arc::new(|_presented: &PresentedHostKey| {
+            Err(AppError::HostKeyRejected("10.0.0.8:22".to_string()))
+        });
+        let connect_fn = move |_host: &HostConfig,
+                               _pw: Option<&str>,
+                               _pp: Option<&str>|
+              -> Result<ExecTransport, AppError> {
+            verifier(&PresentedHostKey {
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:monitor".to_string(),
+            })?;
+            unreachable!("主机身份被拒绝时不得建立监控连接");
+        };
+
+        run_monitor_loop_with(
+            connect_fn,
+            make_params(shutdown),
+            move |snapshot| snap_ref.lock().unwrap().push(snapshot),
+            move |error| err_ref.lock().unwrap().push(error.to_string()),
+        );
+
+        assert_eq!(snapshots.lock().unwrap().len(), 0);
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("主机身份"), "错误应携带主机身份语义");
+        let _ = Ordering::Relaxed;
     }
 
     /// 连接失败时 on_error 被调用，on_snapshot 不被调用

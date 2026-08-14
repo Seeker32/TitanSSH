@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
-import type { SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
+import type { HostIdentityChallenge, SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, translate } from '@/i18n';
@@ -14,6 +14,8 @@ interface SessionState {
   activeView: string | null;
   /** 按 sessionId 存储的连接生命周期投影（阶段 + 结构化错误）；Connected/Disconnected 后清除。 */
   connections: Map<string, SessionConnection>;
+  /** 按 sessionId 存储的主机身份确认投影；接受/拒绝后清除。 */
+  hostKeyChallenges: Map<string, HostIdentityChallenge>;
   openSession: (hostId: string) => Promise<SessionInfo>;
   closeSession: (sessionId: string) => Promise<void>;
   writeTerminal: (sessionId: string, data: string) => Promise<void>;
@@ -21,6 +23,10 @@ interface SessionState {
   setActiveView: (viewId: string | null) => void;
   applySessionStatus: (payload: SessionStatusEvent) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
+  applyHostIdentityChallenge: (payload: HostIdentityChallenge) => void;
+  acceptHostIdentity: (sessionId: string) => Promise<void>;
+  rejectHostIdentity: (sessionId: string) => Promise<void>;
+  removeSessionProjection: (sessionId: string) => void;
   initListeners: () => Promise<() => void>;
 }
 
@@ -69,6 +75,22 @@ export const useSessionStore = create<SessionState>((set, get) => {
     sessions: new Map(),
     activeView: null,
     connections: new Map(),
+    hostKeyChallenges: new Map(),
+
+    /** 从前端投影移除会话及其关联状态；后端 teardown 由调用方保证。 */
+    removeSessionProjection(sessionId: string) {
+      set((state) => {
+        const sessions = new Map(state.sessions);
+        sessions.delete(sessionId);
+        const connections = new Map(state.connections);
+        connections.delete(sessionId);
+        const hostKeyChallenges = new Map(state.hostKeyChallenges);
+        hostKeyChallenges.delete(sessionId);
+        return { sessions, connections, hostKeyChallenges, activeView: state.activeView === sessionId ? null : state.activeView };
+      });
+      useMonitorStore.getState().clearSession(sessionId);
+      useSftpStore.getState().clearSession(sessionId);
+    },
 
     /** 打开 SSH 会话，初始化文件传输并启动关联监控任务。 */
     async openSession(hostId) {
@@ -91,15 +113,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     /** 关闭 SSH 会话；后端统一 teardown，前端只清理 projection。 */
     async closeSession(sessionId) {
       await invoke('close_session', { sessionId });
-      set((state) => {
-        const sessions = new Map(state.sessions);
-        sessions.delete(sessionId);
-        const connections = new Map(state.connections);
-        connections.delete(sessionId);
-        return { sessions, connections, activeView: state.activeView === sessionId ? null : state.activeView };
-      });
-      useMonitorStore.getState().clearSession(sessionId);
-      useSftpStore.getState().clearSession(sessionId);
+      get().removeSessionProjection(sessionId);
     },
 
     /** 将用户输入写入指定终端会话。 */
@@ -143,7 +157,46 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }));
     },
 
-    /** 注册会话状态与连接进度事件，返回统一清理函数。 */
+    /** 应用主机身份确认事件：按 sessionId 存储确认卡投影。 */
+    applyHostIdentityChallenge(payload) {
+      set((state) => ({
+        hostKeyChallenges: new Map(state.hostKeyChallenges).set(payload.sessionId, payload),
+      }));
+    },
+
+    /** 仅本次接受未知主机身份：接受该 Runtime Session 的 Terminal、SFTP、Monitoring 及重连。 */
+    async acceptHostIdentity(sessionId) {
+      const challenge = get().hostKeyChallenges.get(sessionId);
+      if (!challenge) return;
+      await invoke('accept_host_identity', { challengeId: challenge.challengeId });
+      set((state) => {
+        const hostKeyChallenges = new Map(state.hostKeyChallenges);
+        hostKeyChallenges.delete(sessionId);
+        return { hostKeyChallenges };
+      });
+    },
+
+    /** 拒绝未知主机身份并关闭整个 Session：Terminal、SFTP 与 Monitoring 服从同一决定。 */
+    async rejectHostIdentity(sessionId) {
+      const challenge = get().hostKeyChallenges.get(sessionId);
+      if (!challenge) return;
+      await invoke('reject_host_identity', { challengeId: challenge.challengeId });
+      set((state) => {
+        const hostKeyChallenges = new Map(state.hostKeyChallenges);
+        hostKeyChallenges.delete(sessionId);
+        return { hostKeyChallenges };
+      });
+      // 后端已在拒绝时执行 teardown；close_session 可能因会话已移除而报 SessionNotFound，
+      // 失败时仍清理本地投影，保证标签关闭
+      try {
+        await invoke('close_session', { sessionId });
+      } catch {
+        // 会话已由后端关闭
+      }
+      get().removeSessionProjection(sessionId);
+    },
+
+    /** 注册会话状态、连接进度与主机身份确认事件，返回统一清理函数。 */
     async initListeners() {
       const unlistenStatus = await listen<SessionStatusEvent>('session:status', (event) => {
         get().applySessionStatus(event.payload);
@@ -151,9 +204,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
       const unlistenProgress = await listen<SessionProgressEvent>('session:progress', (event) => {
         get().applySessionProgress(event.payload);
       });
+      const unlistenChallenge = await listen<HostIdentityChallenge>('host-identity:challenge', (event) => {
+        get().applyHostIdentityChallenge(event.payload);
+      });
       return () => {
         unlistenStatus();
         unlistenProgress();
+        unlistenChallenge();
       };
     },
   };

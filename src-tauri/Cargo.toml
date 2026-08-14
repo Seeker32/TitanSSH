@@ -17,6 +17,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros"] }
 ssh2 = "0.9"
+# 主机身份指纹：SHA-256（默认 features 含 std，供 fingerprint 计算使用）
+sha2 = "0.10"
+# OpenSSH 风格指纹的 base64（无填充）编码
+base64 = "0.22"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }

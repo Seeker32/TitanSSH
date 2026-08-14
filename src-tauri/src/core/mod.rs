@@ -1,3 +1,4 @@
+pub mod host_identity;
 pub mod host_service;
 pub mod monitor_service;
 pub mod monitor_worker;

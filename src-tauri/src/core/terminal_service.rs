@@ -1,3 +1,4 @@
+use crate::core::host_identity::HostKeyVerifier;
 use crate::core::ssh_transport;
 use crate::core::ssh_transport::{ConnectPhase, TerminalTransport};
 use crate::errors::app_error::AppError;
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// SSH 连接阶段总超时时间（含 TCP、握手、认证），作为 libssh2 阻塞场景的外层兜底
@@ -23,6 +24,8 @@ pub enum ConnectionPhase {
     LoadingCredentials,
     ConnectingTcp,
     SshHandshake,
+    /// 首次未知主机身份确认：等待用户决定期间不占用连接总超时
+    VerifyingHostKey,
     Authenticating,
     OpeningChannel,
     RequestingPty,
@@ -49,9 +52,21 @@ pub enum TerminalCommand {
     Close,
 }
 
+/// SSH 连接函数：生产为 ssh_transport::connect_terminal，测试可注入模拟实现。
+type TerminalConnectFn = Box<
+    dyn FnOnce(
+            &HostConfig,
+            Option<&str>,
+            Option<&str>,
+            &HostKeyVerifier,
+            &mut dyn FnMut(ConnectPhase),
+        ) -> Result<TerminalTransport, AppError>
+        + Send,
+>;
+
 /// 启动终端服务工作线程
 ///
-/// 负责从安全存储读取凭据、建立 SSH 连接、请求 PTY、启动 Shell，
+/// 负责从安全存储读取凭据、建立 SSH 连接（含首次主机身份确认）、请求 PTY、启动 Shell，
 /// 并进入非阻塞 IO 循环处理终端数据读写，派发 terminal:data 和 session:status 事件。
 ///
 /// # 参数
@@ -61,6 +76,7 @@ pub enum TerminalCommand {
 /// - `command_rx`: 命令接收端，接收来自协调层的终端命令
 /// - `shutdown`: 关闭标志，设置为 true 时工作线程退出
 /// - `runtime_status`: 后端权威会话状态，事件发出前先更新
+/// - `verifier`: 主机身份统一校验器（握手后、认证前生效）
 pub fn start_terminal_session<R: Runtime>(
     app: AppHandle<R>,
     host: HostConfig,
@@ -68,8 +84,9 @@ pub fn start_terminal_session<R: Runtime>(
     command_rx: Receiver<TerminalCommand>,
     shutdown: Arc<AtomicBool>,
     runtime_status: Arc<Mutex<SessionStatus>>,
+    verifier: HostKeyVerifier,
 ) {
-    start_terminal_session_with_credential_loader(
+    start_terminal_session_with_parts(
         app,
         host,
         session_id,
@@ -77,11 +94,19 @@ pub fn start_terminal_session<R: Runtime>(
         shutdown,
         runtime_status,
         load_credentials,
+        verifier,
+        Box::new(
+            |host, password, passphrase, verifier: &HostKeyVerifier, on_phase| {
+                ssh_transport::connect_terminal(host, password, passphrase, verifier, on_phase)
+            },
+        ),
+        Duration::from_secs(CONNECT_TOTAL_TIMEOUT_SECS),
     );
 }
 
-/// 启动可注入凭据加载器的终端工作线程，生产环境使用系统安全存储，测试可模拟首次授权等待
-fn start_terminal_session_with_credential_loader<R, F>(
+/// 启动可注入部件的终端工作线程：凭据加载、连接函数与连接总超时均可替换，供测试使用。
+#[allow(clippy::too_many_arguments)]
+fn start_terminal_session_with_parts<R, F>(
     app: AppHandle<R>,
     host: HostConfig,
     session_id: String,
@@ -89,6 +114,9 @@ fn start_terminal_session_with_credential_loader<R, F>(
     shutdown: Arc<AtomicBool>,
     runtime_status: Arc<Mutex<SessionStatus>>,
     credential_loader: F,
+    verifier: HostKeyVerifier,
+    connect_fn: TerminalConnectFn,
+    connect_timeout: Duration,
 ) where
     R: Runtime,
     F: FnOnce(&HostConfig) -> Result<(Option<String>, Option<String>), AppError> + Send + 'static,
@@ -134,13 +162,15 @@ fn start_terminal_session_with_credential_loader<R, F>(
         let session_id_for_connect = session_id.clone();
         let current_phase = Arc::new(Mutex::new(ConnectionPhase::ConnectingTcp));
         let current_phase_for_connect = current_phase.clone();
+        let verifier_for_connect = verifier;
 
         thread::spawn(move || {
-            let result = ssh_transport::connect_terminal(
+            let result = connect_fn(
                 &host_clone,
                 password_owned.as_deref(),
                 passphrase_owned.as_deref(),
-                |phase| {
+                &verifier_for_connect,
+                &mut |phase| {
                     let mapped_phase = map_connect_phase(phase);
                     update_current_phase(&current_phase_for_connect, mapped_phase.clone());
                     emit_connection_progress(
@@ -154,26 +184,32 @@ fn start_terminal_session_with_credential_loader<R, F>(
             let _ = conn_tx.send(result);
         });
 
-        // 等待连接结果，超时则派发 Timeout 状态并退出
-        let mut terminal =
-            match conn_rx.recv_timeout(Duration::from_secs(CONNECT_TOTAL_TIMEOUT_SECS)) {
-                Ok(Ok(terminal)) => terminal,
+        // 等待连接结果：固定短轮询，按当前阶段决定是否消耗连接总超时预算。
+        // 主机身份确认（VerifyingHostKey）等待用户决定期间不设独立自动超时、
+        // 不占用预算；其余阶段共享总预算，超过截止即上报 Timeout。
+        let overall_deadline = Instant::now() + connect_timeout;
+        let mut terminal = loop {
+            let active_phase = current_phase_value(&current_phase);
+            let verifying = active_phase == ConnectionPhase::VerifyingHostKey;
+            if !verifying && Instant::now() >= overall_deadline {
+                emit_session_status(
+                    &app,
+                    &session_id,
+                    &runtime_status,
+                    SessionStatus::Timeout,
+                    Some(phase_timeout_message(&active_phase)),
+                );
+                return;
+            }
+            match conn_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(terminal)) => break terminal,
                 Ok(Err(error)) => {
-                    let active_phase = current_phase_value(&current_phase);
                     let (status, message) = map_phase_error_to_status(&active_phase, &error);
                     emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // recv_timeout 超时：连接线程仍在阻塞，直接放弃并上报超时
-                    emit_session_status(
-                        &app,
-                        &session_id,
-                        &runtime_status,
-                        SessionStatus::Timeout,
-                        Some(phase_timeout_message(&current_phase_value(&current_phase))),
-                    );
-                    return;
+                    // 回到循环顶：重新读取阶段并按截止判定（验证阶段无限等待）
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     emit_session_status(
@@ -185,7 +221,8 @@ fn start_terminal_session_with_credential_loader<R, F>(
                     );
                     return;
                 }
-            };
+            }
+        };
 
         // 派发"已连接"状态事件
         emit_session_status(
@@ -351,6 +388,7 @@ fn map_connect_phase(phase: ConnectPhase) -> ConnectionPhase {
     match phase {
         ConnectPhase::ConnectingTcp => ConnectionPhase::ConnectingTcp,
         ConnectPhase::SshHandshake => ConnectionPhase::SshHandshake,
+        ConnectPhase::VerifyingHostKey => ConnectionPhase::VerifyingHostKey,
         ConnectPhase::Authenticating => ConnectionPhase::Authenticating,
         ConnectPhase::OpeningChannel => ConnectionPhase::OpeningChannel,
         ConnectPhase::RequestingPty => ConnectionPhase::RequestingPty,
@@ -385,6 +423,7 @@ fn phase_message(phase: &ConnectionPhase) -> &'static str {
         ConnectionPhase::LoadingCredentials => "正在读取凭据...",
         ConnectionPhase::ConnectingTcp => "正在建立 TCP 连接...",
         ConnectionPhase::SshHandshake => "正在进行 SSH 握手...",
+        ConnectionPhase::VerifyingHostKey => "正在验证主机身份...",
         ConnectionPhase::Authenticating => "正在进行 SSH 认证...",
         ConnectionPhase::OpeningChannel => "正在打开终端通道...",
         ConnectionPhase::RequestingPty => "正在请求终端 PTY...",
@@ -400,6 +439,7 @@ fn phase_timeout_message(phase: &ConnectionPhase) -> String {
         ConnectionPhase::LoadingCredentials => "读取系统凭据超时".to_string(),
         ConnectionPhase::ConnectingTcp => "建立 TCP 连接超时".to_string(),
         ConnectionPhase::SshHandshake => "SSH 握手超时".to_string(),
+        ConnectionPhase::VerifyingHostKey => "主机身份确认超时".to_string(),
         ConnectionPhase::Authenticating => "SSH 认证超时".to_string(),
         ConnectionPhase::OpeningChannel => "打开终端通道超时".to_string(),
         ConnectionPhase::RequestingPty => "请求终端 PTY 超时".to_string(),
@@ -431,6 +471,16 @@ fn map_phase_error_to_status(phase: &ConnectionPhase, error: &AppError) -> (Sess
             (SessionStatus::Timeout, phase_timeout_message(phase))
         }
         AppError::SecureStoreError(msg) => (SessionStatus::Error, format!("凭据读取失败: {msg}")),
+        // 用户拒绝未知主机身份：不进入认证，展示结构化错误供所属标签渲染
+        AppError::HostKeyRejected(detail) => (
+            SessionStatus::Error,
+            format!("已拒绝未知主机身份: {detail}"),
+        ),
+        // 会话关闭取消了等待中的主机身份验证
+        AppError::HostKeyVerificationCancelled(_) => (
+            SessionStatus::Error,
+            "主机身份验证已随会话关闭取消".to_string(),
+        ),
         // 凭据不存在：引导用户重新保存主机配置，而非显示通用错误
         AppError::CredentialNotFound(key) => (
             SessionStatus::Error,
@@ -726,10 +776,16 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use crate::core::host_identity::{HostIdentityService, HostKeyVerifier, PresentedHostKey};
     use crate::errors::app_error::AppError;
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::session::SessionStatus;
     use serde_json::json;
+
+    /// 构建总是放行的主机身份校验器，供不关注身份确认的终端测试使用。
+    fn test_allow_all_verifier() -> HostKeyVerifier {
+        Arc::new(|_presented: &PresentedHostKey| Ok(()))
+    }
 
     /// 构造测试用 HostConfig（密码认证模式）
     fn make_password_host(password_ref: Option<&str>) -> HostConfig {
@@ -980,6 +1036,222 @@ mod integration_tests {
         );
     }
 
+    /// 构建模拟 transport 顺序的连接函数：握手后、认证前调用统一校验器。
+    /// 与生产 ssh_transport::connect_session 的校验位置一致。
+    fn gated_connect_fn(presented: PresentedHostKey) -> TerminalConnectFn {
+        Box::new(
+            move |_host,
+                  _password,
+                  _passphrase,
+                  verifier,
+                  on_phase: &mut dyn FnMut(ConnectPhase)| {
+                on_phase(ConnectPhase::ConnectingTcp);
+                on_phase(ConnectPhase::SshHandshake);
+                on_phase(ConnectPhase::VerifyingHostKey);
+                verifier(&presented)?;
+                on_phase(ConnectPhase::Authenticating);
+                Ok(crate::core::ssh_transport::test_support::idle_terminal())
+            },
+        )
+    }
+
+    /// 等待后端权威状态偏离 Connecting，返回最终状态。
+    fn wait_for_final_status(
+        runtime_status: &Arc<Mutex<SessionStatus>>,
+        timeout: Duration,
+    ) -> SessionStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = runtime_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if status != SessionStatus::Connecting || Instant::now() >= deadline {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 主机身份等待用户决定期间不占用连接总超时：远超预算仍保持 Connecting，
+    /// 接受后进入认证并连接成功。
+    #[test]
+    fn host_identity_wait_does_not_consume_connect_timeout() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-identity-wait".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| Ok((Some("password".to_string()), None)),
+            identity.verifier(app.handle().clone(), "session-identity-wait".to_string()),
+            gated_connect_fn(PresentedHostKey {
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:terminal-wait".to_string(),
+            }),
+            // 预算远小于下方等待时长：验证等待期间不设独立自动超时
+            Duration::from_millis(300),
+        );
+
+        // challenge 出现后等待 1s（> 3× 预算），状态必须仍为 Connecting
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity
+            .pending_challenge("session-identity-wait")
+            .is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity
+            .pending_challenge("session-identity-wait")
+            .expect("终端连接产生主机身份 challenge");
+        thread::sleep(Duration::from_millis(1_000));
+        assert_eq!(
+            wait_for_final_status(&runtime_status, Duration::from_millis(50)),
+            SessionStatus::Connecting,
+            "等待用户确认主机身份期间不设独立自动超时"
+        );
+
+        identity.accept(&challenge.challenge_id).unwrap();
+        assert_eq!(
+            wait_for_final_status(&runtime_status, Duration::from_secs(2)),
+            SessionStatus::Connected,
+            "仅本次接受后终端继续认证并连接成功"
+        );
+    }
+
+    /// 拒绝主机身份：终端连接失败，会话状态为 Error，不进入认证。
+    #[test]
+    fn host_identity_rejection_fails_terminal_as_error() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-identity-deny".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| Ok((Some("password".to_string()), None)),
+            identity.verifier(app.handle().clone(), "session-identity-deny".to_string()),
+            gated_connect_fn(PresentedHostKey {
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:terminal-deny".to_string(),
+            }),
+            Duration::from_secs(15),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity
+            .pending_challenge("session-identity-deny")
+            .is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity.pending_challenge("session-identity-deny").unwrap();
+        identity.reject(&challenge.challenge_id).unwrap();
+
+        assert_eq!(
+            wait_for_final_status(&runtime_status, Duration::from_secs(2)),
+            SessionStatus::Error,
+            "拒绝后终端连接以 Error 失败"
+        );
+    }
+
+    /// 关闭 Session 取消等待中的主机身份验证：连接以取消错误退出，不进入认证。
+    #[test]
+    fn session_close_cancels_pending_host_identity_verification() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-identity-cancel".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| Ok((Some("password".to_string()), None)),
+            identity.verifier(app.handle().clone(), "session-identity-cancel".to_string()),
+            gated_connect_fn(PresentedHostKey {
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:terminal-cancel".to_string(),
+            }),
+            Duration::from_secs(15),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity
+            .pending_challenge("session-identity-cancel")
+            .is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // 关闭 Session：取消全部等待者并清除临时信任
+        identity.cancel_session("session-identity-cancel");
+
+        assert_eq!(
+            wait_for_final_status(&runtime_status, Duration::from_secs(2)),
+            SessionStatus::Error,
+            "会话关闭取消等待中的主机身份验证，终端以 Error 退出"
+        );
+        assert!(
+            identity
+                .pending_challenge("session-identity-cancel")
+                .is_none()
+        );
+    }
+
+    /// 用户拒绝主机身份映射为 Error 状态并保留结构化语义。
+    #[test]
+    fn host_key_rejected_maps_to_error_status() {
+        let (status, message) = map_phase_error_to_status(
+            &ConnectionPhase::VerifyingHostKey,
+            &AppError::HostKeyRejected("10.0.0.8:22 (SHA256:xxx)".to_string()),
+        );
+        assert_eq!(status, SessionStatus::Error);
+        assert!(message.contains("已拒绝未知主机身份"));
+    }
+
+    /// 会话关闭取消的主机身份验证映射为 Error 状态。
+    #[test]
+    fn host_key_cancelled_maps_to_error_status() {
+        let (status, message) = map_phase_error_to_status(
+            &ConnectionPhase::VerifyingHostKey,
+            &AppError::HostKeyVerificationCancelled("session-1".to_string()),
+        );
+        assert_eq!(status, SessionStatus::Error);
+        assert!(message.contains("主机身份验证"));
+    }
+
     /// 首次系统授权超过五秒后，成功读取的凭据仍应继续进入 SSH 连接阶段
     #[test]
     fn slow_credential_authorization_does_not_timeout_session() {
@@ -994,7 +1266,7 @@ mod integration_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
 
-        start_terminal_session_with_credential_loader(
+        start_terminal_session_with_parts(
             app.handle().clone(),
             host,
             "session-slow-authorization".to_string(),
@@ -1005,6 +1277,14 @@ mod integration_tests {
                 thread::sleep(Duration::from_millis(5_100));
                 Ok((Some("password".to_string()), None))
             },
+            test_allow_all_verifier(),
+            Box::new(|_host, _password, _passphrase, _verifier, on_phase| {
+                on_phase(ConnectPhase::ConnectingTcp);
+                Err(AppError::SshConnectionError(
+                    "connection refused".to_string(),
+                ))
+            }),
+            Duration::from_secs(15),
         );
 
         let deadline = Instant::now() + Duration::from_secs(7);

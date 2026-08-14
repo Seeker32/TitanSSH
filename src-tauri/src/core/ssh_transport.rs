@@ -1,3 +1,6 @@
+use crate::core::host_identity::{
+    HostKeyVerifier, PresentedHostKey, algorithm_name, fingerprint_sha256,
+};
 use crate::errors::app_error::AppError;
 use crate::models::host::{AuthType, HostConfig};
 use serde::Serialize;
@@ -19,6 +22,8 @@ const TERMINAL_SETUP_TIMEOUT_MS: u32 = 5_000;
 pub enum ConnectPhase {
     ConnectingTcp,
     SshHandshake,
+    /// 首次未知主机身份确认：阻塞等待用户决定，不进入认证
+    VerifyingHostKey,
     Authenticating,
     OpeningChannel,
     RequestingPty,
@@ -337,12 +342,13 @@ pub fn connect_terminal<F>(
     host: &HostConfig,
     password: Option<&str>,
     passphrase: Option<&str>,
+    verifier: &HostKeyVerifier,
     mut on_phase: F,
 ) -> Result<TerminalTransport, AppError>
 where
     F: FnMut(ConnectPhase),
 {
-    let session = connect_session(host, password, passphrase, &mut on_phase)?;
+    let session = connect_session(host, password, passphrase, verifier, &mut on_phase)?;
     session.set_timeout(TERMINAL_SETUP_TIMEOUT_MS);
 
     on_phase(ConnectPhase::OpeningChannel);
@@ -363,8 +369,9 @@ pub fn connect_sftp(
     host: &HostConfig,
     password: Option<&str>,
     passphrase: Option<&str>,
+    verifier: &HostKeyVerifier,
 ) -> Result<SftpTransport, AppError> {
-    let session = connect_session(host, password, passphrase, &mut |_| {})?;
+    let session = connect_session(host, password, passphrase, verifier, &mut |_| {})?;
     let sftp = session
         .sftp()
         .map_err(|error| AppError::SftpChannelError(error.to_string()))?;
@@ -376,16 +383,20 @@ pub fn connect_exec(
     host: &HostConfig,
     password: Option<&str>,
     passphrase: Option<&str>,
+    verifier: &HostKeyVerifier,
 ) -> Result<ExecTransport, AppError> {
-    connect_session(host, password, passphrase, &mut |_| {})
+    connect_session(host, password, passphrase, verifier, &mut |_| {})
         .map(|session| ExecTransport::from_backend(Ssh2Exec { session }))
 }
 
 /// 建立 TCP、SSH 握手并完成认证；raw Session 不离开本 module。
+/// 首次未知主机身份在握手后、任何认证前经 verifier 统一校验，
+/// 拒绝或取消时不发送任何密码或私钥。
 fn connect_session<F>(
     host: &HostConfig,
     password: Option<&str>,
     passphrase: Option<&str>,
+    verifier: &HostKeyVerifier,
     on_phase: &mut F,
 ) -> Result<Session, AppError>
 where
@@ -402,6 +413,18 @@ where
     session.set_timeout(SSH_PROTOCOL_TIMEOUT_MS);
     session.set_tcp_stream(tcp);
     session.handshake().map_err(protocol_error)?;
+
+    // 主机身份统一校验：计算指纹并等待用户决定；任何拒绝在认证前终止连接
+    on_phase(ConnectPhase::VerifyingHostKey);
+    if let Some((blob, key_type)) = session.host_key() {
+        let presented = PresentedHostKey {
+            host: host.host.clone(),
+            port: host.port,
+            algorithm: algorithm_name(key_type).to_string(),
+            fingerprint: fingerprint_sha256(blob),
+        };
+        verifier(&presented)?;
+    }
 
     on_phase(ConnectPhase::Authenticating);
     match host.auth_type {
@@ -528,7 +551,10 @@ fn build_connect_error(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{ExecOps, ExecTransport, RemoteFile, SftpEntry, SftpOps, SftpTransport};
+    use super::{
+        ExecOps, ExecTransport, RemoteFile, SftpEntry, SftpOps, SftpTransport, TerminalOps,
+        TerminalTransport,
+    };
     use crate::errors::app_error::AppError;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1412,6 +1438,39 @@ pub(crate) mod test_support {
     }
 
     /// 创建返回空目录的 SFTP 测试 capability。
+    /// 构建总是放行的主机身份校验器（真实 SSH E2E 与 transport 测试使用）。
+    pub(crate) fn allow_all_verifier() -> crate::core::host_identity::HostKeyVerifier {
+        std::sync::Arc::new(|_presented: &crate::core::host_identity::PresentedHostKey| Ok(()))
+    }
+
+    /// 构建空闲终端 capability：无输出、不 EOF，供连接编排测试驱动主循环。
+    pub(crate) fn idle_terminal() -> TerminalTransport {
+        struct IdleTerminal;
+        impl TerminalOps for IdleTerminal {
+            /// 始终无数据可读。
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "idle"))
+            }
+            /// 丢弃写入。
+            fn write(&mut self, _data: &str) -> Result<(), AppError> {
+                Ok(())
+            }
+            /// 忽略尺寸调整。
+            fn resize(&mut self, _cols: u32, _rows: u32) -> Result<(), AppError> {
+                Ok(())
+            }
+            /// 永不 EOF。
+            fn eof(&self) -> bool {
+                false
+            }
+            /// 关闭为 no-op。
+            fn close(&mut self) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+        TerminalTransport::from_backend(IdleTerminal)
+    }
+
     pub(crate) fn empty_sftp() -> SftpTransport {
         SftpTransport::from_backend(EmptySftp)
     }
@@ -1535,6 +1594,7 @@ mod tests {
         TerminalOps, TerminalTransport, build_connect_error, connect_tcp_stream, is_timeout_error,
         map_sftp_rename_error, resolve_socket_addrs,
     };
+    use crate::core::ssh_transport::test_support::allow_all_verifier;
     use crate::errors::app_error::AppError;
     use crate::models::host::{AuthType, HostConfig};
     use std::io;
@@ -1836,8 +1896,13 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let (host, password, passphrase) = e2e_host();
-        let mut exec = super::connect_exec(&host, password.as_deref(), passphrase.as_deref())
-            .expect("Exec transport 应连接成功");
+        let mut exec = super::connect_exec(
+            &host,
+            password.as_deref(),
+            passphrase.as_deref(),
+            &allow_all_verifier(),
+        )
+        .expect("Exec transport 应连接成功");
         let remote_path = format!("/tmp/titan-transport-{}.bin", uuid::Uuid::new_v4());
         exec.execute(&format!(
             "dd if=/dev/zero of={} bs=1048576 count=8 2>/dev/null",
@@ -1845,11 +1910,21 @@ mod tests {
         ))
         .expect("应创建 E2E 远端文件");
 
-        let mut terminal =
-            super::connect_terminal(&host, password.as_deref(), passphrase.as_deref(), |_| {})
-                .expect("Terminal transport 应连接成功");
-        let mut sftp = super::connect_sftp(&host, password.as_deref(), passphrase.as_deref())
-            .expect("SFTP transport 应连接成功");
+        let mut terminal = super::connect_terminal(
+            &host,
+            password.as_deref(),
+            passphrase.as_deref(),
+            &allow_all_verifier(),
+            |_| {},
+        )
+        .expect("Terminal transport 应连接成功");
+        let mut sftp = super::connect_sftp(
+            &host,
+            password.as_deref(),
+            passphrase.as_deref(),
+            &allow_all_verifier(),
+        )
+        .expect("SFTP transport 应连接成功");
         let transfer_started = Arc::new(Barrier::new(2));
         let transfer_done = Arc::new(AtomicBool::new(false));
         let started_for_transfer = transfer_started.clone();

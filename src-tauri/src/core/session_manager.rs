@@ -1,3 +1,4 @@
+use crate::core::host_identity::{HostIdentityService, HostKeyVerifier};
 use crate::core::monitor_service::MonitorService;
 use crate::core::sftp_service::SftpService;
 use crate::core::terminal_service;
@@ -40,15 +41,22 @@ pub struct SessionManager {
     monitor_service: MonitorService,
     /// File Transfer module，共享 clone 只复制内部 registry 引用。
     sftp_service: SftpService,
+    /// 主机身份确认服务：临时信任与 pending challenge 的单一后端权威
+    identity_service: HostIdentityService,
 }
 
 impl SessionManager {
-    /// 使用共享 Monitoring 与 File Transfer 状态创建会话管理器实例
-    pub fn new(monitor_service: MonitorService, sftp_service: SftpService) -> Self {
+    /// 使用共享 Monitoring、File Transfer 与主机身份确认状态创建会话管理器实例
+    pub fn new(
+        monitor_service: MonitorService,
+        sftp_service: SftpService,
+        identity_service: HostIdentityService,
+    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             monitor_service,
             sftp_service,
+            identity_service,
         }
     }
 
@@ -108,9 +116,17 @@ impl SessionManager {
                 },
             );
 
+        // 为该 Runtime Session 构建统一主机身份校验器：Terminal、SFTP、Monitoring 共用
+        let verifier = self
+            .identity_service
+            .verifier(app.clone(), session_id.clone());
+
         // 与 Terminal 并行启动独立 SFTP 连接；registry 在返回前已可等待连接结果。
-        self.sftp_service
-            .register_session(session_id.clone(), host.clone());
+        self.sftp_service.register_session_with_verifier(
+            session_id.clone(),
+            host.clone(),
+            verifier.clone(),
+        );
 
         // 启动 terminal_service 工作线程（独立 SSH 连接、PTY、终端 IO）
         terminal_service::start_terminal_session(
@@ -120,6 +136,7 @@ impl SessionManager {
             command_rx,
             shutdown.clone(),
             runtime_status,
+            verifier,
         );
 
         Ok(session_info)
@@ -178,6 +195,8 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id)
             .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))?;
+        // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
+        self.identity_service.cancel_session(session_id);
         // 通知所有工作线程退出
         handle.shutdown.store(true, Ordering::Relaxed);
         // 发送关闭命令到终端工作线程
@@ -209,6 +228,24 @@ impl SessionManager {
             .collect()
     }
 
+    /// 为指定 Session 构建主机身份统一校验器，供 Monitoring 等按需启动的 capability 使用。
+    pub fn host_key_verifier<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        session_id: &str,
+    ) -> Result<HostKeyVerifier, AppError> {
+        // 校验会话存在，避免为已关闭会话发放校验器
+        self.host_config(session_id)?;
+        Ok(self
+            .identity_service
+            .verifier(app.clone(), session_id.to_string()))
+    }
+
+    /// 主机身份确认服务句柄，供命令层接受/拒绝决定使用。
+    pub fn identity_service(&self) -> &HostIdentityService {
+        &self.identity_service
+    }
+
     /// 返回指定 Session 的主机配置副本，供所属 module 在锁外启动工作。
     pub fn host_config(&self, session_id: &str) -> Result<HostConfig, AppError> {
         self.sessions
@@ -227,7 +264,11 @@ mod tests {
 
     /// 创建共享运行时状态一致的 SessionManager。
     fn make_manager() -> SessionManager {
-        SessionManager::new(MonitorService::new(), SftpService::new())
+        SessionManager::new(
+            MonitorService::new(),
+            SftpService::new(),
+            HostIdentityService::new(),
+        )
     }
 
     /// 构造测试用 HostConfig
@@ -302,13 +343,79 @@ mod tests {
                 "expected test failure".to_string(),
             ))
         });
-        let manager = SessionManager::new(MonitorService::new(), sftp_service.clone());
+        let manager = SessionManager::new(
+            MonitorService::new(),
+            sftp_service.clone(),
+            HostIdentityService::new(),
+        );
 
         let session = manager
             .open_session(app.handle().clone(), make_host("host-1"))
             .unwrap();
 
         assert!(sftp_service.has_session(&session.session_id));
+    }
+
+    /// close_session 必须取消该 Session 等待中的主机身份验证并清除临时信任。
+    #[test]
+    fn close_session_cancels_host_identity_waiters() {
+        use crate::core::host_identity::PresentedHostKey;
+        use std::time::{Duration, Instant};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let sftp_service = SftpService::with_connector(|_, _| {
+            Err(AppError::SshConnectionError(
+                "expected test failure".to_string(),
+            ))
+        });
+        let manager = SessionManager::new(MonitorService::new(), sftp_service, identity.clone());
+        let session_id = "session-identity-close".to_string();
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        manager.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                meta: SessionInfo {
+                    session_id: session_id.clone(),
+                    host_id: "host-1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 22,
+                    username: "root".to_string(),
+                    status: SessionStatus::Connecting,
+                    created_at: 1_710_000_000_000,
+                },
+                runtime_status: Arc::new(Mutex::new(SessionStatus::Connecting)),
+                command_tx,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                host: make_host("host-1"),
+            },
+        );
+
+        // 模拟该 Session 的 capability 连接正在等待主机身份确认
+        let verifier = identity.verifier(app.handle().clone(), session_id.clone());
+        let waiter = std::thread::spawn(move || {
+            verifier(&PresentedHostKey {
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:manager-close".to_string(),
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity.pending_challenge(&session_id).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        manager
+            .close_session(&session_id, &app.handle().clone())
+            .unwrap();
+
+        // 等待者以取消错误退出，不得进入认证
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.code(), "HostKeyVerificationCancelled");
+        assert!(identity.pending_challenge(&session_id).is_none());
     }
 
     /// close_session 必须在后端一次性停止 Terminal、Monitoring 并清理 File Transfer。
@@ -325,7 +432,11 @@ mod tests {
                 "expected test failure".to_string(),
             ))
         });
-        let manager = SessionManager::new(monitor_service.clone(), sftp_service.clone());
+        let manager = SessionManager::new(
+            monitor_service.clone(),
+            sftp_service.clone(),
+            HostIdentityService::new(),
+        );
         let session_id = "session-close-all".to_string();
         let terminal_shutdown = Arc::new(AtomicBool::new(false));
         let monitor_shutdown = Arc::new(AtomicBool::new(false));

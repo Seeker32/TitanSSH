@@ -6,7 +6,9 @@ use tauri::{AppHandle, State};
 
 /// 为指定会话启动监控任务
 ///
-/// 从 session_manager 读取主机配置后，委托 monitor_service 读取凭据并创建后台采集任务。
+/// 从 session_manager 读取主机配置与主机身份统一校验器后，
+/// 委托 monitor_service 读取凭据并创建后台采集任务；监控连接与其他 capability
+/// 一样在握手后、认证前经过统一校验。
 /// 返回包含 task_id 的 TaskInfo，前端可用于跟踪任务状态。
 /// 凭据读取失败或 session 不存在时返回错误字符串。
 #[tauri::command]
@@ -19,8 +21,11 @@ pub fn start_monitoring(
     let host = session_manager
         .host_config(&session_id)
         .map_err(AppErrorInfo::from)?;
+    let verifier = session_manager
+        .host_key_verifier(&app, &session_id)
+        .map_err(AppErrorInfo::from)?;
     monitor_service
-        .start_monitoring(session_id, host, app)
+        .start_monitoring(session_id, host, verifier, app)
         .map_err(AppErrorInfo::from)
 }
 
