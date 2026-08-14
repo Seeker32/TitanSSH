@@ -32,19 +32,29 @@ export interface SessionStatusEvent {
   error?: AppErrorInfo | null;
 }
 
-/** 首次未知主机身份确认事件（host-identity:challenge）；指纹由后端计算，前端不解析 SSH key 文本 */
+/** 首次未知主机身份确认事件（host-identity:challenge）；指纹由后端计算，前端不解析 SSH key 文本。
+ *  kind=Changed 时同时携带已保存旧记录与服务器本次呈现的算法/指纹。 */
 export interface HostIdentityChallenge {
   challengeId: string;
   sessionId: string;
   host: string;
   port: number;
-  /** OpenSSH 风格算法名（如 ssh-ed25519） */
+  /** challenge 类型：未知主机或已保存 key 与呈现不一致；旧后端缺省视为 Unknown。 */
+  kind?: HostIdentityChallengeKind;
+  /** OpenSSH 风格算法名（如 ssh-ed25519）；Changed 时为服务器本次呈现的算法 */
   keyAlgorithm: string;
-  /** OpenSSH 风格 SHA-256 指纹 */
+  /** OpenSSH 风格 SHA-256 指纹；Changed 时为服务器本次呈现 key 的指纹 */
   fingerprint: string;
+  /** Changed 专属：已保存信任记录的算法名；Unknown 为 null/缺省 */
+  storedAlgorithm?: string | null;
+  /** Changed 专属：已保存信任记录的 SHA-256 指纹；Unknown 为 null/缺省 */
+  storedFingerprint?: string | null;
   /** Unix 毫秒时间戳 */
   timestamp: number;
 }
+
+/** challenge 类型：未知主机 / 已保存记录与呈现 key 不一致（主机指纹变化） */
+export type HostIdentityChallengeKind = 'Unknown' | 'Changed';
 
 export enum SessionStatus {
   Connecting = "Connecting",

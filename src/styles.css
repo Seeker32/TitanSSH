@@ -191,6 +191,17 @@ body.sftp-resizing { cursor: row-resize; }
 .host-identity-card__accept:hover { background: var(--color-accent-light); }
 .host-identity-card__reject { padding: 5px 14px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card-bg); color: var(--color-text-primary); }
 .host-identity-card__reject:hover { background: var(--color-card-bg-hover); }
+/* Changed challenge：已保存/呈现两组键信息与替换二次确认 */
+.host-identity-card__group { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card-bg); }
+.host-identity-card__group--stored .host-identity-card__mono { color: var(--color-text-secondary); }
+.host-identity-card--changed .host-identity-card__title { color: var(--color-danger, #ef4444); }
+.host-identity-card__confirm { display: flex; flex-direction: column; gap: 4px; flex: 1; padding: 8px 10px; border: 1px solid var(--color-danger, #ef4444); border-radius: 6px; background: rgba(239, 68, 68, .08); }
+.host-identity-card__confirm-title { margin: 0; font-size: 12px; font-weight: 600; color: var(--color-danger, #ef4444); }
+.host-identity-card__confirm-hint { margin: 0; font-size: 12px; line-height: 1.6; color: var(--color-text-secondary); }
+.host-identity-card__replace-confirm { padding: 5px 14px; border: 0; border-radius: 6px; background: var(--color-danger, #ef4444); color: #ffffff; }
+.host-identity-card__replace-confirm:hover { background: #dc2626; }
+.host-identity-card__cancel { padding: 5px 14px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card-bg); color: var(--color-text-primary); }
+.host-identity-card__cancel:hover { background: var(--color-card-bg-hover); }
 .custom-scrollbar__thumb { position: absolute; top: 0; left: 0; width: 100%; display: none; border-radius: 99px;
   background: rgba(148, 163, 184, .45); cursor: pointer; pointer-events: all; }
 .custom-scrollbar__thumb:hover { background: rgba(148, 163, 184, .75); }

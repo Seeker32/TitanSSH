@@ -7,7 +7,7 @@
 //! 不把策略复制到各 capability service。
 
 use crate::errors::app_error::AppError;
-use crate::models::session::HostIdentityChallenge;
+use crate::models::session::{HostIdentityChallenge, HostIdentityChallengeKind};
 use crate::storage::trust_store::{TrustRecord, TrustStore};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -177,9 +177,14 @@ impl HostIdentityService {
     }
 
     /// 统一校验：持久化信任精确匹配直接放行并记为 Session 已验证决定；
-    /// 已信任直接放行；未知主机派发 challenge 事件并阻塞等待用户决定。
-    /// 信任存储不可读/不可解析时 fail-closed。
-    /// 同一 Session、endpoint 与指纹的并发连接合并到同一 challenge。
+    /// 已信任直接放行；未知主机或已保存 key 与呈现不一致时派发 challenge 事件并阻塞
+    /// 等待用户决定。信任存储不可读/不可解析时 fail-closed。
+    /// 已保存记录与呈现 key 任一不一致都产生 Changed challenge（携带旧记录与呈现的
+    /// 算法/指纹），绝不覆盖或删除旧记录，也不开始认证。
+    /// 同一 Session、endpoint 与指纹的并发连接合并到同一 challenge；
+    /// 同一 Session、endpoint 已有 pending challenge 而新呈现指纹不同（服务端在
+    /// challenge 后再次更换 key）时，新 challenge 取代旧 challenge：旧等待者取消，
+    /// 对旧 challenge 的一切决定安全失败，绝不借旧决定认证新 key。
     /// 已验证决定在信任记录被生命周期清理移除后仍持续到 Session 关闭；
     /// 已关闭 Session 的迟到校验器（含已保存 key 精确匹配）仍必须立即失败，
     /// 不得借持久化信任继续认证。
@@ -211,9 +216,10 @@ impl HostIdentityService {
                 return Ok(());
             }
         }
-        // 持久化信任：精确 host+port+算法+完整公钥匹配即静默放行；存储错误 fail-closed；
-        // 已保存记录与呈现 key 不一致仍产生 challenge（前端展示变更警告）
-        if let Some(store) = self
+        // 持久化信任：精确 host+port+算法+完整公钥匹配即静默放行；存储错误 fail-closed。
+        // 已保存记录与呈现 key 不一致时快照旧记录（Changed challenge 的展示与替换依据），
+        // 不在此处改动旧记录。
+        let stored_record: Option<TrustRecord> = if let Some(store) = self
             .trust_store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -242,10 +248,12 @@ impl HostIdentityService {
                     state.trusted.insert(key);
                     return Ok(());
                 }
-                _ => {}
+                mismatch => mismatch,
             }
-        }
-        let (wait, created) = {
+        } else {
+            None
+        };
+        let (wait, created, superseded) = {
             let mut state = self
                 .state
                 .lock()
@@ -267,15 +275,47 @@ impl HostIdentityService {
                         .cloned()
                         .expect("pending_index 与 pending 同步维护"),
                     false,
+                    Vec::new(),
                 ),
                 None => {
+                    // 同一 Session、同一 endpoint 已有 pending challenge 但指纹不同：
+                    // 服务端在 challenge 之后再次更换 key。旧 challenge 必须被取代——
+                    // 旧等待者取消（连接不得以未确认的旧 key 认证），
+                    // 对旧 challenge 的后续决定一律 HostKeyChallengeNotFound 安全失败。
+                    let superseded: Vec<Arc<ChallengeWait>> = state
+                        .pending
+                        .values()
+                        .filter(|other| {
+                            other.challenge.session_id == session_id
+                                && other.challenge.host == presented.host
+                                && other.challenge.port == presented.port
+                                && other.challenge.fingerprint != presented.fingerprint
+                        })
+                        .cloned()
+                        .collect();
+                    for old in &superseded {
+                        state.pending.remove(&old.challenge.challenge_id);
+                        state
+                            .pending_index
+                            .remove(&IdentityKey::from_challenge(&old.challenge));
+                    }
                     let challenge = HostIdentityChallenge {
                         challenge_id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
                         host: presented.host.clone(),
                         port: presented.port,
+                        kind: match &stored_record {
+                            Some(_) => HostIdentityChallengeKind::Changed,
+                            None => HostIdentityChallengeKind::Unknown,
+                        },
                         key_algorithm: presented.algorithm.clone(),
                         fingerprint: presented.fingerprint.clone(),
+                        stored_algorithm: stored_record
+                            .as_ref()
+                            .map(|record| record.algorithm.clone()),
+                        stored_fingerprint: stored_record
+                            .as_ref()
+                            .map(|record| fingerprint_sha256(&record.blob)),
                         timestamp: chrono::Utc::now().timestamp_millis(),
                     };
                     let wait = Arc::new(ChallengeWait {
@@ -291,10 +331,14 @@ impl HostIdentityService {
                     state
                         .pending_index
                         .insert(key, wait.challenge.challenge_id.clone());
-                    (wait, true)
+                    (wait, true, superseded)
                 }
             }
         };
+        // 被取代的旧 challenge 等待者一律取消：绝不借旧决定认证新 key
+        for old in superseded {
+            Self::decide(&old, Decision::Cancelled);
+        }
         // 仅首个到达的连接派发 challenge 事件；合并到同一 challenge 的等待者不重复派发
         if created {
             let _ = app.emit("host-identity:challenge", &wait.challenge);
@@ -352,56 +396,52 @@ impl HostIdentityService {
         Ok(())
     }
 
-    /// 接受并保存：把 challenge 快照的算法 + 完整公钥持久化到信任存储，
+    /// 接受并保存/替换记录：把 challenge 快照的算法 + 完整公钥持久化到信任存储，
     /// 然后像 accept 一样记录临时信任并唤醒全部等待者。
     ///
     /// 保存失败时 challenge 保持未决（不授予任何信任，不自动降级为临时信任），
     /// 以 HostKeySaveFailed 结构化返回，用户可重试保存、改选仅本次接受或拒绝。
     /// 保存成功后，其他 Session 中同 endpoint + 同 key 的 pending challenge 一并放行。
+    ///
+    /// 状态锁覆盖「存在性检查 → 持久化 → 移除」全程：保存期间 challenge 无法被
+    /// 取代/拒绝/重复解决，stale 决定（challenge 已不存在）在写盘前即失败，
+    /// 绝不把过时 key 写入信任存储。锁顺序为 state → trust store，与 verify 的
+    /// 短暂 store 锁（释放后再取 state 锁）不构成环。
     pub fn accept_and_save(&self, challenge_id: &str) -> Result<(), AppError> {
-        // 快照 challenge 的 endpoint 与完整公钥（不取出 pending，失败时保持未决）
-        let record = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let wait = state
-                .pending
-                .get(challenge_id)
-                .cloned()
-                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
-            TrustRecord {
-                host: wait.challenge.host.clone(),
-                port: wait.challenge.port,
-                algorithm: wait.challenge.key_algorithm.clone(),
-                blob: wait.presented_blob.clone(),
-            }
-        };
-
-        // 持久化：trust store 内部串行化读写并安全发布，失败不改动旧记录
-        let store = self
-            .trust_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .ok_or_else(|| {
-                AppError::HostKeySaveFailed("信任存储未初始化，无法持久化信任记录".to_string())
-            })?;
-        store
-            .upsert(record)
-            .map_err(|error| AppError::HostKeySaveFailed(error.to_string()))?;
-
-        // 状态锁内：移除本 challenge + 写入临时信任；同 endpoint + 同 key 的
-        // 其他 Session pending challenge 一并移除（其等待者由持久化信任覆盖）
         let (wait, released_others) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(wait) = state.pending.remove(challenge_id) else {
-                // 保存已生效但 challenge 已被其他路径解决（并发决定）：仍视为成功
-                return Ok(());
-            };
+            // challenge 已被取代/拒绝/重复解决：stale 决定在写盘前安全失败
+            let wait = state
+                .pending
+                .get(challenge_id)
+                .cloned()
+                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
+
+            // 持久化：trust store 内部串行化读写并安全发布，失败不改动旧记录。
+            // 写入失败时本 challenge 尚未从 pending 移除，保持未决。
+            let store = self
+                .trust_store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .ok_or_else(|| {
+                    AppError::HostKeySaveFailed("信任存储未初始化，无法持久化信任记录".to_string())
+                })?;
+            store
+                .upsert(TrustRecord {
+                    host: wait.challenge.host.clone(),
+                    port: wait.challenge.port,
+                    algorithm: wait.challenge.key_algorithm.clone(),
+                    blob: wait.presented_blob.clone(),
+                })
+                .map_err(|error| AppError::HostKeySaveFailed(error.to_string()))?;
+
+            // 移除本 challenge + 写入临时信任；同 endpoint + 同 key 的
+            // 其他 Session pending challenge 一并移除（其等待者由持久化信任覆盖）
+            state.pending.remove(challenge_id);
             let key = IdentityKey::from_challenge(&wait.challenge);
             state.pending_index.remove(&key);
             state.trusted.insert(key);
@@ -872,7 +912,7 @@ mod tests {
         let app = mock_app();
         let service = HostIdentityService::new();
         service
-            .init_trust_store(&app.handle())
+            .init_trust_store(app.handle())
             .expect("初始化应成功");
         // mock app 的应用数据目录在测试间共享：使用唯一 host 避免测试间写入互相干扰
         let unique_host = format!("10.0.0.{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -1256,19 +1296,23 @@ mod tests {
         );
     }
 
-    /// challenge 事件 payload 为 camelCase 且字段完整（前端不解析 SSH key 文本）。
+    /// challenge 事件 payload 为 camelCase 且字段完整（前端不解析 SSH key 文本）；
+    /// Unknown 与 Changed 的 kind、stored 字段均正确序列化。
     #[test]
     fn challenge_event_serializes_as_camel_case_payload() {
-        let challenge = HostIdentityChallenge {
+        let unknown = HostIdentityChallenge {
             challenge_id: "c-1".to_string(),
             session_id: "session-1".to_string(),
             host: "10.0.0.8".to_string(),
             port: 22,
+            kind: HostIdentityChallengeKind::Unknown,
             key_algorithm: "ssh-ed25519".to_string(),
             fingerprint: "SHA256:aaa".to_string(),
+            stored_algorithm: None,
+            stored_fingerprint: None,
             timestamp: 1_710_000_000_000,
         };
-        let value = serde_json::to_value(&challenge).unwrap();
+        let value = serde_json::to_value(&unknown).unwrap();
         assert_eq!(
             value,
             serde_json::json!({
@@ -1276,11 +1320,27 @@ mod tests {
                 "sessionId": "session-1",
                 "host": "10.0.0.8",
                 "port": 22,
+                "kind": "Unknown",
                 "keyAlgorithm": "ssh-ed25519",
                 "fingerprint": "SHA256:aaa",
+                "storedAlgorithm": null,
+                "storedFingerprint": null,
                 "timestamp": 1_710_000_000_000_i64
             })
         );
+        let changed = HostIdentityChallenge {
+            challenge_id: "c-2".to_string(),
+            kind: HostIdentityChallengeKind::Changed,
+            key_algorithm: "ssh-rsa".to_string(),
+            fingerprint: "SHA256:bbb".to_string(),
+            stored_algorithm: Some("ssh-ed25519".to_string()),
+            stored_fingerprint: Some(fingerprint_sha256(b"old")),
+            ..unknown
+        };
+        let value = serde_json::to_value(&changed).unwrap();
+        assert_eq!(value["kind"], "Changed");
+        assert_eq!(value["storedAlgorithm"], "ssh-ed25519");
+        assert_eq!(value["storedFingerprint"], fingerprint_sha256(b"old"));
         let _: Value = value;
     }
 
@@ -1429,5 +1489,497 @@ mod tests {
         let service = HostIdentityService::new();
         let error = service.forget_endpoint("10.0.0.8", 22).unwrap_err();
         assert_eq!(error.code(), "TrustStoreError");
+    }
+
+    /// 等待指定 Session 出现与给定 id 不同的 pending challenge（旧 challenge 被取代后
+    /// 新 challenge 出现）；超时则 panic。
+    fn wait_pending_other(
+        service: &HostIdentityService,
+        session_id: &str,
+        exclude: &str,
+    ) -> HostIdentityChallenge {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(challenge) = service.pending_challenge(session_id)
+                && challenge.challenge_id != exclude
+            {
+                return challenge;
+            }
+            assert!(Instant::now() < deadline, "新 challenge 应在超时前创建");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 已保存 key 与呈现不一致：产生 Changed challenge，携带旧记录与新呈现的算法/指纹，
+    /// 不覆盖或删除旧记录，也不开始认证；替换成功后 endpoint 只保留呈现 key。
+    #[test]
+    fn changed_key_produces_changed_challenge_with_stored_and_presented_info() {
+        let app = mock_app();
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let captured = payloads.clone();
+        app.listen("host-identity:challenge", move |event| {
+            let payload: HostIdentityChallenge =
+                serde_json::from_str(event.payload()).expect("payload 可反序列化");
+            captured.lock().unwrap().push(payload);
+        });
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"old-blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = PresentedHostKey {
+            algorithm: "ssh-rsa".to_string(),
+            blob: b"new-blob".to_vec(),
+            ..make_presented("SHA256:presented")
+        };
+        let waiter = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+
+        // Changed challenge 同时展示旧记录与新呈现的算法/指纹
+        assert_eq!(challenge.kind, HostIdentityChallengeKind::Changed);
+        assert_eq!(challenge.key_algorithm, "ssh-rsa");
+        assert_eq!(challenge.fingerprint, "SHA256:presented");
+        assert_eq!(challenge.stored_algorithm.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            challenge.stored_fingerprint.as_deref(),
+            Some(fingerprint_sha256(b"old-blob").as_str())
+        );
+        // 事件 payload 同样携带 kind 与新旧信息
+        let payloads = payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].kind, HostIdentityChallengeKind::Changed);
+        assert_eq!(payloads[0].stored_algorithm.as_deref(), Some("ssh-ed25519"));
+        drop(payloads);
+
+        // 旧记录未被覆盖或删除（磁盘真相），认证未开始（等待者仍在等待）
+        let records = TrustStore::from_file_path(path.clone()).reload().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].algorithm, "ssh-ed25519");
+        assert_eq!(records[0].blob, b"old-blob");
+        assert_eq!(service.waiting_connections(&challenge.challenge_id), 1);
+
+        // 替换成功：endpoint 只保留呈现 key
+        service.accept_and_save(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("替换成功后放行认证");
+        let records = TrustStore::from_file_path(path).reload().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].algorithm, "ssh-rsa");
+        assert_eq!(records[0].blob, b"new-blob");
+    }
+
+    /// 仅算法变化（公钥材料相同）同样产生 Changed challenge，不静默放行。
+    #[test]
+    fn algorithm_change_alone_produces_changed_challenge() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-rsa".to_string(),
+            blob: b"same-blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = PresentedHostKey {
+            blob: b"same-blob".to_vec(),
+            ..make_presented("SHA256:same")
+        };
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+        assert_eq!(challenge.kind, HostIdentityChallengeKind::Changed);
+        assert_eq!(challenge.stored_algorithm.as_deref(), Some("ssh-rsa"));
+        service.reject(&challenge.challenge_id).unwrap();
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 仅本次接受以 Runtime Session 为作用域：Changed challenge 的临时接受只放行当前
+    /// Session（含重连），其他 Session 相同 endpoint + 相同呈现 key 仍独立等待。
+    #[test]
+    fn changed_challenge_accept_once_is_scoped_to_current_session() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"stored".to_vec(),
+        });
+        let presented = PresentedHostKey {
+            blob: b"rotated".to_vec(),
+            ..make_presented("SHA256:rotated")
+        };
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let waiter_a = thread::spawn({
+            let verifier = verifier_a.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let waiter_b = thread::spawn({
+            let verifier = verifier_b.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge_a = wait_pending(&service, "session-a");
+        let challenge_b = wait_pending(&service, "session-b");
+        assert_eq!(challenge_a.kind, HostIdentityChallengeKind::Changed);
+        assert_eq!(challenge_b.kind, HostIdentityChallengeKind::Changed);
+        assert_ne!(challenge_a.challenge_id, challenge_b.challenge_id);
+
+        // 仅本次接受只解决 session-a 的 challenge
+        service.accept(&challenge_a.challenge_id).unwrap();
+        waiter_a.join().unwrap().expect("session-a 放行");
+        assert_eq!(
+            service.pending_challenge("session-b").unwrap().challenge_id,
+            challenge_b.challenge_id,
+            "其他 Session 仍独立等待"
+        );
+        // 同 Session 重连复用临时信任，不产生新 challenge
+        verifier_a(&presented).expect("session-a 重连放行");
+        // session-b 按自己的决定解决
+        service.accept(&challenge_b.challenge_id).unwrap();
+        waiter_b.join().unwrap().expect("session-b 按自身决定放行");
+    }
+
+    /// 替换成功只自动解决兼容的 pending challenge：相同 endpoint + 相同呈现 key 的
+    /// 其他 Session 一并放行；不同呈现 key 或不同 endpoint 不受影响。
+    #[test]
+    fn replace_releases_only_compatible_changed_challenges() {
+        let app = mock_app();
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"stored".to_vec(),
+        });
+        let presented = PresentedHostKey {
+            blob: b"rotated".to_vec(),
+            ..make_presented("SHA256:rotated")
+        };
+        let presented_other_key = PresentedHostKey {
+            blob: b"other-key".to_vec(),
+            ..make_presented("SHA256:other")
+        };
+        let presented_other_endpoint = PresentedHostKey {
+            host: "10.0.0.9".to_string(),
+            ..presented.clone()
+        };
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let verifier_c = service.verifier(app.handle().clone(), "session-c".to_string());
+        let verifier_d = service.verifier(app.handle().clone(), "session-d".to_string());
+        let waiter_a = thread::spawn({
+            let verifier = verifier_a.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let waiter_b = thread::spawn({
+            let verifier = verifier_b.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let waiter_c = thread::spawn({
+            let verifier = verifier_c.clone();
+            let presented = presented_other_key.clone();
+            move || verifier(&presented)
+        });
+        let waiter_d = thread::spawn({
+            let verifier = verifier_d.clone();
+            let presented = presented_other_endpoint.clone();
+            move || verifier(&presented)
+        });
+        let challenge_a = wait_pending(&service, "session-a");
+        let challenge_b = wait_pending(&service, "session-b");
+        assert_eq!(challenge_b.kind, HostIdentityChallengeKind::Changed);
+        let challenge_c = wait_pending(&service, "session-c");
+        let challenge_d = wait_pending(&service, "session-d");
+
+        // session-a 替换：同 endpoint + 同呈现 key 的 session-b 一并放行
+        service.accept_and_save(&challenge_a.challenge_id).unwrap();
+        waiter_a.join().unwrap().expect("发起替换的 Session 放行");
+        waiter_b.join().unwrap().expect("兼容 challenge 一并放行");
+        // 不同呈现 key / 不同 endpoint 的 challenge 不受影响，仍待各自决定
+        assert_eq!(
+            service.pending_challenge("session-c").unwrap().challenge_id,
+            challenge_c.challenge_id
+        );
+        assert_eq!(
+            service.pending_challenge("session-d").unwrap().challenge_id,
+            challenge_d.challenge_id
+        );
+        // 磁盘只保留呈现 key，且不新增其他 endpoint 记录
+        let records = TrustStore::from_file_path(path).reload().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].host, "10.0.0.8");
+        assert_eq!(records[0].blob, b"rotated");
+        // 清理剩余挑战
+        service.reject(&challenge_c.challenge_id).unwrap();
+        service.reject(&challenge_d.challenge_id).unwrap();
+        waiter_c.join().unwrap().unwrap_err();
+        waiter_d.join().unwrap().unwrap_err();
+    }
+
+    /// 替换写入失败：旧信任记录与 pending challenge 均保留，用户可明确改选
+    /// 仅本次接受或拒绝；绝不静默降级或丢失旧记录。
+    #[test]
+    fn replace_write_failure_keeps_old_record_and_pending_challenge() {
+        let app = mock_app();
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"old-blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = PresentedHostKey {
+            blob: b"new-blob".to_vec(),
+            ..make_presented("SHA256:new")
+        };
+        let waiter = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+        assert_eq!(challenge.kind, HostIdentityChallengeKind::Changed);
+
+        // 破坏发布目标：文件路径替换为目录，写盘必然失败（读取缓存不受影响）
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let error = service
+            .accept_and_save(&challenge.challenge_id)
+            .unwrap_err();
+        assert_eq!(error.code(), "HostKeySaveFailed");
+        // 旧信任记录未被失败替换污染：新 Session 呈现旧 key 仍精确匹配静默放行
+        let verifier_old = service.verifier(app.handle().clone(), "session-old".to_string());
+        verifier_old(&PresentedHostKey {
+            blob: b"old-blob".to_vec(),
+            ..make_presented("SHA256:old")
+        })
+        .expect("失败替换不得污染旧信任记录");
+        // challenge 保持未决
+        assert_eq!(
+            service.pending_challenge("session-1").unwrap().challenge_id,
+            challenge.challenge_id
+        );
+        // 用户明确改选仅本次接受：正常解决
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("改选仅本次接受后放行");
+    }
+
+    /// challenge 之后服务端再次更换 key：同一 Session、同一 endpoint 的新呈现 key
+    /// 取代旧 challenge；旧等待者取消（不得以旧 key 认证），对旧 challenge 的
+    /// 接受/替换/拒绝决定一律安全失败，新 challenge 正常可决。
+    #[test]
+    fn server_rotating_key_after_challenge_supersedes_old_challenge() {
+        let app = mock_app();
+        let events = Arc::new(AtomicUsize::new(0));
+        let counter = events.clone();
+        app.listen("host-identity:challenge", move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"stored".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented_a = PresentedHostKey {
+            blob: b"key-a".to_vec(),
+            ..make_presented("SHA256:key-a")
+        };
+        let waiter_a = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented_a.clone();
+            move || verifier(&presented)
+        });
+        let challenge_a = wait_pending(&service, "session-1");
+
+        // 服务端再次更换 key：新连接呈现 key-b
+        let presented_b = PresentedHostKey {
+            blob: b"key-b".to_vec(),
+            ..make_presented("SHA256:key-b")
+        };
+        let waiter_b = thread::spawn(move || verifier(&presented_b));
+        let challenge_b = wait_pending_other(&service, "session-1", &challenge_a.challenge_id);
+        assert_ne!(challenge_a.challenge_id, challenge_b.challenge_id);
+        assert_eq!(challenge_b.kind, HostIdentityChallengeKind::Changed);
+        assert_eq!(challenge_b.fingerprint, "SHA256:key-b");
+
+        // 旧等待者取消：连接不得以未经确认的旧 key 认证
+        assert_eq!(
+            waiter_a.join().unwrap().unwrap_err().code(),
+            "HostKeyVerificationCancelled"
+        );
+        // 对旧 challenge 的一切决定安全失败（stale / 重复解决 / 未知 challengeId）
+        assert_eq!(
+            service
+                .accept(&challenge_a.challenge_id)
+                .unwrap_err()
+                .code(),
+            "HostKeyChallengeNotFound"
+        );
+        assert_eq!(
+            service
+                .accept_and_save(&challenge_a.challenge_id)
+                .unwrap_err()
+                .code(),
+            "HostKeyChallengeNotFound"
+        );
+        assert_eq!(
+            service
+                .reject(&challenge_a.challenge_id)
+                .unwrap_err()
+                .code(),
+            "HostKeyChallengeNotFound"
+        );
+        // 新 challenge 正常可决：替换为新呈现 key
+        service.accept_and_save(&challenge_b.challenge_id).unwrap();
+        waiter_b.join().unwrap().expect("新 challenge 决定后放行");
+        assert_eq!(
+            events.load(Ordering::Relaxed),
+            2,
+            "两次不同 key 各派发一次 challenge 事件"
+        );
+    }
+
+    /// 一个 Session 的决定不影响其他 Session 的 pending challenge：接受 session-a 的
+    /// challenge 后 session-b 仍独立等待（错误 Session 不得解决他人 challenge）。
+    #[test]
+    fn decision_does_not_resolve_other_sessions_challenge() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"stored".to_vec(),
+        });
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let presented = PresentedHostKey {
+            blob: b"rotated".to_vec(),
+            ..make_presented("SHA256:rotated")
+        };
+        let waiter_a = thread::spawn({
+            let verifier = verifier_a.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let waiter_b = thread::spawn({
+            let verifier = verifier_b.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge_a = wait_pending(&service, "session-a");
+        let challenge_b = wait_pending(&service, "session-b");
+
+        service.accept(&challenge_a.challenge_id).unwrap();
+        waiter_a.join().unwrap().unwrap();
+        assert_eq!(
+            service.pending_challenge("session-b").unwrap().challenge_id,
+            challenge_b.challenge_id,
+            "接受 session-a 不得解决 session-b 的 challenge"
+        );
+        // 重复/错误 Session 决定安全失败（stale challengeId），不得影响 session-b
+        assert_eq!(
+            service
+                .accept(&challenge_a.challenge_id)
+                .unwrap_err()
+                .code(),
+            "HostKeyChallengeNotFound"
+        );
+        assert_eq!(
+            service
+                .reject(&challenge_a.challenge_id)
+                .unwrap_err()
+                .code(),
+            "HostKeyChallengeNotFound"
+        );
+        assert_eq!(
+            service.pending_challenge("session-b").unwrap().challenge_id,
+            challenge_b.challenge_id,
+            "错误 Session 的决定不得取消或解决他人 challenge"
+        );
+        service.reject(&challenge_b.challenge_id).unwrap();
+        assert_eq!(
+            waiter_b.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 并发压力：保存/替换与「服务端再次换 key」（取代旧 challenge）竞争。
+    /// 无论竞争顺序如何，结局必须安全：保存成功 ⇒ 磁盘只保留呈现 key；
+    /// 保存失败（stale）⇒ 写盘前失败、磁盘仍是旧记录；新 challenge 始终可解决。
+    #[test]
+    fn save_racing_supersede_never_persists_stale_key() {
+        let app = mock_app();
+        for _ in 0..25 {
+            let (service, path) = service_with_record(TrustRecord {
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                blob: b"old".to_vec(),
+            });
+            let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+            let presented_a = PresentedHostKey {
+                blob: b"key-a".to_vec(),
+                ..make_presented("SHA256:key-a")
+            };
+            let waiter_a = thread::spawn({
+                let verifier = verifier.clone();
+                let presented = presented_a.clone();
+                move || verifier(&presented)
+            });
+            let challenge_a = wait_pending(&service, "session-1");
+
+            // 并发：保存 challenge_a（替换记录）与呈现新 key（取代旧 challenge）
+            let save_handle = {
+                let service = service.clone();
+                let challenge_id = challenge_a.challenge_id.clone();
+                thread::spawn(move || service.accept_and_save(&challenge_id))
+            };
+            let presented_b = PresentedHostKey {
+                blob: b"key-b".to_vec(),
+                ..make_presented("SHA256:key-b")
+            };
+            let waiter_b = thread::spawn({
+                let verifier = verifier.clone();
+                move || verifier(&presented_b)
+            });
+
+            match save_handle.join().unwrap() {
+                Ok(()) => {
+                    // 保存成功：磁盘只保留呈现 key，challenge_a 等待者被接受
+                    let records = TrustStore::from_file_path(path.clone()).reload().unwrap();
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].blob, b"key-a");
+                    waiter_a
+                        .join()
+                        .unwrap()
+                        .expect("保存成功应放行本挑战等待者");
+                }
+                Err(error) => {
+                    // stale 保存：challenge_a 先被取代，写盘前安全失败，磁盘仍是旧记录
+                    assert_eq!(error.code(), "HostKeyChallengeNotFound");
+                    let records = TrustStore::from_file_path(path.clone()).reload().unwrap();
+                    assert_eq!(records[0].blob, b"old");
+                    assert_eq!(
+                        waiter_a.join().unwrap().unwrap_err().code(),
+                        "HostKeyVerificationCancelled"
+                    );
+                }
+            }
+            // 新 challenge（key-b）始终正常可决：接受后放行，无死锁
+            let challenge_b = wait_pending_other(&service, "session-1", &challenge_a.challenge_id);
+            service.accept(&challenge_b.challenge_id).unwrap();
+            waiter_b.join().unwrap().expect("新 challenge 接受后放行");
+        }
     }
 }

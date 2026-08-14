@@ -18,25 +18,38 @@ test.beforeEach(async ({ page }) => {
     let snapshotTasks: unknown[] = [];
     // 待消费的失败注入队列：按 command 匹配，命中则让 invoke 以结构化错误拒绝
     const failQueue: Array<{ command: string; error: { code: string; detail?: string } }> = [];
-    // 主机身份确认建模（issue #31）：pending challenge 与 gated capability 等待者。
-    // 真实后端：未知主机在握手后、认证前阻断 Terminal/SFTP/Monitoring 连接并派发 challenge；
-    // mock 以 pendingChallenges 充当同一后端权威，sftp_list_dir/start_monitoring 在决定前不返回。
+    // 主机身份确认建模（issue #31/#32/#34）：pending challenge 与 gated capability 等待者。
+    // 真实后端：未知主机/主机身份变更在握手后、认证前阻断 Terminal/SFTP/Monitoring 连接
+    // 并派发 challenge；mock 以 pendingChallenges 充当同一后端权威，
+    // sftp_list_dir/start_monitoring 在决定前不返回。
     const pendingChallenges = new Map<string, {
-      challenge: { challengeId: string; sessionId: string };
+      challenge: {
+        challengeId: string; sessionId: string; host: string; port: number;
+        kind?: string; keyAlgorithm: string; fingerprint: string;
+        storedAlgorithm?: string | null; storedFingerprint?: string | null;
+      };
       waiters: Array<{ command: string; resolve: () => void; reject: (error: unknown) => void }>;
     }>();
     // 每个 gated capability 的决定终局（接受 code=null），供断言三 capability 服从同一决定
     const identityWaiterResults: Array<{ command: string; code: string | null }> = [];
     // 测试开启后，open_session 立即派发未知主机 challenge（模拟后端连接到达校验门）
     let autoHostIdentity = false;
-    // 持久化信任记录（issue #32）：保存成功后同 endpoint 的新 Session 静默放行不再提示
+    // 主机身份变更建模（issue #34）：信任存储已保存旧 key，服务端呈现新 key
+    let autoChangedIdentity = false;
+    // 会话序号：每次 open_session 递增，支持同 endpoint 多 Runtime Session
+    let sessionSeq = 0;
+    // 持久化信任记录（issue #32/#34）：保存/替换成功后同 endpoint 的新 Session 静默放行
     const savedTrust = new Map<string, { algorithm: string; fingerprint: string }>();
     /** 精确 endpoint 键：host + port（与后端信任记录归属一致）。 */
     const endpointKey = (host: string, port: number) => `${host}:${port}`;
     /** 向所有已注册监听器派发结构化 Tauri 事件。 */
     const emitEvent = (name: string, payload: unknown) => {
       if (name === 'host-identity:challenge' && payload && typeof payload === 'object' && 'sessionId' in payload) {
-        const challenge = payload as { challengeId: string; sessionId: string };
+        const challenge = payload as {
+          challengeId: string; sessionId: string; host: string; port: number;
+          kind?: string; keyAlgorithm: string; fingerprint: string;
+          storedAlgorithm?: string | null; storedFingerprint?: string | null;
+        };
         pendingChallenges.set(challenge.sessionId, { challenge, waiters: [] });
       }
       listeners.get(name)?.forEach((id) => callbacks.get(id)?.({ event: name, id, payload }));
@@ -103,12 +116,42 @@ test.beforeEach(async ({ page }) => {
           return undefined;
         }
         if (command === 'open_session') {
+          const newSessionId = `session-${++sessionSeq}`;
+          const newSession = { ...session, sessionId: newSessionId };
+          const endpoint = endpointKey('10.0.0.8', 22);
+          // 主机身份变更建模：信任存储已保存旧 key，服务端呈现新 key → Changed challenge；
+          // 替换成功后同 endpoint 静默放行（模拟持久化信任精确匹配）。
+          if (autoChangedIdentity) {
+            if (savedTrust.get(endpoint)?.fingerprint === 'SHA256:newfp') {
+              setTimeout(() => {
+                emitEvent('session:status', { sessionId: newSessionId, status: 'Connected', message: null });
+              }, 0);
+            } else {
+              emitEvent('host-identity:challenge', {
+                challengeId: `changed-${sessionSeq}`,
+                sessionId: newSessionId,
+                host: '10.0.0.8',
+                port: 22,
+                kind: 'Changed',
+                keyAlgorithm: 'ssh-rsa',
+                fingerprint: 'SHA256:newfp',
+                storedAlgorithm: 'ssh-ed25519',
+                storedFingerprint: 'SHA256:oldfp',
+                timestamp: Date.now(),
+              });
+              // 终端连接到达主机身份验证阶段（会话注册后再派发，投影方可接收）
+              setTimeout(() => {
+                emitEvent('session:progress', { sessionId: newSessionId, phase: 'VerifyingHostKey', timestamp: Date.now() });
+              }, 0);
+            }
+            return newSession;
+          }
           // 未知主机：连接到达统一校验门，mock 后端派发 challenge；认证前不返回 capability 数据。
           // 已保存信任记录的 endpoint：静默放行，不派发 challenge，直接进入 Connected
-          if (autoHostIdentity && !savedTrust.has(endpointKey('10.0.0.8', 22))) {
+          if (autoHostIdentity && !savedTrust.has(endpoint)) {
             emitEvent('host-identity:challenge', {
-              challengeId: 'challenge-auto',
-              sessionId: 'session-1',
+              challengeId: `challenge-${sessionSeq}`,
+              sessionId: newSessionId,
               host: '10.0.0.8',
               port: 22,
               keyAlgorithm: 'ssh-ed25519',
@@ -117,27 +160,36 @@ test.beforeEach(async ({ page }) => {
             });
             // 终端连接到达主机身份验证阶段（会话注册后再派发，投影方可接收）
             setTimeout(() => {
-              emitEvent('session:progress', { sessionId: 'session-1', phase: 'VerifyingHostKey', timestamp: Date.now() });
+              emitEvent('session:progress', { sessionId: newSessionId, phase: 'VerifyingHostKey', timestamp: Date.now() });
             }, 0);
           } else if (autoHostIdentity) {
             setTimeout(() => {
-              emitEvent('session:status', { sessionId: 'session-1', status: 'Connected', message: null });
+              emitEvent('session:status', { sessionId: newSessionId, status: 'Connected', message: null });
             }, 0);
           }
-          return session;
+          return newSession;
         }
         if (command === 'accept_and_save_host_identity') {
           const entry = pendingByChallengeId(args.challengeId);
           if (!entry) throw { code: 'HostKeyChallengeNotFound', detail: String(args.challengeId) };
-          pendingChallenges.delete(entry.challenge.sessionId);
-          entry.waiters.forEach((waiter) => {
-            identityWaiterResults.push({ command: waiter.command, code: null });
-            waiter.resolve();
+          const { challenge } = entry;
+          // 持久化：endpoint 只保留呈现 key；后续新 Session 同 endpoint 不再产生 challenge
+          savedTrust.set(endpointKey(challenge.host, challenge.port), { algorithm: challenge.keyAlgorithm, fingerprint: challenge.fingerprint });
+          // 保存/替换只自动解决兼容的 challenge：同 endpoint + 同呈现 key 的其他 Session 一并放行
+          const compatible = [...pendingChallenges.values()].filter((other) =>
+            other.challenge.host === challenge.host
+            && other.challenge.port === challenge.port
+            && other.challenge.keyAlgorithm === challenge.keyAlgorithm
+            && other.challenge.fingerprint === challenge.fingerprint);
+          compatible.forEach((other) => {
+            pendingChallenges.delete(other.challenge.sessionId);
+            other.waiters.forEach((waiter) => {
+              identityWaiterResults.push({ command: waiter.command, code: null });
+              waiter.resolve();
+            });
+            // 后端放行认证：终端会话进入 Connected
+            emitEvent('session:status', { sessionId: other.challenge.sessionId, status: 'Connected', message: null });
           });
-          // 持久化信任记录：后续新 Session 同 endpoint 不再产生 challenge
-          savedTrust.set(endpointKey('10.0.0.8', 22), { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:aGVscG1l' });
-          // 后端放行认证：终端会话进入 Connected
-          emitEvent('session:status', { sessionId: entry.challenge.sessionId, status: 'Connected', message: null });
           return undefined;
         }
         if (command === 'accept_host_identity') {
@@ -187,6 +239,36 @@ test.beforeEach(async ({ page }) => {
         enableHostIdentity() {
           autoHostIdentity = true;
         },
+        /** 开启主机身份变更建模（issue #34）：信任存储已保存旧 key，服务端呈现新 key，
+         *  open_session 后 mock 后端派发 Changed challenge 并阻塞 capability。 */
+        enableChangedIdentity() {
+          autoChangedIdentity = true;
+          savedTrust.set(endpointKey('10.0.0.8', 22), { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:oldfp' });
+        },
+        /** 模拟服务端在 challenge 后再次更换 key：旧 challenge 取消（等待者以
+         *  HostKeyVerificationCancelled 失败），并派发新呈现 key 的 Changed challenge。 */
+        rotateHostKey(sessionId: string) {
+          const old = pendingChallenges.get(sessionId);
+          if (old) {
+            pendingChallenges.delete(sessionId);
+            old.waiters.forEach((waiter) => {
+              identityWaiterResults.push({ command: waiter.command, code: 'HostKeyVerificationCancelled' });
+              waiter.reject({ code: 'HostKeyVerificationCancelled', detail: sessionId });
+            });
+          }
+          emitEvent('host-identity:challenge', {
+            challengeId: `rotated-${sessionId}`,
+            sessionId,
+            host: '10.0.0.8',
+            port: 22,
+            kind: 'Changed',
+            keyAlgorithm: 'ecdsa-sha2-nistp256',
+            fingerprint: 'SHA256:rotatedfp',
+            storedAlgorithm: 'ssh-ed25519',
+            storedFingerprint: 'SHA256:oldfp',
+            timestamp: Date.now(),
+          });
+        },
         /** 当前等待统一决定的 gated capability 数（sftp_list_dir / start_monitoring）。 */
         pendingIdentityWaits() {
           return [...pendingChallenges.values()].reduce((total, entry) => total + entry.waiters.length, 0);
@@ -198,6 +280,10 @@ test.beforeEach(async ({ page }) => {
         /** 已保存的持久化信任记录数（验收：保存后新 Session 不再提示）。 */
         savedTrustCount() {
           return savedTrust.size;
+        },
+        /** 已保存信任记录快照（endpoint → 算法/指纹），验收：替换后只保留呈现 key。 */
+        savedTrustSnapshot() {
+          return [...savedTrust.entries()].map(([endpoint, record]) => ({ endpoint, ...record }));
         },
         /** 让下一次匹配 command 的 invoke 以结构化错误拒绝（与后端 AppErrorInfo 契约一致）。 */
         failNext(command: string, error: { code: string; detail?: string }) {
@@ -542,7 +628,7 @@ test('首次主机身份：内联确认卡仅本次接受，三 capability 统�
   const acceptCalls = await page.evaluate(() => (window as unknown as {
     __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
   }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
-  expect(acceptCalls).toEqual([{ command: 'accept_host_identity', args: { challengeId: 'challenge-auto' } }]);
+  expect(acceptCalls).toEqual([{ command: 'accept_host_identity', args: { challengeId: 'challenge-1' } }]);
   await expect(card).toHaveCount(0);
   await expect(page.locator('.terminal-overlay')).toHaveCount(0);
   await expect(page.getByText('syslog')).toBeVisible();
@@ -571,7 +657,7 @@ test('拒绝未知主机身份：三 capability 以 HostKeyRejected 失败并关
   const rejectCalls = await page.evaluate(() => (window as unknown as {
     __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
   }).__TAURI_TEST__.calls.filter((call) => call.command === 'reject_host_identity'));
-  expect(rejectCalls).toEqual([{ command: 'reject_host_identity', args: { challengeId: 'challenge-auto' } }]);
+  expect(rejectCalls).toEqual([{ command: 'reject_host_identity', args: { challengeId: 'challenge-1' } }]);
 
   // 同一决定：全部等待者以 HostKeyRejected 失败，不进入认证；Session 整体关闭
   await expect(page.locator('.empty-state')).toBeVisible();
@@ -633,7 +719,7 @@ test('接受并保存：保存信任记录后新 Session 静默放行，不再�
   const saveCalls = await page.evaluate(() => (window as unknown as {
     __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
   }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_and_save_host_identity'));
-  expect(saveCalls).toEqual([{ command: 'accept_and_save_host_identity', args: { challengeId: 'challenge-auto' } }]);
+  expect(saveCalls).toEqual([{ command: 'accept_and_save_host_identity', args: { challengeId: 'challenge-1' } }]);
   await expect(card).toHaveCount(0);
   await expect(page.getByText('syslog')).toBeVisible();
   await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
@@ -651,7 +737,7 @@ test('接受并保存：保存信任记录后新 Session 静默放行，不再�
     __TAURI_TEST__: { calls: Array<{ command: string }> };
   }).__TAURI_TEST__.calls.filter((call) => call.command.startsWith('accept_') || call.command === 'reject_host_identity'));
   expect(identityCalls).toEqual([
-    { command: 'accept_and_save_host_identity', args: { challengeId: 'challenge-auto' } },
+    { command: 'accept_and_save_host_identity', args: { challengeId: 'challenge-1' } },
   ]);
 });
 
@@ -686,4 +772,205 @@ test('保存失败：challenge 保持未决并显示结构化错误，可改选�
   await expect(card).toHaveCount(0);
   await expect(page.getByText('syslog')).toBeVisible();
   await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
+});
+
+test('主机身份变更：内联卡展示新旧指纹，替换需二次确认，跨 Session 兼容 challenge 一并放行', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableChangedIdentity: () => void };
+  }).__TAURI_TEST__.enableChangedIdentity());
+  // 多标签下每张确认卡都在 DOM 中（隐藏属性控制显隐），严格模式需限定到当前活动标签
+  const activeCard = () => page.locator('.terminal-session:not([hidden])').getByTestId('host-identity-card');
+  const activeButton = (testid: string) => page.locator('.terminal-session:not([hidden])').getByTestId(testid);
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(activeCard()).toBeVisible();
+  await expect(activeCard()).toContainText('主机身份已变更');
+  await expect(activeCard().getByTestId('host-identity-stored')).toContainText('ssh-ed25519');
+  await expect(activeCard().getByTestId('host-identity-stored')).toContainText('SHA256:oldfp');
+  await expect(activeCard().getByTestId('host-identity-presented')).toContainText('ssh-rsa');
+  await expect(activeCard().getByTestId('host-identity-presented')).toContainText('SHA256:newfp');
+  await expect(page.locator('.terminal-session:not([hidden]) .terminal-view')).toHaveAttribute('data-interactive', 'false');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(2);
+
+  // 第二个 Session：同 endpoint 同呈现 key 独立产生 Changed challenge
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(activeCard()).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(4);
+
+  // 替换记录必须先经过第二次内联确认：第一次点击只进入确认，不 invoke
+  await activeButton('host-identity-replace').click();
+  await expect(page.locator('.terminal-session:not([hidden])').getByTestId('host-identity-replace-confirm')).toBeVisible();
+  const saveCalls = () => page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_and_save_host_identity'));
+  expect(await saveCalls()).toHaveLength(0);
+  // 取消：退回主操作，仍不 invoke
+  await activeButton('host-identity-replace-cancel').click();
+  await expect(page.locator('.terminal-session:not([hidden])').getByTestId('host-identity-replace-confirm')).toHaveCount(0);
+  expect(await saveCalls()).toHaveLength(0);
+
+  // 确认替换：跨 Session 兼容 challenge 一并放行
+  await activeButton('host-identity-replace').click();
+  await activeButton('host-identity-replace-confirm-btn').click();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+  expect(await saveCalls()).toEqual([{ command: 'accept_and_save_host_identity', args: { challengeId: 'changed-2' } }]);
+  await expect(page.locator('.terminal-session:not([hidden]) .terminal-view')).toHaveAttribute('data-interactive', 'true');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(0);
+  const results = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { identityWaiterResults: () => Array<{ command: string; code: string | null }> };
+  }).__TAURI_TEST__.identityWaiterResults());
+  expect(results).toEqual([
+    { command: 'sftp_list_dir', code: null },
+    { command: 'start_monitoring', code: null },
+    { command: 'sftp_list_dir', code: null },
+    { command: 'start_monitoring', code: null },
+  ]);
+
+  // 切回第一个标签：兼容 challenge 已被放行，不再显示确认卡
+  await page.getByRole('tab').first().click();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+  await expect(page.locator('.terminal-session:not([hidden]) .terminal-view')).toHaveAttribute('data-interactive', 'true');
+
+  // 替换后信任记录只保留呈现 key
+  const snapshot = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { savedTrustSnapshot: () => Array<{ endpoint: string; algorithm: string; fingerprint: string }> };
+  }).__TAURI_TEST__.savedTrustSnapshot());
+  expect(snapshot).toEqual([{ endpoint: '10.0.0.8:22', algorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp' }]);
+
+  // 关闭两个标签后重开：同 endpoint 已保存呈现 key，静默放行不再提示
+  await page.locator('.tab .close-btn').first().click();
+  await page.locator('.tab .close-btn').first().click();
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+  await expect(page.locator('.terminal-session:not([hidden]) .terminal-view')).toHaveAttribute('data-interactive', 'true');
+});
+
+test('仅本次接受只放行当前 Session：其他 Session 相同 challenge 独立等待', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableChangedIdentity: () => void };
+  }).__TAURI_TEST__.enableChangedIdentity());
+  const activeCard = () => page.locator('.terminal-session:not([hidden])').getByTestId('host-identity-card');
+  const activeView = () => page.locator('.terminal-session:not([hidden]) .terminal-view');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(activeCard()).toBeVisible();
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(activeCard()).toBeVisible();
+
+  // session-2 仅本次接受：只放行当前 Session
+  await page.locator('.terminal-session:not([hidden])').getByTestId('host-identity-accept').click();
+  const acceptCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
+  expect(acceptCalls).toEqual([{ command: 'accept_host_identity', args: { challengeId: 'changed-2' } }]);
+  await expect(activeView()).toHaveAttribute('data-interactive', 'true');
+  // session-2 的两个等待者放行；session-1 的两个等待者仍阻塞在校验门后
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(2);
+  // 仅本次接受不落盘：信任记录仍是旧记录
+  const snapshot = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { savedTrustSnapshot: () => Array<{ endpoint: string; algorithm: string; fingerprint: string }> };
+  }).__TAURI_TEST__.savedTrustSnapshot());
+  expect(snapshot).toEqual([{ endpoint: '10.0.0.8:22', algorithm: 'ssh-ed25519', fingerprint: 'SHA256:oldfp' }]);
+
+  // 切回 session-1：确认卡仍独立等待，终端不可交互
+  await page.getByRole('tab').first().click();
+  await expect(activeCard()).toBeVisible();
+  await expect(activeView()).toHaveAttribute('data-interactive', 'false');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(2);
+
+  // 独立解决：拒绝 → 本 Session 关闭，session-2 不受影响
+  await page.locator('.terminal-session:not([hidden])').getByTestId('host-identity-reject').click();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+  const results = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { identityWaiterResults: () => Array<{ command: string; code: string | null }> };
+  }).__TAURI_TEST__.identityWaiterResults());
+  expect(results).toEqual([
+    { command: 'sftp_list_dir', code: null },
+    { command: 'start_monitoring', code: null },
+    { command: 'sftp_list_dir', code: 'HostKeyRejected' },
+    { command: 'start_monitoring', code: 'HostKeyRejected' },
+  ]);
+  await page.getByRole('tab').first().click();
+  await expect(activeView()).toHaveAttribute('data-interactive', 'true');
+});
+
+test('替换写入失败：challenge 保持未决且旧信任记录保留，可改选仅本次接受或拒绝', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    const bridge = (window as unknown as {
+      __TAURI_TEST__: { enableChangedIdentity: () => void; failNext: (command: string, error: { code: string; detail?: string }) => void };
+    }).__TAURI_TEST__;
+    bridge.enableChangedIdentity();
+    bridge.failNext('accept_and_save_host_identity', { code: 'HostKeySaveFailed', detail: 'write denied' });
+  });
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const card = page.locator('.terminal-pane').getByTestId('host-identity-card');
+  await expect(card).toBeVisible();
+
+  // 二次确认替换 → 写入失败：确认卡保持未决并展示结构化错误
+  await page.getByTestId('host-identity-replace').click();
+  await page.getByTestId('host-identity-replace-confirm-btn').click();
+  await expect(card).toBeVisible();
+  await expect(card.getByTestId('host-identity-save-error')).toContainText('write denied');
+  // 旧信任记录保留（失败替换不落盘），等待者仍阻塞在校验门后
+  const snapshot = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { savedTrustSnapshot: () => Array<{ endpoint: string; algorithm: string; fingerprint: string }> };
+  }).__TAURI_TEST__.savedTrustSnapshot());
+  expect(snapshot).toEqual([{ endpoint: '10.0.0.8:22', algorithm: 'ssh-ed25519', fingerprint: 'SHA256:oldfp' }]);
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(2);
+  // 失败绝不自动降级为临时信任：没有 accept_host_identity 调用
+  const acceptCallsAfterFail = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
+  expect(acceptCallsAfterFail).toHaveLength(0);
+
+  // 用户明确改选仅本次接受：正常解决并放行全部等待者
+  await page.getByTestId('host-identity-accept').click();
+  await expect(card).toHaveCount(0);
+  await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
+});
+
+test('challenge 后服务端再次更换 key：卡片更新为新 key，旧等待者取消，新决定正常生效', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableChangedIdentity: () => void };
+  }).__TAURI_TEST__.enableChangedIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const card = page.locator('.terminal-pane').getByTestId('host-identity-card');
+  await expect(card).toContainText('SHA256:newfp');
+
+  // 服务端再次更换 key：新 challenge 取代旧 challenge，卡片更新为新呈现 key
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { rotateHostKey: (sessionId: string) => void };
+  }).__TAURI_TEST__.rotateHostKey('session-1'));
+  await expect(card).toContainText('SHA256:rotatedfp');
+  await expect(card).toContainText('ecdsa-sha2-nistp256');
+  // 旧等待者取消：连接不得以旧 key 认证
+  const results = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { identityWaiterResults: () => Array<{ command: string; code: string | null }> };
+  }).__TAURI_TEST__.identityWaiterResults());
+  expect(results).toEqual([
+    { command: 'sftp_list_dir', code: 'HostKeyVerificationCancelled' },
+    { command: 'start_monitoring', code: 'HostKeyVerificationCancelled' },
+  ]);
+
+  // 新 challenge 正常可决：仅本次接受放行
+  await page.getByTestId('host-identity-accept').click();
+  const acceptCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
+  expect(acceptCalls).toEqual([{ command: 'accept_host_identity', args: { challengeId: 'rotated-session-1' } }]);
+  await expect(card).toHaveCount(0);
 });

@@ -488,6 +488,51 @@ describe('Zustand stores', () => {
     expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
   });
 
+  it('Changed challenge 事件按 sessionId 投影并携带 kind、旧记录与新呈现信息，替换走同一保存契约', async () => {
+    const challenge = {
+      challengeId: 'challenge-changed', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed' as const,
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    mockInvoke.mockResolvedValue(undefined);
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('host-identity:challenge', challenge);
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+    cleanup();
+
+    // 替换记录与接受并保存共用同一后端契约（替换由确认卡二次确认把关）
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+    expect(mockInvoke).toHaveBeenCalledWith('accept_and_save_host_identity', { challengeId: 'challenge-changed' });
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+  });
+
+  it('替换失败（Changed challenge）保持确认卡与结构化错误，可改选仅本次接受或拒绝', async () => {
+    const challenge = {
+      challengeId: 'challenge-replace-fail', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed' as const,
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockRejectedValue({ code: 'HostKeySaveFailed', detail: 'write denied' });
+
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+
+    // 替换写入失败：未降级为临时信任，challenge 保持未决
+    expect(mockInvoke).not.toHaveBeenCalledWith('accept_host_identity', expect.anything());
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+    expect(useSessionStore.getState().hostKeySaveErrors.get('session-1')).toEqual({ code: 'HostKeySaveFailed', detail: 'write denied' });
+
+    // 用户明确改选仅本次接受：正常解决并清除错误投影
+    mockInvoke.mockResolvedValue(undefined);
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+  });
+
   it('会话状态进入 Connected（跨 Session 保存放行）时清理确认卡与保存错误投影', async () => {
     const challenge = {
       challengeId: 'challenge-cross', sessionId: 'session-1', host: '10.0.0.8', port: 22,

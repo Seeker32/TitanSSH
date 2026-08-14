@@ -309,6 +309,100 @@ describe('React components', () => {
     act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
   });
 
+  it('主机身份变更卡展示已保存与呈现的算法/指纹，提供仅本次接受/替换记录/拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const save = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-changed', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed',
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    render(<HostIdentityCard challenge={challenge} onAcceptAndSave={save} saveError={null} onAccept={accept} onReject={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    expect(card).toHaveTextContent('主机身份已变更');
+    expect(card).toHaveTextContent('10.0.0.8:22');
+    // 内联卡片清晰展示已保存旧记录与服务器呈现的算法/指纹
+    const stored = within(card).getByTestId('host-identity-stored');
+    expect(stored).toHaveTextContent('已保存算法');
+    expect(stored).toHaveTextContent('ssh-ed25519');
+    expect(stored).toHaveTextContent('已保存 SHA-256 指纹');
+    expect(stored).toHaveTextContent('SHA256:oldfp');
+    const presented = within(card).getByTestId('host-identity-presented');
+    expect(presented).toHaveTextContent('呈现算法');
+    expect(presented).toHaveTextContent('ssh-rsa');
+    expect(presented).toHaveTextContent('呈现 SHA-256 指纹');
+    expect(presented).toHaveTextContent('SHA256:newfp');
+    // Changed 不提供一次性"接受并保存"，提供 仅本次接受/替换记录/拒绝
+    expect(screen.queryByTestId('host-identity-save')).toBeNull();
+    expect(screen.getByTestId('host-identity-replace')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledTimes(1);
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('替换记录必须经过第二次内联确认：取消不回调，确认替换才回调；challenge 更换重置确认', async () => {
+    const user = userEvent.setup();
+    const save = vi.fn();
+    const makeChallenge = (challengeId: string): HostIdentityChallenge => ({
+      challengeId, sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed',
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    });
+    const { rerender } = render(<HostIdentityCard challenge={makeChallenge('challenge-1')}
+      onAcceptAndSave={save} saveError={null} onAccept={vi.fn()} onReject={vi.fn()} />);
+
+    // 第一次点击"替换记录"只进入二次确认，不触发替换
+    await user.click(screen.getByTestId('host-identity-replace'));
+    expect(screen.getByTestId('host-identity-replace-confirm')).toHaveTextContent('确认替换长期信任记录？');
+    expect(save).not.toHaveBeenCalled();
+    // 取消：退回主操作，仍不触发替换
+    await user.click(screen.getByTestId('host-identity-replace-cancel'));
+    expect(screen.queryByTestId('host-identity-replace-confirm')).toBeNull();
+    expect(save).not.toHaveBeenCalled();
+    // 第二次进入确认并点击"确认替换"才真正替换
+    await user.click(screen.getByTestId('host-identity-replace'));
+    await user.click(screen.getByTestId('host-identity-replace-confirm-btn'));
+    expect(save).toHaveBeenCalledTimes(1);
+
+    // 服务端再次换 key（新 challenge 事件）：确认状态重置，不残留二次确认
+    rerender(<HostIdentityCard challenge={makeChallenge('challenge-2')}
+      onAcceptAndSave={save} saveError={null} onAccept={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByTestId('host-identity-replace-confirm')).toBeNull();
+  });
+
+  it('替换失败时确认卡保持未决并展示替换失败文案，可改选仅本次接受或拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-replace-fail', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed',
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    render(<HostIdentityCard challenge={challenge} onAcceptAndSave={vi.fn()}
+      saveError={{ code: 'HostKeySaveFailed', detail: 'write denied' }} onAccept={accept} onReject={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    const error = screen.getByTestId('host-identity-save-error');
+    expect(card).toContainElement(error);
+    expect(error).toHaveTextContent('替换信任记录失败');
+    expect(error).toHaveTextContent('write denied');
+    // 替换失败后仍可改选仅本次接受或拒绝
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledTimes(1);
+  });
+
   it('英文环境下连接阶段与失败操作使用英文文案', async () => {
     const user = userEvent.setup();
     act(() => useLocaleStore.setState({ locale: 'en-US' }));

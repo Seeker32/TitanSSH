@@ -252,6 +252,40 @@ describe('HomePage integration', () => {
     expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
   });
 
+  it('主机身份变更：内联卡展示新旧指纹，替换记录需二次确认，失败可改选仅本次接受', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => {
+      emitMockEvent('host-identity:challenge', {
+        challengeId: 'challenge-changed', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+        kind: 'Changed',
+        keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+        storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+        timestamp: 1_710_000_000_000,
+      });
+    });
+    const card = screen.getByTestId('host-identity-card');
+    expect(card).toHaveTextContent('主机身份已变更');
+    expect(within(card).getByTestId('host-identity-stored')).toHaveTextContent('SHA256:oldfp');
+    expect(within(card).getByTestId('host-identity-presented')).toHaveTextContent('SHA256:newfp');
+
+    // 替换记录必须先经过第二次内联确认
+    mockInvoke.mockRejectedValueOnce({ code: 'HostKeySaveFailed', detail: 'write denied' });
+    await user.click(screen.getByTestId('host-identity-replace'));
+    await user.click(screen.getByTestId('host-identity-replace-confirm-btn'));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('accept_and_save_host_identity', { challengeId: 'challenge-changed' }));
+    // 替换写入失败：确认卡保持未决并展示替换失败文案，不降级为临时信任
+    expect(within(card).getByTestId('host-identity-save-error')).toHaveTextContent('write denied');
+    expect(mockInvoke).not.toHaveBeenCalledWith('accept_host_identity', expect.anything());
+
+    // 明确改选仅本次接受：正常解决并清除确认卡
+    mockInvoke.mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('accept_host_identity', { challengeId: 'challenge-changed' }));
+    expect(screen.queryByTestId('host-identity-card')).toBeNull();
+  });
+
   it('保存成功后新 Session 不再提示：连接进入 Connected 时清理确认卡投影', async () => {
     const user = userEvent.setup();
     render(<HomePage />);
