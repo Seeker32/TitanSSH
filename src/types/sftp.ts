@@ -10,8 +10,16 @@ export interface RemoteEntry {
 
 export type TransferType = 'Upload' | 'Download';
 
-/** 下载目标已存在时的冲突处理策略；未显式指定时默认 Reject */
-export type DownloadConflictStrategy = 'Reject' | 'Overwrite';
+/** 传输最终目标已存在时的冲突处理策略（上传与下载共用）；未显式指定时默认 Reject */
+export type ConflictStrategy = 'Reject' | 'Overwrite';
+
+/** 计算上传任务的远程目标目录；remotePath 为后端拼接的完整目标路径（目录/文件名）。 */
+export function uploadTargetDir(task: Pick<TransferTask, 'remotePath' | 'fileName'>): string {
+  const suffix = `/${task.fileName}`;
+  return task.remotePath.endsWith(suffix) && task.remotePath.length > suffix.length
+    ? task.remotePath.slice(0, -suffix.length)
+    : '/';
+}
 
 /** SFTP 任务专用状态，Cancelled 区分主动取消与失败 */
 export type SftpTaskStatus = 'Pending' | 'Running' | 'Done' | 'Failed' | 'Cancelled';

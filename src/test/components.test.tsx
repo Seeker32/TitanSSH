@@ -361,6 +361,21 @@ describe('React components', () => {
     expect(overwrite).toHaveBeenCalledWith(conflict);
   });
 
+  it('上传冲突失败任务行显示覆盖按钮，点击仅回调该任务', async () => {
+    const user = userEvent.setup();
+    const overwrite = vi.fn();
+    const conflict = makeTransferTask({
+      taskId: 'task-upload-conflict', transferType: 'Upload', remotePath: '/var/log/syslog',
+      fileName: 'syslog', localPath: '/tmp/syslog', status: 'Failed',
+      error: { code: 'SftpTargetExists', detail: '/var/log/syslog' },
+    });
+    render(<TransferQueue tasks={new Map([[conflict.taskId, conflict]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={overwrite} onClearTerminal={vi.fn()} />);
+    expect(screen.getByTestId('overwrite-btn')).toHaveTextContent('覆盖上传');
+    await user.click(screen.getByTestId('overwrite-btn'));
+    expect(overwrite).toHaveBeenCalledWith(conflict);
+  });
+
   it('非冲突失败任务不显示覆盖按钮', () => {
     const task = makeTransferTask({ status: 'Failed', error: { code: 'SftpReadError', detail: 'reset' } });
     render(<TransferQueue tasks={new Map([[task.taskId, task]])}

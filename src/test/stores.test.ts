@@ -8,7 +8,7 @@ import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { TaskStatus } from '@/types/monitor';
-import type { RemoteEntry, TransferTask } from '@/types/sftp';
+import { uploadTargetDir, type RemoteEntry, type TransferTask } from '@/types/sftp';
 import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
@@ -567,6 +567,96 @@ describe('Zustand stores', () => {
       sessionId: 'session-1', remotePath: '/var/log/syslog', localPath: '/tmp/syslog',
       conflictStrategy: 'Reject',
     });
+  });
+
+  it('SFTP 上传请求显式携带 Reject 冲突策略（默认）', async () => {
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ transferType: 'Upload' }));
+    await useSftpStore.getState().upload('session-1', '/tmp/syslog', '/var/log');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_upload', {
+      sessionId: 'session-1', localPath: '/tmp/syslog', remotePath: '/var/log',
+      conflictStrategy: 'Reject',
+    });
+  });
+
+  it('SFTP 上传冲突确认后以 Overwrite 策略重新发起，并清除原任务行 actionError', async () => {
+    const task = makeTransferTask({ transferType: 'Upload', status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpTargetExists', detail: '/var/log/syslog' }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ transferType: 'Upload', taskId: 'task-overwrite-2' }));
+    await useSftpStore.getState().upload('session-1', task.localPath, uploadTargetDir(task), task.taskId, 'Overwrite');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_upload', {
+      sessionId: 'session-1', localPath: task.localPath, remotePath: uploadTargetDir(task),
+      conflictStrategy: 'Overwrite',
+    });
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.has(task.taskId)).toBe(false);
+    expect(state?.tasks.has('task-overwrite-2')).toBe(true);
+  });
+
+  it('上传任务 Done 且用户仍位于目标目录时自动刷新该目录', async () => {
+    const task = makeTransferTask({ transferType: 'Upload', remotePath: '/var/log/syslog', fileName: 'syslog', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/var/log', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce([makeRemoteEntry()]);
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/var/log' });
+    await Promise.resolve();
+    expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.status).toBe('Done');
+  });
+
+  it('上传任务 Done 但用户已离开目标目录时不刷新，不把用户拉回目标目录', () => {
+    const task = makeTransferTask({ transferType: 'Upload', remotePath: '/var/log/syslog', fileName: 'syslog', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/home/user', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.status).toBe('Done');
+  });
+
+  it('下载任务 Done 不触发目录刷新', () => {
+    const task = makeTransferTask({ status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/var/log', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('上传 Done 触发的刷新服从最新目录请求规则：晚到的刷新响应不得覆盖更新的导航', async () => {
+    const task = makeTransferTask({ transferType: 'Upload', remotePath: '/var/log/syslog', fileName: 'syslog', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/var/log', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    let resolveRefresh!: (entries: RemoteEntry[]) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveRefresh = resolve; }));
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+
+    // 刷新在途时用户导航到新目录：最新请求序号更高
+    mockInvoke.mockResolvedValueOnce([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await useSftpStore.getState().listDir('session-1', '/new');
+    // 刷新响应晚到：不得让投影倒退到旧目录
+    resolveRefresh([makeRemoteEntry({ name: 'syslog', path: '/var/log/syslog' })]);
+    await Promise.resolve();
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.currentPath).toBe('/new');
+    expect(state?.entries.map((entry) => entry.path)).toEqual(['/new/new.txt']);
+  });
+
+  it('uploadTargetDir 从完整远端目标路径提取目标目录', () => {
+    expect(uploadTargetDir({ remotePath: '/var/log/syslog', fileName: 'syslog' })).toBe('/var/log');
+    expect(uploadTargetDir({ remotePath: '/syslog', fileName: 'syslog' })).toBe('/');
+    expect(uploadTargetDir({ remotePath: '/a/b/c.txt', fileName: 'c.txt' })).toBe('/a/b');
   });
 
   it('SFTP 冲突确认后以 Overwrite 策略重新发起，并清除原任务行 actionError', async () => {

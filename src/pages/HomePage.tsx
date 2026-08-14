@@ -20,7 +20,7 @@ import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
-import type { TransferTask } from '@/types/sftp';
+import { uploadTargetDir, type TransferTask } from '@/types/sftp';
 
 /** 协调主机、会话、终端、监控与 SFTP 视图。 */
 export default function HomePage() {
@@ -146,18 +146,23 @@ export default function HomePage() {
     if (typeof localPath === 'string') await useSftpStore.getState().upload(sessionId, localPath, remotePath);
   }
 
-  /** 根据原任务方向重新发起传输；失败在原任务行与文件浏览器错误区可见。 */
+  /** 根据原任务方向重新发起传输；失败在原任务行与文件浏览器错误区可见。
+   *  上传的 remotePath 为完整目标路径，重试必须回到其目标目录。 */
   async function retry(task: TransferTask) {
     if (task.transferType === 'Download') {
       await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId);
     } else {
-      await useSftpStore.getState().upload(task.sessionId, task.localPath, task.remotePath, task.taskId);
+      await useSftpStore.getState().upload(task.sessionId, task.localPath, uploadTargetDir(task), task.taskId);
     }
   }
 
-  /** 对单个冲突文件确认覆盖：以 Overwrite 策略重新发起下载，不扩展到批次或会话。 */
+  /** 对单个冲突文件确认覆盖：以 Overwrite 策略按方向重新发起传输，不扩展到批次或会话。 */
   async function overwrite(task: TransferTask) {
-    await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId, 'Overwrite');
+    if (task.transferType === 'Download') {
+      await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId, 'Overwrite');
+    } else {
+      await useSftpStore.getState().upload(task.sessionId, task.localPath, uploadTargetDir(task), task.taskId, 'Overwrite');
+    }
   }
 
   return <div className="page-shell">

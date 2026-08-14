@@ -126,6 +126,12 @@ pub(crate) trait SftpOps: Send {
     fn create(&mut self, path: &str) -> Result<RemoteFile, AppError>;
     /// 删除远端文件，供失败上传清理残留。
     fn unlink(&mut self, path: &str) -> Result<(), AppError>;
+    /// 将远端 src 重命名为 dst，供上传临时文件安全发布。
+    ///
+    /// overwrite = false：dst 已存在时返回 SftpTargetExists，绝不改动 dst；
+    /// overwrite = true：原子替换 dst；远端无法保证安全替换时返回
+    /// SftpPublishError 且不得先删除或改动 dst（旧目标保留）。
+    fn rename(&mut self, src: &str, dst: &str, overwrite: bool) -> Result<(), AppError>;
 }
 
 /// SFTP 专用 opaque capability；连接始终保持 blocking，不影响 Terminal。
@@ -164,6 +170,11 @@ impl SftpTransport {
     /// 删除远端文件，供失败上传清理残留。
     pub fn unlink(&mut self, path: &str) -> Result<(), AppError> {
         self.inner.unlink(path)
+    }
+
+    /// 将远端 src 重命名为 dst，供上传临时文件安全发布。
+    pub fn rename(&mut self, src: &str, dst: &str, overwrite: bool) -> Result<(), AppError> {
+        self.inner.rename(src, dst, overwrite)
     }
 }
 
@@ -288,6 +299,21 @@ impl SftpOps for Ssh2Sftp {
             .unlink(Path::new(path))
             .map_err(|error| AppError::SftpTransferError(error.to_string()))
     }
+
+    /// 重命名 ssh2 远端文件：no-clobber（overwrite=false）或覆盖替换（overwrite=true）。
+    ///
+    /// SFTP v5+ 携带覆盖标志实现原子替换；v3 重命名无标志语义（OpenSSH 以
+    /// link+unlink 实现，目标已存在即失败），libssh2 不会先删旧文件。
+    fn rename(&mut self, src: &str, dst: &str, overwrite: bool) -> Result<(), AppError> {
+        let flags = if overwrite {
+            ssh2::RenameFlags::OVERWRITE
+        } else {
+            ssh2::RenameFlags::empty()
+        };
+        self.sftp
+            .rename(Path::new(src), Path::new(dst), Some(flags))
+            .map_err(|error| map_sftp_rename_error(dst, overwrite, error))
+    }
 }
 
 struct Ssh2Exec {
@@ -408,6 +434,31 @@ fn protocol_error(error: ssh2::Error) -> AppError {
     AppError::SshProtocolError(error.to_string())
 }
 
+/// 将 ssh2 rename 错误转换为稳定领域错误。
+///
+/// 目标已存在：no-clobber 发布竞态 → SftpTargetExists（前端据此逐文件确认覆盖）；
+/// 覆盖发布 → 远端不支持覆盖语义（SFTP v3 重命名无覆盖标志），返回 SftpPublishError
+/// 且旧目标保持不动，绝不先删旧文件。其余失败统一为 SftpPublishError 保留底层诊断。
+fn map_sftp_rename_error(dst: &str, overwrite: bool, error: ssh2::Error) -> AppError {
+    let message = error.to_string();
+    // LIBSSH2_FX_FILE_ALREADY_EXISTS = 11（libssh2_sftp.h 稳定常量）；
+    // 消息兜底兼容错误码未能传递的服务端实现差异。
+    let already_exists = matches!(error.code(), ssh2::ErrorCode::SFTP(11))
+        || message.contains("File already exists");
+    if already_exists {
+        if overwrite {
+            AppError::SftpPublishError(format!(
+                "远端服务器无法保证安全替换，旧目标保留: {} ({})",
+                dst, message
+            ))
+        } else {
+            AppError::SftpTargetExists(dst.to_string())
+        }
+    } else {
+        AppError::SftpPublishError(format!("远端重命名失败: {} ({})", dst, message))
+    }
+}
+
 /// 将 SFTP 路径错误转换为稳定领域错误。
 fn map_sftp_path_error(path: &str, error: ssh2::Error) -> AppError {
     let message = error.to_string();
@@ -479,6 +530,7 @@ fn build_connect_error(
 pub(crate) mod test_support {
     use super::{ExecOps, ExecTransport, RemoteFile, SftpEntry, SftpOps, SftpTransport};
     use crate::errors::app_error::AppError;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
@@ -508,6 +560,11 @@ pub(crate) mod test_support {
         /// 空 adapter 的删除操作直接成功。
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
+        }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
         }
     }
 
@@ -542,6 +599,11 @@ pub(crate) mod test_support {
         /// 本 adapter 无需清理远端文件。
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
+        }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
         }
     }
 
@@ -615,6 +677,11 @@ pub(crate) mod test_support {
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
         }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
     }
 
     /// 传输打开/创建持续返回通道错误的 SFTP adapter，模拟已失效的传输连接。
@@ -648,6 +715,11 @@ pub(crate) mod test_support {
         /// 本 adapter 无需删除远端文件。
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
+        }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
         }
     }
 
@@ -694,6 +766,11 @@ pub(crate) mod test_support {
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
         }
+
+        /// 发布直接成功：内存 adapter 丢弃写入内容，无需真实落位。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Ok(())
+        }
     }
 
     impl Drop for DropSignalSftp {
@@ -728,6 +805,11 @@ pub(crate) mod test_support {
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
         }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
     }
 
     impl ExecOps for OneShotExec {
@@ -738,10 +820,13 @@ pub(crate) mod test_support {
         }
     }
 
-    /// 上传写入放行门：阻塞的测试传输在此等待，测试显式放行控制完成时序。
+    /// 上传写入放行门：阻塞的测试传输在此等待，测试显式放行控制完成时序；
+    /// 首个写入到达时置位到达信号，供测试确定传输已进入写入阶段。
     pub(crate) struct Gate {
         released: Mutex<bool>,
         cond: Condvar,
+        arrived: Mutex<bool>,
+        arrived_cond: Condvar,
     }
 
     impl Gate {
@@ -750,6 +835,8 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 released: Mutex::new(false),
                 cond: Condvar::new(),
+                arrived: Mutex::new(false),
+                arrived_cond: Condvar::new(),
             })
         }
 
@@ -760,6 +847,29 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
             self.cond.notify_all();
+        }
+
+        /// 首个写入到达时置位到达信号并唤醒等待者（测试阻塞在 wait_arrived 上）。
+        fn arrive(&self) {
+            *self
+                .arrived
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            self.arrived_cond.notify_all();
+        }
+
+        /// 阻塞直到首个写入到达门（已到达时立即返回）。
+        pub(crate) fn wait_arrived(&self) {
+            let mut arrived = self
+                .arrived
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*arrived {
+                arrived = self
+                    .arrived_cond
+                    .wait(arrived)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
         }
     }
 
@@ -834,6 +944,223 @@ pub(crate) mod test_support {
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
         }
+
+        /// 发布直接成功：门控 adapter 只控制写入时序，不模拟远端文件系统。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 内存远端文件系统 adapter：按路径存储内容，完整实现 rename 两种发布
+    /// 语义、unlink 失败注入与可选写入放行门，供上传安全发布 contract 测试
+    /// 观察远端文件系统的真实状态。全部状态在 Arc 字段中，跨连接共享同一文件系统。
+    #[derive(Clone)]
+    pub(crate) struct InMemorySftp {
+        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// false 模拟不支持原子替换的远端：overwrite rename 返回 SftpPublishError 且不改动 dst
+        overwrite_supported: bool,
+        /// true 时全部 unlink 返回清理失败错误（detail 含被删路径）
+        unlink_denied: Arc<std::sync::atomic::AtomicBool>,
+        /// true 时远端写入首次即失败（供运行时写入失败 + 清理失败合并测试）
+        write_denied: bool,
+        /// 首次写入在此门后阻塞（测试控制传输时序）
+        gate: Option<Arc<Gate>>,
+        /// 记录全部 unlink 调用路径，供“只清理本任务临时文件”断言
+        unlink_calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl InMemorySftp {
+        /// 拒绝后续全部 unlink；被删路径写入错误 detail。
+        pub(crate) fn deny_unlink(&self) {
+            self.unlink_denied.store(true, Ordering::Relaxed);
+        }
+
+        /// 读取指定路径的远端内容；不存在返回 None。
+        pub(crate) fn content(&self, path: &str) -> Option<Vec<u8>> {
+            self.files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(path)
+                .cloned()
+        }
+
+        /// 判断远端文件是否存在。
+        pub(crate) fn has_file(&self, path: &str) -> bool {
+            self.files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(path)
+        }
+
+        /// 返回全部 unlink 调用路径（按调用顺序）。
+        pub(crate) fn unlink_calls(&self) -> Vec<String> {
+            self.unlink_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    /// 内存远端写句柄：写入累积到 buffer，flush 或 drop 时提交到所属文件系统。
+    struct InMemoryWriteFile {
+        path: String,
+        buffer: Vec<u8>,
+        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        write_denied: bool,
+        gate: Option<Arc<Gate>>,
+    }
+
+    impl std::io::Read for InMemoryWriteFile {
+        /// 写句柄不产生输入。
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl std::io::Write for InMemoryWriteFile {
+        /// 首次写入在放行门后阻塞；deny 时写入失败，否则追加到 buffer。
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if let Some(gate) = &self.gate {
+                gate.arrive();
+                let mut released = gate
+                    .released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    released = gate
+                        .cond
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+            if self.write_denied {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "remote write reset",
+                ));
+            }
+            self.buffer.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        /// flush 即提交：模拟远端 fsync，之后 rename 才能看到完整内容。
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), self.buffer.clone());
+            Ok(())
+        }
+    }
+
+    impl Drop for InMemoryWriteFile {
+        /// 关闭即提交：未 flush 的写入在句柄关闭时落位（零字节文件同样创建空条目）。
+        fn drop(&mut self) {
+            self.files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), std::mem::take(&mut self.buffer));
+        }
+    }
+
+    impl SftpOps for InMemorySftp {
+        /// 从内存文件系统列举目录条目（仅文件）。
+        fn list_dir(&mut self, path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            let prefix = if path.ends_with('/') {
+                path.to_string()
+            } else {
+                format!("{}/", path)
+            };
+            let files = self
+                .files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Ok(files
+                .iter()
+                .filter(|(full, _)| {
+                    full.starts_with(&prefix) && !full[prefix.len()..].contains('/')
+                })
+                .map(|(full, content)| SftpEntry {
+                    path: full.clone(),
+                    is_dir: false,
+                    size: content.len() as u64,
+                    modified_at: 0,
+                    permissions: None,
+                })
+                .collect())
+        }
+
+        /// 查询内存文件大小；不存在返回 SftpPathNotFound。
+        fn file_size(&mut self, path: &str) -> Result<u64, AppError> {
+            match self.content(path) {
+                Some(content) => Ok(content.len() as u64),
+                None => Err(AppError::SftpPathNotFound(path.to_string())),
+            }
+        }
+
+        /// 返回已提交内容的只读游标；不存在返回 SftpPathNotFound。
+        fn open_read(&mut self, path: &str) -> Result<RemoteFile, AppError> {
+            let content = self
+                .content(path)
+                .ok_or_else(|| AppError::SftpPathNotFound(path.to_string()))?;
+            Ok(RemoteFile {
+                inner: Box::new(std::io::Cursor::new(content)),
+            })
+        }
+
+        /// 在内存文件系统中创建写句柄。
+        fn create(&mut self, path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(InMemoryWriteFile {
+                    path: path.to_string(),
+                    buffer: Vec::new(),
+                    files: self.files.clone(),
+                    write_denied: self.write_denied,
+                    gate: self.gate.clone(),
+                }),
+            })
+        }
+
+        /// 删除内存文件：deny 时返回包含路径的清理失败错误；调用路径始终记录。
+        fn unlink(&mut self, path: &str) -> Result<(), AppError> {
+            self.unlink_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(path.to_string());
+            if self.unlink_denied.load(Ordering::Relaxed) {
+                return Err(AppError::SftpTransferError("permission denied".to_string()));
+            }
+            self.files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(path);
+            Ok(())
+        }
+
+        /// 完整 rename 语义：no-clobber（overwrite=false）撞目标返回 SftpTargetExists；
+        /// 覆盖发布在远端不支持原子替换时返回 SftpPublishError 且不改动 dst。
+        fn rename(&mut self, src: &str, dst: &str, overwrite: bool) -> Result<(), AppError> {
+            let mut files = self
+                .files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(content) = files.get(src).cloned() else {
+                return Err(AppError::SftpPathNotFound(src.to_string()));
+            };
+            let dst_exists = files.contains_key(dst);
+            if dst_exists && !overwrite {
+                return Err(AppError::SftpTargetExists(dst.to_string()));
+            }
+            if dst_exists && !self.overwrite_supported {
+                return Err(AppError::SftpPublishError(format!(
+                    "远端服务器无法保证安全替换，旧目标保留: {}",
+                    dst
+                )));
+            }
+            files.insert(dst.to_string(), content);
+            files.remove(src);
+            Ok(())
+        }
     }
 
     /// 包装 adapter 的存活计数守卫：构造时计数加一、释放时减一，
@@ -882,6 +1209,11 @@ pub(crate) mod test_support {
         /// 委托给内部 adapter。
         fn unlink(&mut self, path: &str) -> Result<(), AppError> {
             self.inner.unlink(path)
+        }
+
+        /// 委托给内部 adapter。
+        fn rename(&mut self, src: &str, dst: &str, overwrite: bool) -> Result<(), AppError> {
+            self.inner.rename(src, dst, overwrite)
         }
     }
 
@@ -963,6 +1295,11 @@ pub(crate) mod test_support {
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
         }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
     }
 
     /// 目录列举返回域错误（路径不存在）的 SFTP adapter，连接本身健康。
@@ -992,6 +1329,11 @@ pub(crate) mod test_support {
         /// 本 adapter 无需删除远端文件。
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
+        }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
         }
     }
 
@@ -1025,6 +1367,11 @@ pub(crate) mod test_support {
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
         }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
     }
 
     /// 远端写入在创建后失败的 SFTP adapter。
@@ -1056,6 +1403,11 @@ pub(crate) mod test_support {
         /// 删除操作直接成功。
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
+        }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
         }
     }
 
@@ -1121,9 +1473,50 @@ pub(crate) mod test_support {
         SftpTransport::from_backend(MemorySftp { content })
     }
 
-    /// 创建上传写入在放行门后阻塞的 SFTP 传输测试 capability。
-    pub(crate) fn gated_create_sftp(released: Arc<Gate>) -> SftpTransport {
-        SftpTransport::from_backend(GatedCreateSftp { released })
+    /// 创建支持原子替换的内存远端文件系统（预置初始文件）。
+    pub(crate) fn in_memory_sftp(files: &[(&str, Vec<u8>)]) -> InMemorySftp {
+        in_memory_sftp_with(files, true, false, None)
+    }
+
+    /// 创建不支持原子替换的内存远端文件系统：目标已存在时覆盖发布必然失败。
+    pub(crate) fn in_memory_sftp_no_atomic_replace(files: &[(&str, Vec<u8>)]) -> InMemorySftp {
+        in_memory_sftp_with(files, false, false, None)
+    }
+
+    /// 创建写入被放行门阻塞、deny 时写入失败的内存远端文件系统。
+    pub(crate) fn gated_in_memory_sftp(
+        files: &[(&str, Vec<u8>)],
+        gate: Arc<Gate>,
+        write_denied: bool,
+    ) -> InMemorySftp {
+        in_memory_sftp_with(files, true, write_denied, Some(gate))
+    }
+
+    /// 按参数装配内存远端文件系统 adapter。
+    fn in_memory_sftp_with(
+        files: &[(&str, Vec<u8>)],
+        overwrite_supported: bool,
+        write_denied: bool,
+        gate: Option<Arc<Gate>>,
+    ) -> InMemorySftp {
+        InMemorySftp {
+            files: Arc::new(Mutex::new(
+                files
+                    .iter()
+                    .map(|(path, content)| (path.to_string(), content.clone()))
+                    .collect(),
+            )),
+            overwrite_supported,
+            unlink_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            write_denied,
+            gate,
+            unlink_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// 把内存远端文件系统包装为 SftpTransport；跨连接共享同一文件系统状态。
+    pub(crate) fn in_memory_sftp_transport(fs: &InMemorySftp) -> SftpTransport {
+        SftpTransport::from_backend(fs.clone())
     }
 
     /// 包装内部 adapter 的存活计数测试 capability；构造时计数加一，释放时减一。
@@ -1140,7 +1533,7 @@ mod tests {
     use super::{
         ConnectPhase, RemoteFile, SSH_PROTOCOL_TIMEOUT_MS, SftpEntry, SftpOps, SftpTransport,
         TerminalOps, TerminalTransport, build_connect_error, connect_tcp_stream, is_timeout_error,
-        resolve_socket_addrs,
+        map_sftp_rename_error, resolve_socket_addrs,
     };
     use crate::errors::app_error::AppError;
     use crate::models::host::{AuthType, HostConfig};
@@ -1184,6 +1577,11 @@ mod tests {
         /// 本测试无需删除文件。
         fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
             Ok(())
+        }
+
+        /// 本 adapter 不提供远端重命名。
+        fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
         }
     }
 
@@ -1334,6 +1732,62 @@ mod tests {
     #[test]
     fn ssh_protocol_timeout_is_ten_seconds() {
         assert_eq!(SSH_PROTOCOL_TIMEOUT_MS, 10_000);
+    }
+
+    // ─── 远端 rename 错误映射 contract ────────────────────────────────────
+
+    /// no-clobber rename 撞上已存在目标：映射为 SftpTargetExists，供发布竞态
+    /// 与逐文件确认交互复用。
+    #[test]
+    fn rename_error_maps_already_exists_to_target_exists_for_no_clobber() {
+        let error = ssh2::Error::new(
+            ssh2::ErrorCode::SFTP(11), // LIBSSH2_FX_FILE_ALREADY_EXISTS
+            "File already exists and SSH_FXP_RENAME_OVERWRITE not specified",
+        );
+
+        let mapped = map_sftp_rename_error("/tmp/dst", false, error);
+
+        assert!(
+            matches!(&mapped, AppError::SftpTargetExists(path) if path == "/tmp/dst"),
+            "no-clobber 撞目标应映射为 SftpTargetExists，实际: {mapped:?}"
+        );
+    }
+
+    /// 覆盖 rename 撞上已存在目标：远端不支持覆盖语义（如 SFTP v3 无覆盖标志），
+    /// 映射为 SftpPublishError，detail 说明旧目标保留，绝不先删旧文件。
+    #[test]
+    fn rename_error_maps_already_exists_to_publish_error_for_overwrite() {
+        let error = ssh2::Error::new(
+            ssh2::ErrorCode::SFTP(11), // LIBSSH2_FX_FILE_ALREADY_EXISTS
+            "File already exists and SSH_FXP_RENAME_OVERWRITE not specified",
+        );
+
+        let mapped = map_sftp_rename_error("/tmp/dst", true, error);
+
+        assert!(
+            matches!(&mapped, AppError::SftpPublishError(detail)
+                if detail.contains("无法保证安全替换")
+                    && detail.contains("旧目标保留")
+                    && detail.contains("/tmp/dst")),
+            "覆盖失败必须保留旧目标并给出结构化发布错误，实际: {mapped:?}"
+        );
+    }
+
+    /// 其余 rename 失败统一映射为 SftpPublishError，detail 保留底层诊断。
+    #[test]
+    fn rename_error_maps_other_failures_to_publish_error() {
+        let error = ssh2::Error::new(
+            ssh2::ErrorCode::SFTP(3), // LIBSSH2_FX_PERMISSION_DENIED
+            "Permission denied",
+        );
+
+        let mapped = map_sftp_rename_error("/tmp/dst", false, error);
+
+        assert!(
+            matches!(&mapped, AppError::SftpPublishError(detail)
+                if detail.contains("远端重命名失败") && detail.contains("/tmp/dst")),
+            "其他 rename 失败应保留结构化发布错误，实际: {mapped:?}"
+        );
     }
 
     /// 从环境变量构造真实 SSH E2E 主机与运行时凭据。

@@ -59,8 +59,9 @@ export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry, 
           {(task.status === 'Failed' || task.status === 'Cancelled')
             && <button data-testid="retry-btn" className="task-btn" title={translate(locale, 'sftp.retry')} onClick={() => onRetry(task)}><RotateCcw size={12} /></button>}
           {task.status === 'Failed' && task.error?.code === 'SftpTargetExists'
-            && <button data-testid="overwrite-btn" className="task-btn" title={translate(locale, 'sftp.overwriteDownload')}
-              onClick={() => onOverwrite(task)}>{translate(locale, 'sftp.overwriteDownload')}</button>}
+            && <button data-testid="overwrite-btn" className="task-btn"
+              title={translate(locale, task.transferType === 'Download' ? 'sftp.overwriteDownload' : 'sftp.overwriteUpload')}
+              onClick={() => onOverwrite(task)}>{translate(locale, task.transferType === 'Download' ? 'sftp.overwriteDownload' : 'sftp.overwriteUpload')}</button>}
         </div>
         <div className="progress-bar" data-testid="progress-bar">
           <div className={`progress-fill ${task.status === 'Done' ? 'progress-fill--done' : ''}`}

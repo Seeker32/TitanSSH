@@ -80,6 +80,7 @@ export const zhCN = {
   'sftp.cancel': '取消',
   'sftp.retry': '重新发起',
   'sftp.overwriteDownload': '覆盖下载',
+  'sftp.overwriteUpload': '覆盖上传',
   'sftp.pending': '等待中',
   'sftp.running': '传输中',
   'sftp.done': '完成',
@@ -145,8 +146,8 @@ export const zhCN = {
   'error.SftpCreateError': 'SFTP 创建失败',
   'error.SftpTaskNotFound': 'SFTP 任务不存在',
   'error.SftpTargetExists': '目标文件已存在，未覆盖',
-  'error.SftpTargetBusy': '目标正被同一会话的其他下载占用',
-  'error.SftpPublishError': '下载文件发布失败，原文件未受影响',
+  'error.SftpTargetBusy': '目标正被同一会话的其他传输任务占用',
+  'error.SftpPublishError': '安全发布失败，原文件未受影响',
   'error.MonitorError': '监控错误',
   'error.Unknown': '未知错误',
 } as const;

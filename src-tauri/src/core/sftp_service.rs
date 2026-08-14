@@ -8,7 +8,7 @@ use crate::errors::app_error::AppError;
 use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::sftp::{
-    DownloadConflictStrategy, RemoteEntry, SftpProgressEvent, SftpTaskStatus, SftpTaskStatusEvent,
+    ConflictStrategy, RemoteEntry, SftpProgressEvent, SftpTaskStatus, SftpTaskStatusEvent,
     TransferTask, TransferType,
 };
 use crate::storage::secure_store;
@@ -445,7 +445,7 @@ impl SftpService {
         session_id: String,
         remote_path: String,
         local_path: String,
-        conflict_strategy: DownloadConflictStrategy,
+        conflict_strategy: ConflictStrategy,
         app: AppHandle<R>,
     ) -> Result<TransferTask, AppError> {
         // 验证本地路径父目录可写
@@ -542,16 +542,21 @@ impl SftpService {
 
     /// 发起上传任务，立即返回 status = Pending 的 TransferTask
     ///
+    /// 冲突策略缺省 Reject：远端目标已存在时任务在发布阶段失败，绝不覆盖远端文件；
+    /// Overwrite 仅在用户逐文件确认后使用，经同目录远端临时文件安全发布。
+    ///
     /// # 参数
     /// - `session_id`: 关联会话 ID
     /// - `local_path`: 本地文件完整路径
     /// - `remote_path`: 远程目标目录路径（后端自动拼接文件名）
+    /// - `conflict_strategy`: 目标已存在时的处理策略（Reject / Overwrite）
     /// - `app`: Tauri 应用句柄，用于推送事件
     pub fn enqueue_upload<R: Runtime>(
         &self,
         session_id: String,
         local_path: String,
         remote_path: String,
+        conflict_strategy: ConflictStrategy,
         app: AppHandle<R>,
     ) -> Result<TransferTask, AppError> {
         // 验证本地文件存在
@@ -578,6 +583,27 @@ impl SftpService {
 
         // 传输连接由 worker 按需建立：命令线程不被远端建连阻塞
         let handle = self.handle(&session_id)?;
+
+        // 同一 Session 已有 Pending/Running 上传占用相同最终目标时拒绝入队：
+        // 并发写同一远端目标会互相破坏临时文件与安全发布语义
+        {
+            let tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let occupied = tasks.values().any(|task| {
+                task.session_id == session_id
+                    && task.transfer_type == TransferType::Upload
+                    && matches!(
+                        task.status,
+                        SftpTaskStatus::Pending | SftpTaskStatus::Running
+                    )
+                    && task.remote_path == full_remote_path
+            });
+            if occupied {
+                return Err(AppError::SftpTargetBusy(full_remote_path));
+            }
+        }
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -615,7 +641,7 @@ impl SftpService {
             local_path,
             total_bytes,
             TransferType::Upload,
-            None,
+            Some(conflict_strategy),
             cancel_token,
             app,
         );
@@ -832,7 +858,7 @@ impl SftpService {
     /// - `local_path`: 本地文件路径
     /// - `total_bytes`: 文件总大小
     /// - `transfer_type`: 传输方向
-    /// - `conflict_strategy`: 下载冲突策略；上传为 None
+    /// - `conflict_strategy`: 上传/下载共用的冲突策略（Reject / Overwrite）
     /// - `cancel_token`: 取消令牌
     /// - `app`: Tauri 应用句柄
     fn spawn_transfer_task<R: Runtime + 'static>(
@@ -844,7 +870,7 @@ impl SftpService {
         local_path: String,
         total_bytes: u64,
         transfer_type: TransferType,
-        conflict_strategy: Option<DownloadConflictStrategy>,
+        conflict_strategy: Option<ConflictStrategy>,
         cancel_token: CancelToken,
         app: AppHandle<R>,
     ) {
@@ -1109,7 +1135,7 @@ fn run_transfer_blocking<R: Runtime>(
     local_path: &str,
     total_bytes: u64,
     transfer_type: &TransferType,
-    conflict_strategy: Option<DownloadConflictStrategy>,
+    conflict_strategy: Option<ConflictStrategy>,
     transport: &Arc<Mutex<SftpTransport>>,
     cancel_token: &CancelToken,
     app: &AppHandle<R>,
@@ -1237,48 +1263,90 @@ fn run_transfer_blocking<R: Runtime>(
             }
         }
         TransferType::Upload => {
+            let conflict_strategy = conflict_strategy.unwrap_or_default();
+            // 取消检查先于任何远端写入：已取消任务不得创建临时文件
+            if cancel_token.is_cancelled() {
+                return TransferOutcome::Cancelled(None);
+            }
             let mut local_file = match std::fs::File::open(local_path) {
                 Ok(file) => file,
                 Err(error) => {
                     return TransferOutcome::Failed(AppError::SftpOpenError(error.to_string()));
                 }
             };
-            // 创建远端文件；失败或取消时通过 cleanup_remote 删除残留
-            let mut remote_file = match sftp.create(remote_path) {
+            // 与最终目标同目录、包含 taskId 的唯一远端临时文件：发布前旧目标不受影响
+            let temp_path = upload_temp_path(remote_path, task_id);
+            let temp_path_str = temp_path.to_string_lossy().to_string();
+            let mut remote_file = match sftp.create(&temp_path_str) {
                 Ok(file) => file,
                 Err(error) => return TransferOutcome::Failed(error),
             };
 
-            /// 关闭远端文件句柄并删除残留文件（取消或 IO 失败时调用）
-            macro_rules! cleanup_remote {
+            /// 关闭远端句柄并尽力删除本任务临时文件（取消或 IO 失败时调用）；
+            /// 清理失败的错误并入任务终态，不得静默吞掉
+            macro_rules! cleanup_remote_temp {
                 () => {{
                     drop(remote_file);
-                    let _ = sftp.unlink(remote_path);
+                    cleanup_upload_temp(&mut sftp, &temp_path_str)
                 }};
             }
 
             loop {
                 if cancel_token.is_cancelled() {
-                    // 主动取消：删除远端残留文件后返回取消结果
-                    cleanup_remote!();
-                    return TransferOutcome::Cancelled(None);
+                    // 主动取消：先停止 IO、清理本任务临时文件，再返回终态；旧目标不受影响
+                    return TransferOutcome::Cancelled(cleanup_remote_temp!().err());
                 }
                 let n = match local_file.read(&mut buf) {
                     Ok(n) => n,
                     Err(error) => {
-                        cleanup_remote!();
-                        return TransferOutcome::Failed(AppError::SftpReadError(error.to_string()));
+                        let primary = AppError::SftpReadError(error.to_string());
+                        return TransferOutcome::Failed(merge_cleanup_failure(
+                            primary,
+                            cleanup_remote_temp!(),
+                        ));
                     }
                 };
                 if n == 0 {
                     break;
                 }
                 if let Err(error) = remote_file.write_all(&buf[..n]) {
-                    cleanup_remote!();
-                    return TransferOutcome::Failed(AppError::SftpWriteError(error.to_string()));
+                    let primary = AppError::SftpWriteError(error.to_string());
+                    return TransferOutcome::Failed(merge_cleanup_failure(
+                        primary,
+                        cleanup_remote_temp!(),
+                    ));
                 }
                 transferred += n as u64;
                 emit_progress!();
+            }
+
+            // 刷新后关闭远端句柄（FXP_CLOSE 使服务器落定已提交写入）才允许发布：
+            // 任何失败都不得触碰远端最终目标
+            if let Err(error) = remote_file.flush() {
+                let primary = AppError::SftpWriteError(error.to_string());
+                return TransferOutcome::Failed(merge_cleanup_failure(
+                    primary,
+                    cleanup_remote_temp!(),
+                ));
+            }
+            drop(remote_file);
+
+            // 发布前再次检查取消：已取消的传输不得发布最终文件
+            if cancel_token.is_cancelled() {
+                return TransferOutcome::Cancelled(
+                    cleanup_upload_temp(&mut sftp, &temp_path_str).err(),
+                );
+            }
+
+            // 安全发布：Reject 拒绝已有目标；Overwrite 要求远端原子替换，
+            // 远端无法保证安全替换时保留旧目标并失败，绝不先删旧文件
+            if let Err(error) =
+                publish_upload_file(&mut sftp, &temp_path_str, remote_path, conflict_strategy)
+            {
+                return TransferOutcome::Failed(merge_cleanup_failure(
+                    error,
+                    cleanup_upload_temp(&mut sftp, &temp_path_str),
+                ));
             }
         }
     }
@@ -1299,6 +1367,59 @@ fn download_temp_path(local_path: &str, task_id: &str) -> PathBuf {
     match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(temp_name),
         _ => PathBuf::from(temp_name),
+    }
+}
+
+/// 计算与最终目标同目录、包含 taskId 的上传临时文件路径（远端）。
+///
+/// 与下载共用同一命名规则（.文件名.taskId.part）：taskId 全局唯一，
+/// 同目标并发任务不会撞名；临时文件与最终目标同目录，发布重命名不跨目录。
+fn upload_temp_path(remote_path: &str, task_id: &str) -> PathBuf {
+    download_temp_path(remote_path, task_id)
+}
+
+/// 把已完成写入并关闭句柄的远端临时文件安全发布为最终目标：
+///
+/// - 目标不存在：no-clobber 重命名；检查与重命名之间竞态新出现的目标同样
+///   返回 SftpTargetExists，绝不覆盖未经确认的文件。
+/// - Reject + 目标已存在：返回 SftpTargetExists，旧目标保持不动。
+/// - Overwrite + 目标已存在：要求远端原子替换；远端无法保证安全替换时
+///   保留旧目标并返回 SftpPublishError，绝不先删旧文件。
+fn publish_upload_file(
+    sftp: &mut SftpTransport,
+    temp_path: &str,
+    target_path: &str,
+    strategy: ConflictStrategy,
+) -> Result<(), AppError> {
+    // 冲突检查复用传输连接上的元数据操作：路径不存在 → 可发布，其余错误原样传播
+    let exists = match sftp.file_size(target_path) {
+        Ok(_) => true,
+        Err(AppError::SftpPathNotFound(_)) => false,
+        Err(error) => return Err(error),
+    };
+    if exists && strategy == ConflictStrategy::Reject {
+        return Err(AppError::SftpTargetExists(target_path.to_string()));
+    }
+    if !exists {
+        // 目标不存在：no-clobber 发布；Overwrite 策略下竞态出现的目标同样被拒，
+        // 由用户对单个文件重新确认覆盖
+        return sftp.rename(temp_path, target_path, false);
+    }
+    // 目标已存在 + Overwrite：远端原子替换，旧目标保留至替换成功
+    sftp.rename(temp_path, target_path, true)
+}
+
+/// 尽力删除本任务的上传临时文件；删除失败返回包含临时路径的清理错误。
+///
+/// 只删除本任务的临时路径，绝不扫描未知 `.part` 文件；清理失败不得被吞掉，
+/// 调用方把该错误并入任务终态（Cancelled/Failed 的 error detail）。
+fn cleanup_upload_temp(sftp: &mut SftpTransport, temp_path: &str) -> Result<(), AppError> {
+    match sftp.unlink(temp_path) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(AppError::SftpTransferError(format!(
+            "清理临时文件失败: {} ({})",
+            temp_path, error
+        ))),
     }
 }
 
@@ -1337,9 +1458,9 @@ fn merge_cleanup_failure(primary: AppError, cleanup: Result<(), AppError>) -> Ap
 fn publish_download_file(
     temp_path: &Path,
     target_path: &Path,
-    strategy: DownloadConflictStrategy,
+    strategy: ConflictStrategy,
 ) -> Result<(), AppError> {
-    if strategy == DownloadConflictStrategy::Reject && target_path.exists() {
+    if strategy == ConflictStrategy::Reject && target_path.exists() {
         return Err(AppError::SftpTargetExists(
             target_path.display().to_string(),
         ));
@@ -1360,8 +1481,8 @@ fn publish_download_file(
     })?;
     let named = NamedTempFile::from_parts(file, temp_path_owned);
     let result = match strategy {
-        DownloadConflictStrategy::Reject => named.persist_noclobber(target_path),
-        DownloadConflictStrategy::Overwrite => named.persist(target_path),
+        ConflictStrategy::Reject => named.persist_noclobber(target_path),
+        ConflictStrategy::Overwrite => named.persist(target_path),
     };
     match result {
         Ok(_) => Ok(()),
@@ -1377,7 +1498,7 @@ fn publish_download_file(
                     cleanup_error
                 )
             });
-            let already_exists = strategy == DownloadConflictStrategy::Reject
+            let already_exists = strategy == ConflictStrategy::Reject
                 && error.kind() == std::io::ErrorKind::AlreadyExists;
             let app_error = if already_exists {
                 AppError::SftpTargetExists(target_path.display().to_string())
@@ -1600,7 +1721,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("重连后的元数据操作应成功入队");
@@ -1644,7 +1765,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap_err();
@@ -1686,7 +1807,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("首个下载应正常入队");
@@ -1697,7 +1818,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect_err("相同最终目标的第二个下载应被拒绝");
@@ -1736,7 +1857,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap_err();
@@ -1823,6 +1944,7 @@ mod tests {
     /// 传输连接按需建立：Session 注册只建立控制连接，首次传输才建立独立传输连接。
     #[tokio::test(flavor = "multi_thread")]
     async fn transfer_connection_is_lazy_and_independent_from_control() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
         use std::sync::atomic::AtomicUsize;
         use tauri::test::mock_app;
 
@@ -1831,6 +1953,8 @@ mod tests {
         let transfer_connects = Arc::new(AtomicUsize::new(0));
         let control_connects_for_connector = control_connects.clone();
         let transfer_connects_for_connector = transfer_connects.clone();
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
         let service = SftpService::with_connector(move |_, role| match role {
             SftpRole::Control => {
                 control_connects_for_connector.fetch_add(1, Ordering::SeqCst);
@@ -1838,7 +1962,7 @@ mod tests {
             }
             SftpRole::Transfer => {
                 transfer_connects_for_connector.fetch_add(1, Ordering::SeqCst);
-                Ok(memory_sftp(vec![1u8, 2, 3]))
+                Ok(in_memory_sftp_transport(&fs_for_connector))
             }
         });
         service.register_session("session-1".to_string(), make_host());
@@ -1864,6 +1988,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -1888,19 +2013,22 @@ mod tests {
     /// 本次任务保留结构化错误，不自动重跑。
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_transfer_invalidates_transfer_connection_for_next_task() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
         use std::sync::atomic::AtomicUsize;
         use tauri::test::mock_app;
 
         let app = mock_app();
         let transfer_attempts = Arc::new(AtomicUsize::new(0));
         let transfer_attempts_for_connector = transfer_attempts.clone();
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
         let service = SftpService::with_connector(move |_, role| match role {
             SftpRole::Control => Ok(empty_sftp()),
             SftpRole::Transfer => {
                 if transfer_attempts_for_connector.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(channel_failing_transfer_sftp())
                 } else {
-                    Ok(memory_sftp(vec![1u8, 2, 3]))
+                    Ok(in_memory_sftp_transport(&fs_for_connector))
                 }
             }
         });
@@ -1915,6 +2043,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -1942,6 +2071,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -1993,7 +2123,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -2023,7 +2153,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_second.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("传输运行期间 file_size 元数据操作应在控制连接上完成入队");
@@ -2072,6 +2202,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -2097,7 +2228,7 @@ mod tests {
     /// 第六个保持 Pending；释放一个名额后第六个复用连接启动。
     #[tokio::test(flavor = "multi_thread")]
     async fn five_transfers_run_concurrently_and_sixth_waits_for_freed_slot() {
-        use crate::core::ssh_transport::test_support::{Gate, GatedCreateSftp, counted_sftp};
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
         use tauri::test::mock_app;
 
         let app = mock_app();
@@ -2115,7 +2246,7 @@ mod tests {
                 let gate = Gate::new();
                 gates_for_connector.lock().unwrap().push(gate.clone());
                 Ok(counted_sftp(
-                    GatedCreateSftp { released: gate },
+                    gated_in_memory_sftp(&[], gate, false),
                     live_for_connector.clone(),
                 ))
             }
@@ -2138,6 +2269,7 @@ mod tests {
                         "session-1".to_string(),
                         path.to_string_lossy().to_string(),
                         "/tmp".to_string(),
+                        ConflictStrategy::Reject,
                         app.handle().clone(),
                     )
                     .expect("上传应正常入队")
@@ -2216,7 +2348,9 @@ mod tests {
     /// 名额释放后等待任务按入队顺序启动：Session 内 FIFO，一次释放只启动队首。
     #[tokio::test(flavor = "multi_thread")]
     async fn waiting_tasks_start_in_fifo_order_after_slot_release() {
-        use crate::core::ssh_transport::test_support::{Gate, gated_create_sftp};
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
         use tauri::test::mock_app;
 
         let app = mock_app();
@@ -2244,7 +2378,11 @@ mod tests {
             SftpRole::Transfer => {
                 let gate = Gate::new();
                 gates_for_connector.lock().unwrap().push(gate.clone());
-                Ok(gated_create_sftp(gate))
+                Ok(in_memory_sftp_transport(&gated_in_memory_sftp(
+                    &[],
+                    gate,
+                    false,
+                )))
             }
         });
         service.register_session("session-1".to_string(), make_host());
@@ -2265,6 +2403,7 @@ mod tests {
                         "session-1".to_string(),
                         path.to_string_lossy().to_string(),
                         "/tmp".to_string(),
+                        ConflictStrategy::Reject,
                         app.handle().clone(),
                     )
                     .expect("上传应正常入队")
@@ -2343,7 +2482,7 @@ mod tests {
     /// 额外传输连接连续空闲 60 秒后回收为基础一条：确定性时间源推进，不等待真实 60 秒。
     #[tokio::test(flavor = "multi_thread")]
     async fn idle_extra_connections_recycled_after_sixty_seconds() {
-        use crate::core::ssh_transport::test_support::{Gate, GatedCreateSftp, counted_sftp};
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
         use tauri::test::mock_app;
 
         let app = mock_app();
@@ -2363,7 +2502,7 @@ mod tests {
                     let gate = Gate::new();
                     gates_for_connector.lock().unwrap().push(gate.clone());
                     Ok(counted_sftp(
-                        GatedCreateSftp { released: gate },
+                        gated_in_memory_sftp(&[], gate, false),
                         live_for_connector.clone(),
                     ))
                 }
@@ -2388,6 +2527,7 @@ mod tests {
                     "session-1".to_string(),
                     path.to_string_lossy().to_string(),
                     "/tmp".to_string(),
+                    ConflictStrategy::Reject,
                     app.handle().clone(),
                 )
                 .expect("上传应正常入队");
@@ -2434,6 +2574,7 @@ mod tests {
                 "session-1".to_string(),
                 path_before.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("上传应正常入队");
@@ -2457,6 +2598,7 @@ mod tests {
                 "session-1".to_string(),
                 path_after.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("上传应正常入队");
@@ -2484,7 +2626,9 @@ mod tests {
     /// 传输连接建立失败只影响对应任务：结构化错误与合法迁移，池内其他任务不受影响。
     #[tokio::test(flavor = "multi_thread")]
     async fn transfer_connection_setup_failure_only_fails_affected_task() {
-        use crate::core::ssh_transport::test_support::{Gate, gated_create_sftp};
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp, in_memory_sftp_transport,
+        };
         use tauri::test::mock_app;
 
         let app = mock_app();
@@ -2492,15 +2636,21 @@ mod tests {
         let gate = Gate::new();
         let gate_for_connector = gate.clone();
         let transfer_attempts_for_connector = transfer_attempts.clone();
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
         let service = SftpService::with_connector(move |_, role| match role {
             SftpRole::Control => Ok(memory_sftp(Vec::new())),
             SftpRole::Transfer => {
                 match transfer_attempts_for_connector.fetch_add(1, Ordering::SeqCst) {
-                    0 => Ok(gated_create_sftp(gate_for_connector.clone())),
+                    0 => Ok(in_memory_sftp_transport(&gated_in_memory_sftp(
+                        &[],
+                        gate_for_connector.clone(),
+                        false,
+                    ))),
                     1 => Err(AppError::SftpChannelError(
                         "transfer connect failed".to_string(),
                     )),
-                    _ => Ok(memory_sftp(vec![1u8; 4])),
+                    _ => Ok(in_memory_sftp_transport(&fs_for_connector)),
                 }
             }
         });
@@ -2515,6 +2665,7 @@ mod tests {
                 "session-1".to_string(),
                 first_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("首个上传应正常入队");
@@ -2541,6 +2692,7 @@ mod tests {
                 "session-1".to_string(),
                 second_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("入队本身应成功，失败发生在传输阶段");
@@ -2573,6 +2725,7 @@ mod tests {
                 "session-1".to_string(),
                 third_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .expect("第三个上传应正常入队");
@@ -2639,6 +2792,7 @@ mod tests {
                         "session-1".to_string(),
                         path.to_string_lossy().to_string(),
                         "/tmp".to_string(),
+                        ConflictStrategy::Reject,
                         app.handle().clone(),
                     )
                     .expect("上传应正常入队")
@@ -2689,7 +2843,7 @@ mod tests {
     /// 后台回收线程：额外连接空闲超时后自动释放，无需新的传输活动触发。
     #[tokio::test(flavor = "multi_thread")]
     async fn background_reaper_releases_idle_extra_without_new_activity() {
-        use crate::core::ssh_transport::test_support::{Gate, GatedCreateSftp, counted_sftp};
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
         use tauri::test::mock_app;
 
         let app = mock_app();
@@ -2705,7 +2859,7 @@ mod tests {
                     let gate = Gate::new();
                     gates_for_connector.lock().unwrap().push(gate.clone());
                     Ok(counted_sftp(
-                        GatedCreateSftp { released: gate },
+                        gated_in_memory_sftp(&[], gate, false),
                         live_for_connector.clone(),
                     ))
                 }
@@ -2727,6 +2881,7 @@ mod tests {
                     "session-1".to_string(),
                     path.to_string_lossy().to_string(),
                     "/tmp".to_string(),
+                    ConflictStrategy::Reject,
                     app.handle().clone(),
                 )
                 .expect("上传应正常入队");
@@ -3384,10 +3539,15 @@ mod tests {
     /// 上传 worker 完成真实传输后，registry 由 worker 更新为 Done 并移除令牌。
     #[tokio::test(flavor = "multi_thread")]
     async fn upload_worker_updates_registry_to_done() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![1u8, 2, 3])));
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
         service.register_session("session-1".to_string(), make_host());
 
         let local_path = std::env::temp_dir().join(format!("titan-upload-{}.bin", Uuid::new_v4()));
@@ -3397,6 +3557,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3444,7 +3605,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3480,6 +3641,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3531,7 +3693,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3587,6 +3749,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3639,7 +3802,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3700,6 +3863,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3752,7 +3916,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3805,7 +3969,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Overwrite,
+                ConflictStrategy::Overwrite,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3839,7 +4003,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3870,7 +4034,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3915,7 +4079,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -3962,7 +4126,7 @@ mod tests {
             &local_path.to_string_lossy(),
             16,
             &TransferType::Download,
-            Some(DownloadConflictStrategy::Reject),
+            Some(ConflictStrategy::Reject),
             &checkout.transport,
             &cancel_token,
             app.handle(),
@@ -4011,7 +4175,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_dir.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Overwrite,
+                ConflictStrategy::Overwrite,
                 app.handle().clone(),
             )
             .unwrap();
@@ -4066,7 +4230,7 @@ mod tests {
                 "session-1".to_string(),
                 "/remote/file.bin".to_string(),
                 local_path.to_string_lossy().to_string(),
-                DownloadConflictStrategy::Reject,
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -4115,10 +4279,15 @@ mod tests {
     /// 不得 panic，且任务最终由 worker 迁移到 Done。
     #[test]
     fn sync_context_enqueue_upload_completes_without_runtime() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![1u8, 2, 3])));
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
         service.register_session("session-1".to_string(), make_host());
 
         let local_path = std::env::temp_dir().join(format!("titan-sync-{}.bin", Uuid::new_v4()));
@@ -4128,6 +4297,7 @@ mod tests {
                 "session-1".to_string(),
                 local_path.to_string_lossy().to_string(),
                 "/tmp".to_string(),
+                ConflictStrategy::Reject,
                 app.handle().clone(),
             )
             .unwrap();
@@ -4418,5 +4588,817 @@ mod tests {
             ),
             "迟到 worker 更新必须被拒绝"
         );
+    }
+
+    // ─── 上传临时文件路径（发布目标目录）──────────────────────────────────
+
+    /// 上传临时文件与最终目标同目录且命名包含 taskId：与下载命名规则一致，
+    /// 全局唯一的 taskId 保证同目标并发任务不会撞名。
+    #[test]
+    fn upload_temp_path_lives_in_target_directory_with_task_id() {
+        let temp_path = upload_temp_path("/srv/data/file.bin", "task-42");
+
+        assert_eq!(
+            temp_path.to_string_lossy(),
+            "/srv/data/.file.bin.task-42.part"
+        );
+    }
+
+    /// 根目录下的目标文件：临时文件仍在同一根目录，无重复斜杠。
+    #[test]
+    fn upload_temp_path_handles_root_directory() {
+        let temp_path = upload_temp_path("/file.bin", "task-7");
+
+        assert_eq!(temp_path.to_string_lossy(), "/.file.bin.task-7.part");
+    }
+
+    // ─── 上传发布（publish_upload_file）contract ───────────────────────────
+
+    /// 目标不存在 + Reject：no-clobber 重命名发布成功，临时路径消失、内容落位。
+    #[test]
+    fn publish_upload_new_target_renames_temp_into_place() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+
+        let fs = in_memory_sftp(&[("/srv/.f.txt.task-1.part", b"new".to_vec())]);
+        let mut transport = in_memory_sftp_transport(&fs);
+
+        publish_upload_file(
+            &mut transport,
+            "/srv/.f.txt.task-1.part",
+            "/srv/f.txt",
+            ConflictStrategy::Reject,
+        )
+        .expect("新目标发布应成功");
+
+        assert_eq!(fs.content("/srv/f.txt"), Some(b"new".to_vec()));
+        assert!(
+            !fs.has_file("/srv/.f.txt.task-1.part"),
+            "发布后临时文件不应残留"
+        );
+    }
+
+    /// 目标已存在 + Reject：返回 SftpTargetExists，旧目标内容与临时文件均不动。
+    #[test]
+    fn publish_upload_reject_keeps_existing_target() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+
+        let fs = in_memory_sftp(&[
+            ("/srv/f.txt", b"old".to_vec()),
+            ("/srv/.f.txt.task-1.part", b"new".to_vec()),
+        ]);
+        let mut transport = in_memory_sftp_transport(&fs);
+
+        let error = publish_upload_file(
+            &mut transport,
+            "/srv/.f.txt.task-1.part",
+            "/srv/f.txt",
+            ConflictStrategy::Reject,
+        )
+        .expect_err("目标已存在 + Reject 必须失败");
+
+        assert!(
+            matches!(&error, AppError::SftpTargetExists(path) if path == "/srv/f.txt"),
+            "应返回结构化 SftpTargetExists，实际: {error:?}"
+        );
+        assert_eq!(fs.content("/srv/f.txt"), Some(b"old".to_vec()));
+        assert!(
+            fs.has_file("/srv/.f.txt.task-1.part"),
+            "发布拒绝不得删除临时文件（由 worker 统一清理）"
+        );
+    }
+
+    /// 目标已存在 + Overwrite：远端原子替换，旧内容被新内容替换、临时路径消失。
+    #[test]
+    fn publish_upload_overwrite_atomically_replaces_target() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+
+        let fs = in_memory_sftp(&[
+            ("/srv/f.txt", b"old".to_vec()),
+            ("/srv/.f.txt.task-1.part", b"new".to_vec()),
+        ]);
+        let mut transport = in_memory_sftp_transport(&fs);
+
+        publish_upload_file(
+            &mut transport,
+            "/srv/.f.txt.task-1.part",
+            "/srv/f.txt",
+            ConflictStrategy::Overwrite,
+        )
+        .expect("支持原子替换的远端应发布成功");
+
+        assert_eq!(fs.content("/srv/f.txt"), Some(b"new".to_vec()));
+        assert!(!fs.has_file("/srv/.f.txt.task-1.part"));
+    }
+
+    /// 目标已存在 + Overwrite 且远端不支持原子替换：SftpPublishError，
+    /// 旧目标内容保持不动，绝不先删旧文件。
+    #[test]
+    fn publish_upload_overwrite_fails_without_touching_target_when_unsupported() {
+        use crate::core::ssh_transport::test_support::{
+            in_memory_sftp_no_atomic_replace, in_memory_sftp_transport,
+        };
+
+        let fs = in_memory_sftp_no_atomic_replace(&[
+            ("/srv/f.txt", b"old".to_vec()),
+            ("/srv/.f.txt.task-1.part", b"new".to_vec()),
+        ]);
+        let mut transport = in_memory_sftp_transport(&fs);
+
+        let error = publish_upload_file(
+            &mut transport,
+            "/srv/.f.txt.task-1.part",
+            "/srv/f.txt",
+            ConflictStrategy::Overwrite,
+        )
+        .expect_err("不支持原子替换时必须失败");
+
+        assert!(
+            matches!(&error, AppError::SftpPublishError(detail)
+                if detail.contains("无法保证安全替换") && detail.contains("旧目标保留")),
+            "应保留旧目标并给出结构化发布错误，实际: {error:?}"
+        );
+        assert_eq!(
+            fs.content("/srv/f.txt"),
+            Some(b"old".to_vec()),
+            "发布失败不得改动旧目标"
+        );
+        assert!(fs.has_file("/srv/.f.txt.task-1.part"));
+    }
+
+    /// 目标检查的元数据错误（非路径不存在）原样传播，不做发布尝试。
+    #[test]
+    fn publish_upload_propagates_metadata_errors() {
+        use crate::core::ssh_transport::test_support::failing_channel_sftp;
+
+        let mut transport = failing_channel_sftp();
+
+        let error = publish_upload_file(
+            &mut transport,
+            "/srv/.f.txt.task-1.part",
+            "/srv/f.txt",
+            ConflictStrategy::Reject,
+        )
+        .expect_err("元数据错误应传播");
+
+        assert!(
+            matches!(&error, AppError::SftpChannelError(message) if message.contains("connection lost")),
+            "元数据错误应原样返回，实际: {error:?}"
+        );
+    }
+
+    // ─── 上传安全发布与清理 worker contract ───────────────────────────────
+
+    /// 新文件上传：数据经远端临时文件发布到最终目标，Done 后目标内容正确、
+    /// 临时文件不残留，发布成功不触发任何 unlink。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_new_file_publishes_to_target_without_temp_leftover() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-upload-new-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("新文件上传应正常入队");
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            fs.content(&task.remote_path),
+            Some(b"hello".to_vec()),
+            "目标内容应为本地文件内容"
+        );
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        assert!(
+            !fs.has_file(&temp_path.to_string_lossy()),
+            "发布成功后临时文件不应残留"
+        );
+        assert!(fs.unlink_calls().is_empty(), "发布成功不得触发任何 unlink");
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 零字节文件上传：空内容仍经完整临时文件流程发布，目标以空文件存在。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_zero_byte_file_publishes_empty_target() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let fs = in_memory_sftp(&[]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-upload-zero-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("零字节文件上传应正常入队");
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            fs.content(&task.remote_path),
+            Some(Vec::new()),
+            "零字节文件应以空内容发布到目标"
+        );
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        assert!(!fs.has_file(&temp_path.to_string_lossy()));
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// Reject + 远端目标已存在：任务 Failed + SftpTargetExists，旧远端内容不动，
+    /// 本任务临时文件被清理，未知 .part 文件不被扫描或删除。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_reject_keeps_remote_target_and_cleans_only_own_temp() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let fs = in_memory_sftp(&[
+            ("/srv/keep.txt", b"old".to_vec()),
+            ("/srv/.other.unknown.part", b"x".to_vec()),
+        ]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        // 独立子目录承载同名本地文件：远端目标 /srv/keep.txt 与预置目标冲突
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-upload-reject-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task
+            .error
+            .as_ref()
+            .expect("拒绝覆盖必须携带结构化错误");
+        assert_eq!(error.code, "SftpTargetExists");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("/srv/keep.txt")),
+            "错误 detail 必须包含远端目标路径"
+        );
+        assert_eq!(
+            fs.content("/srv/keep.txt"),
+            Some(b"old".to_vec()),
+            "Reject 冲突不得破坏远端旧目标"
+        );
+        assert!(
+            !fs.has_file(&temp_path.to_string_lossy()),
+            "冲突失败后本任务临时文件应被清理"
+        );
+        assert_eq!(
+            fs.unlink_calls(),
+            vec![temp_path.to_string_lossy().to_string()],
+            "只清理本任务临时文件，不扫描未知 .part"
+        );
+        assert!(
+            fs.has_file("/srv/.other.unknown.part"),
+            "未知 .part 文件不得被删除"
+        );
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 确认覆盖：Overwrite 上传原子替换远端目标，任务 Done，目标内容为新内容。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_overwrite_replaces_remote_target() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let fs = in_memory_sftp(&[("/srv/keep.txt", b"old".to_vec())]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-upload-overwrite-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Overwrite,
+                app.handle().clone(),
+            )
+            .expect("确认覆盖的上传应正常入队");
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            fs.content("/srv/keep.txt"),
+            Some(b"new".to_vec()),
+            "确认覆盖后目标内容应为新内容"
+        );
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        assert!(!fs.has_file(&temp_path.to_string_lossy()));
+        assert!(fs.unlink_calls().is_empty(), "原子替换不得触发 unlink");
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 远端不支持原子替换 + 目标已存在 + Overwrite：任务 Failed + SftpPublishError，
+    /// 旧目标内容保持不动，临时文件被清理。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_overwrite_fails_when_server_cannot_replace_atomically() {
+        use crate::core::ssh_transport::test_support::{
+            in_memory_sftp_no_atomic_replace, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let fs = in_memory_sftp_no_atomic_replace(&[("/srv/keep.txt", b"old".to_vec())]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-upload-noatomic-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Overwrite,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task
+            .error
+            .as_ref()
+            .expect("发布失败必须携带结构化错误");
+        assert_eq!(error.code, "SftpPublishError");
+        assert!(
+            error.detail.as_deref().is_some_and(
+                |detail| detail.contains("无法保证安全替换") && detail.contains("旧目标保留")
+            ),
+            "发布失败必须说明旧目标保留"
+        );
+        assert_eq!(
+            fs.content("/srv/keep.txt"),
+            Some(b"old".to_vec()),
+            "发布失败不得改动远端旧目标"
+        );
+        assert!(
+            !fs.has_file(&temp_path.to_string_lossy()),
+            "临时文件应被清理"
+        );
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 运行时写入失败：任务 Failed + SftpWriteError，本任务临时文件被清理，
+    /// 远端旧目标保持不动。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_write_failure_cleans_temp_and_keeps_target() {
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let gate = Gate::new();
+        let fs = gated_in_memory_sftp(&[("/srv/keep.txt", b"old".to_vec())], gate.clone(), true);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-upload-writefail-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        gate.wait_arrived(); // 传输已创建临时文件并进入首次写入
+        gate.open();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task
+            .error
+            .as_ref()
+            .expect("写入失败必须携带结构化错误");
+        assert_eq!(error.code, "SftpWriteError");
+        assert!(
+            !fs.has_file(&temp_path.to_string_lossy()),
+            "写入失败后本任务临时文件应被清理"
+        );
+        assert_eq!(
+            fs.unlink_calls(),
+            vec![temp_path.to_string_lossy().to_string()],
+            "只清理本任务临时文件"
+        );
+        assert_eq!(fs.content("/srv/keep.txt"), Some(b"old".to_vec()));
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 传输中取消：任务 Cancelled 且无错误，本任务临时文件被清理，
+    /// 远端旧目标保持不动。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_cancel_cleans_temp_and_keeps_target() {
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let gate = Gate::new();
+        let fs = gated_in_memory_sftp(&[("/srv/keep.txt", b"old".to_vec())], gate.clone(), false);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-upload-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        gate.wait_arrived();
+        service.cancel_task(&task.task_id).unwrap();
+        gate.open();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Cancelled
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        assert!(registry_task.error.is_none(), "清理成功的取消不得携带错误");
+        assert!(
+            !fs.has_file(&temp_path.to_string_lossy()),
+            "取消后本任务临时文件应被清理"
+        );
+        assert_eq!(fs.content("/srv/keep.txt"), Some(b"old".to_vec()));
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 取消后清理失败：任务 Cancelled 且 error 报告包含临时路径的清理错误，
+    /// 残留临时文件保留待用户处理。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_cancel_cleanup_failure_reports_temp_path() {
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let gate = Gate::new();
+        let fs = gated_in_memory_sftp(&[], gate.clone(), false);
+        fs.deny_unlink();
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-upload-cleanfail-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        let temp_str = temp_path.to_string_lossy().to_string();
+        gate.wait_arrived();
+        service.cancel_task(&task.task_id).unwrap();
+        gate.open();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Cancelled
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task.error.as_ref().expect("清理失败必须报告错误");
+        assert_eq!(error.code, "SftpTransferError");
+        assert!(
+            error.detail.as_deref().is_some_and(
+                |detail| detail.contains("清理临时文件失败") && detail.contains(&temp_str)
+            ),
+            "清理失败错误必须包含临时路径，实际: {:?}",
+            error.detail
+        );
+        assert!(
+            fs.has_file(&temp_str),
+            "清理失败后残留临时文件保留，路径已报告给用户"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 写入失败叠加清理失败：任务 Failed 保留 SftpWriteError，
+    /// detail 追加包含临时路径的清理诊断。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_failure_with_cleanup_failure_appends_temp_path() {
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let gate = Gate::new();
+        let fs = gated_in_memory_sftp(&[], gate.clone(), true);
+        fs.deny_unlink();
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path =
+            std::env::temp_dir().join(format!("titan-upload-cleanfail2-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"new").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
+        let temp_str = temp_path.to_string_lossy().to_string();
+        gate.wait_arrived();
+        gate.open();
+
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Failed
+        );
+        let registry_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .unwrap()
+            .clone();
+        let error = registry_task
+            .error
+            .as_ref()
+            .expect("失败必须携带结构化错误");
+        assert_eq!(
+            error.code, "SftpWriteError",
+            "主错误代码必须保留 SftpWriteError"
+        );
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("remote write reset")
+                    && detail.contains("清理临时文件失败")
+                    && detail.contains(&temp_str)),
+            "detail 必须同时保留写入诊断与临时路径清理诊断，实际: {:?}",
+            error.detail
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 同一 Session 已有 Pending/Running 上传占用相同最终目标时，后加入任务
+    /// 被拒绝并返回结构化 SftpTargetBusy；原任务不受影响，终态后可再次上传。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enqueue_upload_duplicate_active_target_is_rejected() {
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let gate = Gate::new();
+        let fs = gated_in_memory_sftp(&[], gate.clone(), false);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_dir = std::env::temp_dir().join(format!("titan-upload-dup-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+        let first = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("首个上传应正常入队");
+        gate.wait_arrived(); // 首个任务处于 Running 且占用 /srv/keep.txt
+
+        let error = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect_err("相同最终目标的第二个上传应被拒绝");
+        assert!(
+            matches!(&error, AppError::SftpTargetBusy(path) if path == "/srv/keep.txt"),
+            "重复目标应返回结构化 SftpTargetBusy，实际: {error:?}"
+        );
+
+        gate.open();
+        assert_eq!(
+            wait_for_terminal(&service, &first.task_id),
+            SftpTaskStatus::Done,
+            "原任务不受拒绝影响"
+        );
+
+        // 终态任务不再占用目标：再次上传相同目标应正常入队并完成
+        let again = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/srv".to_string(),
+                ConflictStrategy::Overwrite,
+                app.handle().clone(),
+            )
+            .expect("终态任务不占用目标，再次上传应成功入队");
+        assert_eq!(
+            wait_for_terminal(&service, &again.task_id),
+            SftpTaskStatus::Done
+        );
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 上传与下载各自占用命名空间：同 Session 的下载任务不阻止上传入队。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enqueue_upload_does_not_conflict_with_active_download() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let fs = in_memory_sftp(&[("/remote/file.bin", b"content".to_vec())]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        // 入队一个下载（立刻完成），再上传同名远端目标：两者目标命名空间不同
+        let download_local =
+            std::env::temp_dir().join(format!("titan-cross-{}.bin", Uuid::new_v4()));
+        let download = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                download_local.to_string_lossy().to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("下载应正常入队");
+
+        let upload_local =
+            std::env::temp_dir().join(format!("titan-cross-up-{}.bin", Uuid::new_v4()));
+        std::fs::write(&upload_local, b"up").unwrap();
+        let upload = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                upload_local.to_string_lossy().to_string(),
+                "/remote".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传不得被下载任务阻止");
+
+        assert_eq!(
+            wait_for_terminal(&service, &download.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            wait_for_terminal(&service, &upload.task_id),
+            SftpTaskStatus::Done
+        );
+        let _ = std::fs::remove_file(&download_local);
+        let _ = std::fs::remove_file(&upload_local);
     }
 }

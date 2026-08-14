@@ -1,6 +1,6 @@
 use crate::core::sftp_service::SftpService;
 use crate::errors::app_error::AppErrorInfo;
-use crate::models::sftp::{DownloadConflictStrategy, RemoteEntry, TransferTask};
+use crate::models::sftp::{ConflictStrategy, RemoteEntry, TransferTask};
 use tauri::{AppHandle, Runtime, State};
 
 /// 列举远程目录内容，按目录优先、名称排序
@@ -32,7 +32,7 @@ pub fn sftp_download<R: Runtime>(
     session_id: String,
     remote_path: String,
     local_path: String,
-    conflict_strategy: Option<DownloadConflictStrategy>,
+    conflict_strategy: Option<ConflictStrategy>,
     sftp_service: State<'_, SftpService>,
 ) -> Result<TransferTask, AppErrorInfo> {
     sftp_service
@@ -52,16 +52,24 @@ pub fn sftp_download<R: Runtime>(
 /// - `session_id`: 关联的 SSH 会话 ID
 /// - `local_path`: 本地文件完整路径
 /// - `remote_path`: 远程目标目录路径（后端自动拼接文件名）
+/// - `conflict_strategy`: 目标已存在时的处理策略，缺省 Reject（拒绝覆盖）
 #[tauri::command]
-pub fn sftp_upload(
-    app: AppHandle,
+pub fn sftp_upload<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
     local_path: String,
     remote_path: String,
+    conflict_strategy: Option<ConflictStrategy>,
     sftp_service: State<'_, SftpService>,
 ) -> Result<TransferTask, AppErrorInfo> {
     sftp_service
-        .enqueue_upload(session_id, local_path, remote_path, app)
+        .enqueue_upload(
+            session_id,
+            local_path,
+            remote_path,
+            conflict_strategy.unwrap_or_default(),
+            app,
+        )
         .map_err(AppErrorInfo::from)
 }
 
@@ -104,7 +112,7 @@ pub fn sftp_clear_terminal_tasks(session_id: String, sftp_service: State<'_, Sft
 
 #[cfg(test)]
 mod tests {
-    use super::sftp_download;
+    use super::{sftp_download, sftp_upload};
     use crate::core::sftp_service::SftpService;
     use crate::core::ssh_transport::test_support::memory_sftp;
     use crate::models::host::{AuthType, HostConfig};
@@ -260,5 +268,119 @@ mod tests {
             "确认覆盖后目标内容应为远程内容"
         );
         let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 缺省 conflictStrategy 时上传按 Reject 处理：远端目标已存在的上传最终 Failed，
+    /// 结构化错误为 SftpTargetExists，远端旧内容保持不动。
+    #[test]
+    fn sftp_upload_without_conflict_strategy_defaults_to_reject() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+
+        let fs = in_memory_sftp(&[("/srv/keep.txt", b"old".to_vec())]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        let managed = service.clone();
+        service.register_session("session-1".to_string(), make_host());
+
+        let app = mock_builder()
+            .manage(managed)
+            .invoke_handler(tauri::generate_handler![sftp_upload])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        // 独立子目录承载同名本地文件：远端目标 /srv/keep.txt 与预置目标冲突
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-cmd-upload-default-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+
+        let response = get_ipc_response(
+            &webview,
+            request(
+                "sftp_upload",
+                serde_json::json!({
+                    "sessionId": "session-1",
+                    "localPath": local_path.to_string_lossy(),
+                    "remotePath": "/srv",
+                }),
+            ),
+        )
+        .expect("缺省 conflictStrategy 的上传命令应成功入队");
+        let task: TransferTask = response.deserialize().unwrap();
+        assert_eq!(task.status, SftpTaskStatus::Pending);
+
+        let terminal = wait_terminal(&service, "session-1", &task.task_id);
+        assert_eq!(terminal.status, SftpTaskStatus::Failed);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.code.as_str()),
+            Some("SftpTargetExists"),
+            "缺省策略必须为 Reject，冲突时返回结构化 SftpTargetExists"
+        );
+        assert_eq!(
+            fs.content("/srv/keep.txt"),
+            Some(b"old".to_vec()),
+            "缺省 Reject 不得覆盖远端旧文件"
+        );
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// 显式 Overwrite 策略经上传命令透传：远端目标被原子替换，任务 Done。
+    #[test]
+    fn sftp_upload_with_explicit_overwrite_replaces_remote_target() {
+        use crate::core::ssh_transport::test_support::{in_memory_sftp, in_memory_sftp_transport};
+
+        let fs = in_memory_sftp(&[("/srv/keep.txt", b"old".to_vec())]);
+        let fs_for_connector = fs.clone();
+        let service = SftpService::with_connector(move |_, _| {
+            Ok(in_memory_sftp_transport(&fs_for_connector))
+        });
+        let managed = service.clone();
+        service.register_session("session-1".to_string(), make_host());
+
+        let app = mock_builder()
+            .manage(managed)
+            .invoke_handler(tauri::generate_handler![sftp_upload])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        let local_dir =
+            std::env::temp_dir().join(format!("titan-cmd-upload-overwrite-{}", Uuid::new_v4()));
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_path = local_dir.join("keep.txt");
+        std::fs::write(&local_path, b"new").unwrap();
+
+        let response = get_ipc_response(
+            &webview,
+            request(
+                "sftp_upload",
+                serde_json::json!({
+                    "sessionId": "session-1",
+                    "localPath": local_path.to_string_lossy(),
+                    "remotePath": "/srv",
+                    "conflictStrategy": "Overwrite",
+                }),
+            ),
+        )
+        .expect("显式 Overwrite 的上传命令应成功入队");
+        let task: TransferTask = response.deserialize().unwrap();
+        assert_eq!(task.status, SftpTaskStatus::Pending);
+
+        let terminal = wait_terminal(&service, "session-1", &task.task_id);
+        assert_eq!(terminal.status, SftpTaskStatus::Done);
+        assert_eq!(
+            fs.content("/srv/keep.txt"),
+            Some(b"new".to_vec()),
+            "确认覆盖后远端目标内容应为新内容"
+        );
+        let _ = std::fs::remove_dir_all(&local_dir);
     }
 }

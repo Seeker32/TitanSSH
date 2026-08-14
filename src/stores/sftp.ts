@@ -2,9 +2,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
 import { toAppError, type AppErrorInfo } from '@/i18n';
-import { isTerminalStatus } from '@/types/sftp';
+import { isTerminalStatus, uploadTargetDir } from '@/types/sftp';
 import type {
-  DownloadConflictStrategy,
+  ConflictStrategy,
   RemoteEntry,
   SftpProgressEvent,
   SftpSessionState,
@@ -23,8 +23,8 @@ interface SftpState {
   ensureState: (sessionId: string) => SftpSessionState;
   listDir: (sessionId: string, path: string) => Promise<void>;
   loadTaskSnapshot: (sessionId: string) => Promise<void>;
-  download: (sessionId: string, remotePath: string, localPath: string, parentTaskId?: string, conflictStrategy?: DownloadConflictStrategy) => Promise<void>;
-  upload: (sessionId: string, localPath: string, remotePath: string, parentTaskId?: string) => Promise<void>;
+  download: (sessionId: string, remotePath: string, localPath: string, parentTaskId?: string, conflictStrategy?: ConflictStrategy) => Promise<void>;
+  upload: (sessionId: string, localPath: string, remotePath: string, parentTaskId?: string, conflictStrategy?: ConflictStrategy) => Promise<void>;
   cancelTask: (taskId: string, sessionId: string) => Promise<void>;
   clearTerminalTasks: (sessionId: string) => Promise<void>;
   toggleSelect: (sessionId: string, path: string) => void;
@@ -199,11 +199,15 @@ export const useSftpStore = create<SftpState>((set, get) => ({
   },
 
   /** 发起上传任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。
-   *  invoke 拒绝（启动失败）不向外抛出：重试场景（parentTaskId）只在原任务行
-   *  标注 actionError，否则写入文件浏览器错误区；成功后清除原任务行的旧操作错误。 */
-  async upload(sessionId, localPath, remotePath, parentTaskId) {
+   *  冲突策略默认 Reject；仅当用户对单个冲突文件确认覆盖时才传 Overwrite，
+   *  确认不扩展到批次或 Session。invoke 拒绝（启动失败）不向外抛出：重试场景
+   *  （parentTaskId）只在原任务行标注 actionError，否则写入文件浏览器错误区；
+   *  成功后清除原任务行的旧操作错误。 */
+  async upload(sessionId, localPath, remotePath, parentTaskId, conflictStrategy = 'Reject') {
     try {
-      const task = await invoke<TransferTask>('sftp_upload', { sessionId, localPath, remotePath });
+      const task = await invoke<TransferTask>('sftp_upload', {
+        sessionId, localPath, remotePath, conflictStrategy,
+      });
       updateSession(set, sessionId, (state) => ({
         ...state,
         tasks: new Map(state.tasks).set(task.taskId, task),
@@ -292,7 +296,9 @@ export const useSftpStore = create<SftpState>((set, get) => ({
 
   /** 应用传输任务终态；完成时强制进度为总大小。未知任务缓存最新事件。
    *  会话已关闭（投影已清空）时迟到事件直接丢弃；任务到达终态时同步清除
-   *  对应任务行的 actionError（取消失败等操作错误已失去意义）。 */
+   *  对应任务行的 actionError（取消失败等操作错误已失去意义）。
+   *  上传 Done 且用户仍停留在目标目录时自动刷新该目录（离开目标目录的用户
+   *  不会被拉回）；刷新经 listDir 的请求序号机制服从最新目录请求规则。 */
   applyTaskStatus(event) {
     if (get().closedSessions.has(event.sessionId)) return;
     const state = get().sessionStates.get(event.sessionId);
@@ -322,6 +328,13 @@ export const useSftpStore = create<SftpState>((set, get) => ({
         taskActionErrors,
       };
     });
+    // 仅上传完成且用户仍位于目标目录时刷新：离开目标目录的用户不得被强制导航回来
+    if (event.status === 'Done' && task.transferType === 'Upload') {
+      const targetDir = uploadTargetDir(task);
+      if (state?.currentPath === targetDir) {
+        void get().listDir(event.sessionId, targetDir);
+      }
+    }
   },
 
   /** 任务元数据到达后补投缓存的状态事件；事件不再落回缓存。 */
