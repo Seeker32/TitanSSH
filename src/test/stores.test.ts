@@ -4,7 +4,7 @@ import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
 import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, readMonitorCollapsed, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
-import { useSessionStore } from '@/stores/session';
+import { connectionLabel, useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { TaskStatus } from '@/types/monitor';
@@ -189,15 +189,64 @@ describe('Zustand stores', () => {
     await expect(useSessionStore.getState().openSession('host-1')).resolves.toMatchObject({ sessionId: 'session-1' });
   });
 
-  it('会话状态和进度事件更新公开状态', async () => {
-    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? makeSession() : makeTaskInfo());
+  it('连接阶段与失败错误按 sessionId 更新且互不覆盖', async () => {
+    let openCount = 0;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') {
+        openCount += 1;
+        return makeSession({ sessionId: `session-${openCount}` });
+      }
+      return makeTaskInfo();
+    });
     await useSessionStore.getState().openSession('host-1');
+    await useSessionStore.getState().openSession('host-1');
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({ phase: null, error: null });
     const cleanup = await useSessionStore.getState().initListeners();
+
     emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.SshHandshake, timestamp: Date.now() });
-    expect(useSessionStore.getState().statusMessage).toContain('SSH 握手');
-    emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.AuthFailed, error: null });
-    expect(useSessionStore.getState().statusMessage).toContain('认证失败');
+    emitMockEvent('session:progress', { sessionId: 'session-2', phase: ConnectionPhase.Authenticating, timestamp: Date.now() });
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({ phase: ConnectionPhase.SshHandshake, error: null });
+    expect(useSessionStore.getState().connections.get('session-2')).toEqual({ phase: ConnectionPhase.Authenticating, error: null });
+
+    emitMockEvent('session:status', { sessionId: 'session-2', status: SessionStatus.AuthFailed, error: null });
+    expect(useSessionStore.getState().connections.get('session-2')).toEqual({ phase: null, error: null });
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({ phase: ConnectionPhase.SshHandshake, error: null });
+
+    emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, error: null });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().sessions.get('session-2')?.status).toBe(SessionStatus.AuthFailed);
     cleanup();
+  });
+
+  it('连接失败保留结构化错误供所属标签渲染', async () => {
+    useSessionStore.setState({ sessions: new Map([['session-1', makeSession()]]) });
+    useSessionStore.getState().applySessionStatus({
+      sessionId: 'session-1', status: SessionStatus.Error, error: { code: 'SshConnectionError', detail: 'connection refused' },
+    });
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({
+      phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' },
+    });
+  });
+
+  it('断开的会话清除连接投影，不再残留不可见状态', () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession({ status: SessionStatus.Connected })]]),
+      connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
+    });
+    useSessionStore.getState().applySessionStatus({ sessionId: 'session-1', status: SessionStatus.Disconnected, error: null });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+  });
+
+  it('连接文案在渲染时生成且随语言切换即时生效', () => {
+    const session = makeSession();
+    const failed = makeSession({ status: SessionStatus.Error });
+    const connecting = { phase: ConnectionPhase.SshHandshake, error: null };
+    const failedConnection = { phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' } };
+    expect(connectionLabel(session, connecting, 'zh-CN')).toContain('SSH 握手');
+    expect(connectionLabel(session, connecting, 'en-US')).toContain('SSH handshake');
+    expect(connectionLabel(session, undefined, 'zh-CN')).toContain('正在连接');
+    expect(connectionLabel(failed, failedConnection, 'zh-CN')).toContain('SSH 连接失败');
+    expect(connectionLabel(failed, failedConnection, 'en-US')).toContain('SSH connection failed');
   });
 
   it('打开会话时初始化文件传输且连接成功事件不重复请求目录', async () => {
@@ -254,7 +303,11 @@ describe('Zustand stores', () => {
 
   it('关闭活动会话只调用后端 teardown 并清理前端 projection', async () => {
     const task = makeTaskInfo();
-    useSessionStore.setState({ sessions: new Map([['session-1', makeSession()]]), activeView: 'session-1' });
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      activeView: 'session-1',
+      connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
+    });
     useMonitorStore.setState({
       sessionTaskMap: new Map([['session-1', task.taskId]]),
       tasks: new Map([[task.taskId, task]]),
@@ -266,6 +319,7 @@ describe('Zustand stores', () => {
 
     expect(useSessionStore.getState().activeView).toBeNull();
     expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
     expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
     expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);

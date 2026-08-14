@@ -119,6 +119,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'session.timeout': 'Connection timed out. Check the network or host address.',
   'session.error': 'Connection error',
   'session.disconnected': 'Connection disconnected',
+  'session.closeTab': 'Close Tab',
   'session.unknown': 'Connection failed',
   'phase.LoadingCredentials': 'Loading credentials...',
   'phase.ConnectingTcp': 'Establishing TCP connection...',

@@ -250,6 +250,36 @@ test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) 
   expect(commands).toEqual(expect.arrayContaining(['open_session', 'start_monitoring', 'sftp_list_dir', 'sftp_download']));
 });
 
+test('终端标签独立呈现连接生命周期：阶段、错误与关闭', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const emit = (name: string, payload: unknown) => page.evaluate(([eventName, eventPayload]) => {
+    (window as unknown as { __TAURI_TEST__: { emit: (event: string, value: unknown) => void } }).__TAURI_TEST__.emit(eventName as string, eventPayload);
+  }, [name, payload] as const);
+
+  // Connecting：加载动画与当前阶段，且无任何操作按钮
+  await emit('session:progress', { sessionId: 'session-1', phase: 'ConnectingTcp', timestamp: Date.now() });
+  await expect(page.locator('.terminal-overlay--connecting')).toContainText('正在建立 TCP 连接...');
+  await expect(page.locator('.terminal-overlay .spinner')).toBeVisible();
+
+  // Connected：覆盖层消失，终端可交互
+  await emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null });
+  await expect(page.locator('.terminal-overlay')).toHaveCount(0);
+
+  // 连接错误回到所属标签，仅提供关闭标签操作
+  await emit('session:status', {
+    sessionId: 'session-1', status: 'Error',
+    error: { code: 'SshConnectionError', detail: 'connection refused' },
+  });
+  await expect(page.getByRole('alert')).toContainText('SSH 连接失败');
+  await page.getByRole('button', { name: '关闭标签' }).click();
+  const closed = await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> } }).__TAURI_TEST__.calls
+    .filter((call) => call.command === 'close_session'));
+  expect(closed).toEqual([{ command: 'close_session', args: { sessionId: 'session-1' } }]);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.locator('.empty-state')).toBeVisible();
+});
+
 test('失败状态可见且传输任务可以重试', async ({ page }) => {
   await page.goto('/');
   await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();

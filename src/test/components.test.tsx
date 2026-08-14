@@ -1,5 +1,5 @@
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import FileExplorer from '@/components/sftp/FileExplorer';
@@ -12,11 +12,14 @@ import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
 import TransferQueue from '@/components/sftp/TransferQueue';
 import { AuthType } from '@/types/host';
-import { SessionStatus } from '@/types/session';
+import { ConnectionPhase, SessionStatus } from '@/types/session';
+import { useLocaleStore } from '@/stores/locale';
 import { makeHost, makeRemoteDir, makeRemoteEntry, makeSession, makeSnapshot, makeTransferTask } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({
-  default: ({ sessionId, active }: { sessionId: string; active: boolean }) => <div data-testid="xterm" data-session={sessionId} hidden={!active} />,
+  default: ({ sessionId, active, interactive }: { sessionId: string; active: boolean; interactive?: boolean }) => (
+    <div data-testid="xterm" data-session={sessionId} data-interactive={String(interactive ?? true)} hidden={!active} />
+  ),
 }));
 
 describe('React components', () => {
@@ -144,7 +147,7 @@ describe('React components', () => {
 
   it('终端面板保留每个会话实例，仅展示当前视图', () => {
     render(<TerminalPane sessions={[makeSession(), makeSession({ sessionId: 'session-2' })]} activeView="session-2"
-      onInput={vi.fn()} onResize={vi.fn()} />);
+      connections={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
     const terminals = screen.getAllByTestId('xterm');
     expect(terminals).toHaveLength(2);
     expect(terminals[0]).not.toBeVisible();
@@ -153,10 +156,82 @@ describe('React components', () => {
 
   it('无会话时终端面板显示空态页并可新建主机', () => {
     const onCreateHost = vi.fn();
-    render(<TerminalPane sessions={[]} activeView={null} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} />);
+    render(<TerminalPane sessions={[]} activeView={null} connections={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} onCloseTab={vi.fn()} />);
     expect(screen.getByText(/选择左侧主机/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '新建主机' }));
     expect(onCreateHost).toHaveBeenCalledOnce();
+  });
+
+  it('连接中的会话在终端区域显示加载动画与当前阶段', () => {
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
+    const overlay = screen.getByRole('status');
+    expect(overlay).toBeVisible();
+    expect(overlay).toHaveTextContent('正在进行 SSH 握手...');
+    expect(overlay.querySelector('.spinner')).not.toBeNull();
+    // 连接未完成时不提供任何操作按钮，也不接收输入
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.getByTestId('xterm')).not.toHaveAttribute('data-interactive', 'true');
+  });
+
+  it('连接失败的会话显示结构化错误且仅提供关闭标签操作', async () => {
+    const user = userEvent.setup();
+    const onCloseTab = vi.fn();
+    render(<TerminalPane sessions={[makeSession({ status: SessionStatus.Error })]} activeView="session-1"
+      connections={new Map([['session-1', { phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' } }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={onCloseTab} />);
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('SSH 连接失败: connection refused');
+    await user.click(screen.getByRole('button', { name: '关闭标签' }));
+    expect(onCloseTab).toHaveBeenCalledWith('session-1');
+  });
+
+  it('两个会话各自呈现连接阶段且互不覆盖，非当前标签不抢占焦点', () => {
+    render(<TerminalPane
+      sessions={[
+        makeSession({ sessionId: 'session-1' }),
+        makeSession({ sessionId: 'session-2', status: SessionStatus.AuthFailed }),
+      ]}
+      activeView="session-1"
+      connections={new Map([
+        ['session-1', { phase: ConnectionPhase.ConnectingTcp, error: null }],
+        ['session-2', { phase: null, error: null }],
+      ])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
+    const overlays = screen.getAllByRole('status').length + screen.getAllByRole('alert', { hidden: true }).length;
+    expect(overlays).toBe(2);
+    expect(screen.getByRole('status')).toHaveTextContent('正在建立 TCP 连接...');
+    expect(screen.getByRole('alert', { hidden: true })).not.toBeVisible();
+    expect(screen.getByRole('status')).toBeVisible();
+  });
+
+  it('连接中切换语言后覆盖层文案即时更新', () => {
+    const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
+    expect(screen.getByRole('status')).toHaveTextContent('正在进行 SSH 握手...');
+    act(() => useLocaleStore.setState({ locale: 'en-US' }));
+    rerender(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
+    act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
+  });
+
+  it('英文环境下连接阶段与失败操作使用英文文案', async () => {
+    const user = userEvent.setup();
+    act(() => useLocaleStore.setState({ locale: 'en-US' }));
+    const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
+    rerender(<TerminalPane sessions={[makeSession({ status: SessionStatus.Timeout })]} activeView="session-1"
+      connections={new Map([['session-1', { phase: null, error: null }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('Connection timed out');
+    await user.click(screen.getByRole('button', { name: 'Close Tab' }));
+    act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
   });
 
   it('文件行与传输队列使用 lucide 图标而非 emoji', () => {

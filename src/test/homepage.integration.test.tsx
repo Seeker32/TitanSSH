@@ -6,12 +6,13 @@ import { emitMockEvent, listen, resetMockEvents } from '@tauri-apps/api/event';
 import HomePage from '@/pages/HomePage';
 import { useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
+import { useLocaleStore } from '@/stores/locale';
 import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useLogLevelStore } from '@/stores/log-level';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
-import { SessionStatus } from '@/types/session';
+import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({ default: () => <div data-testid="xterm" /> }));
@@ -109,6 +110,73 @@ describe('HomePage integration', () => {
     expect(screen.getByLabelText('网卡接口')).toHaveValue('ens5');
     act(() => useSessionStore.getState().setActiveView('session-1'));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('eth1');
+  });
+
+  it('终端标签独立呈现连接阶段，后台会话错误不覆盖当前标签', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    const overlay = screen.getByRole('status');
+    expect(overlay).toHaveTextContent('正在连接 root@10.0.0.8');
+
+    await act(async () => {
+      emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.RequestingPty, timestamp: Date.now() });
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('正在请求终端 PTY...');
+
+    act(() => useSessionStore.setState({ sessions: new Map([
+      ...useSessionStore.getState().sessions,
+      ['session-2', makeSession({ sessionId: 'session-2' })],
+    ]) }));
+    await act(async () => {
+      emitMockEvent('session:status', { sessionId: 'session-2', status: SessionStatus.AuthFailed, error: null });
+    });
+
+    // 当前标签仍呈现自己的连接阶段，后台标签仅更新状态点
+    expect(screen.getByRole('status')).toHaveTextContent('正在请求终端 PTY...');
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs[1].querySelector('.dot-error')).not.toBeNull();
+
+    await act(async () => {
+      emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, error: null });
+    });
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('连接失败在所属标签内显示错误，关闭标签调用后端 teardown', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => {
+      emitMockEvent('session:status', {
+        sessionId: 'session-1', status: SessionStatus.Error,
+        error: { code: 'SshConnectionError', detail: 'connection refused' },
+      });
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent('SSH 连接失败');
+    expect(screen.getByRole('alert')).toHaveTextContent('connection refused');
+    mockInvoke.mockClear();
+    await user.click(screen.getByRole('button', { name: '关闭标签' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' }));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('英文环境下连接阶段与失败操作使用英文文案', async () => {
+    const user = userEvent.setup();
+    act(() => useLocaleStore.setState({ locale: 'en-US' }));
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    expect(screen.getByRole('status')).toHaveTextContent('Connecting to root@10.0.0.8');
+    await act(async () => {
+      emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.ConnectingTcp, timestamp: Date.now() });
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('Establishing TCP connection...');
+    await act(async () => {
+      emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Timeout, error: null });
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent('Connection timed out');
+    expect(screen.getByRole('button', { name: 'Close Tab' })).toBeInTheDocument();
+    act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
   });
 
   it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {

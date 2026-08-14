@@ -29,6 +29,7 @@ export default function HomePage() {
   const selectedHostId = useHostStore((state) => state.selectedHostId);
   const sessionsMap = useSessionStore((state) => state.sessions);
   const activeView = useSessionStore((state) => state.activeView);
+  const connections = useSessionStore((state) => state.connections);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
   const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
   const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
@@ -85,6 +86,11 @@ export default function HomePage() {
   /** 打开指定主机的 SSH 会话。 */
   async function openSession(hostId: string) {
     await useSessionStore.getState().openSession(hostId);
+  }
+
+  /** 关闭 SSH 会话：标签栏与终端错误覆盖层共用同一入口。 */
+  async function closeSession(sessionId: string) {
+    await useSessionStore.getState().closeSession(sessionId);
   }
 
   /** 打开新建主机表单。 */
@@ -202,12 +208,13 @@ export default function HomePage() {
     <section className="main-panel">
       {sessions.length > 0 && <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
         onActivate={(view) => useSessionStore.getState().setActiveView(view)}
-        onClose={(sessionId) => useSessionStore.getState().closeSession(sessionId)} /></div>}
+        onClose={closeSession} /></div>}
       <div className="content-area">
-        <TerminalPane sessions={sessions} activeView={activeView}
+        <TerminalPane sessions={sessions} activeView={activeView} connections={connections}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
-          onCreateHost={createHost} />
+          onCreateHost={createHost}
+          onCloseTab={closeSession} />
         {activeView !== null && <SftpPanel sessionId={activeView} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}

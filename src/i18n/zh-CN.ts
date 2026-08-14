@@ -117,6 +117,7 @@ export const zhCN = {
   'session.timeout': '连接超时，请检查网络或主机地址',
   'session.error': '连接错误',
   'session.disconnected': '连接已断开',
+  'session.closeTab': '关闭标签',
   'session.unknown': '连接异常',
   'phase.LoadingCredentials': '正在读取凭据...',
   'phase.ConnectingTcp': '正在建立 TCP 连接...',
