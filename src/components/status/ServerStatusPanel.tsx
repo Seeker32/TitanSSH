@@ -18,13 +18,13 @@ interface Props {
   onToggle: () => void;
 }
 
-/** 将监控数值格式化为百分比文本。 */
-function formatPercent(value: number | undefined) {
+/** 将监控数值格式化为百分比文本；null/undefined 表示未知。 */
+function formatPercent(value: number | null | undefined) {
   return typeof value === 'number' ? `${value.toFixed(1)}%` : '--';
 }
 
-/** 将字节容量格式化为易读文本。 */
-function formatBytes(bytes: number | undefined) {
+/** 将字节容量格式化为易读文本；null/undefined 表示未知。 */
+function formatBytes(bytes: number | null | undefined) {
   if (typeof bytes !== 'number' || bytes <= 0) return '--';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
@@ -96,7 +96,7 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
       <div className="monitor-strip" data-testid="monitor-strip" role="button" aria-expanded="false" onClick={onToggle}>
         <span className={`status-dot ${snapshot ? 'dot-connected' : 'dot-offline'}`} />
         <span className="monitor-strip-label">{translate(locale, 'monitor.name')}</span>
-        <ChevronDown size={12} className="monitor-strip-chevron" />
+        <ChevronUp size={12} className="monitor-strip-chevron" />
       </div>
     );
   }
@@ -113,7 +113,7 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
     <Card size="small" variant="borderless" className="status-panel"
       title={<><Typography.Text type="secondary">{translate(locale, 'monitor.title')}</Typography.Text><strong>{snapshot ? translate(locale, 'monitor.connected') : translate(locale, 'monitor.disconnected')}</strong></>}
       extra={<button type="button" className="monitor-collapse-btn" data-testid="monitor-collapse-btn"
-        aria-label={translate(locale, 'monitor.collapse')} title={translate(locale, 'monitor.collapse')} onClick={onToggle}><ChevronUp size={12} /></button>}>
+        aria-label={translate(locale, 'monitor.collapse')} title={translate(locale, 'monitor.collapse')} onClick={onToggle}><ChevronDown size={12} /></button>}>
       <Row gutter={[12, 12]}>
         {metrics.map(([label, value], index) => (
           <Col span={index === 2 ? 24 : 12} key={label}>

@@ -15,6 +15,8 @@ interface Props {
   onDownload: (sessionId: string, paths: string[]) => void;
   onCancel: (taskId: string) => void;
   onRetry: (task: TransferTask) => void;
+  onOverwrite: (task: TransferTask) => void;
+  onClearTerminal: () => void;
 }
 
 const MIN_HEIGHT = 120;
@@ -53,8 +55,9 @@ export default function SftpPanel(props: Props) {
     };
   }, []);
 
-  /** 启动 SFTP 面板高度拖动。 */
+  /** 启动 SFTP 面板高度拖动：阻止默认行为防止拖动过程中文本被选中。 */
   function startResize(event: ReactPointerEvent) {
+    event.preventDefault();
     dragging.current = true;
     startY.current = event.clientY;
     startHeight.current = height;
@@ -75,6 +78,8 @@ export default function SftpPanel(props: Props) {
         onSelect={(path) => props.onSelect(props.sessionId, path)}
         onUpload={() => props.onUpload(props.sessionId, props.state!.currentPath)}
         onDownload={(paths) => props.onDownload(props.sessionId, paths)} />
-        : <TransferQueue tasks={props.state.tasks} onCancel={props.onCancel} onRetry={props.onRetry} />}
+        : <TransferQueue tasks={props.state.tasks} actionErrors={props.state.taskActionErrors}
+          onCancel={props.onCancel} onRetry={props.onRetry} onOverwrite={props.onOverwrite}
+          onClearTerminal={props.onClearTerminal} />}
   </div>;
 }

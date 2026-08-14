@@ -13,12 +13,14 @@ pub fn list_hosts(app: AppHandle) -> Result<Vec<HostConfig>, AppErrorInfo> {
     service.list_hosts().map_err(AppErrorInfo::from)
 }
 
-/// 保存主机配置:将明文凭据写入 OS 安全存储,仅将引用键落盘
+/// 保存主机配置：将明文凭据写入 OS 安全存储，仅将引用键落盘；
+/// endpoint 变更且旧值不再被任何配置引用时，自动清理旧信任记录
 ///
-/// 薄 adapter:校验、凭据写入、引用解析、落盘与失败补偿全部委托 host_service。
+/// 薄 adapter：校验、凭据写入、引用解析、落盘、失败补偿与信任清理全部委托
+/// host_service。
 ///
 /// # 参数
-/// - `request`: 含明文凭据的保存请求,处理完毕后明文不得持久化
+/// - `request`: 含明文凭据的保存请求，处理完毕后明文不得持久化
 ///
 /// # 返回
 /// 更新后的主机列表
@@ -31,7 +33,8 @@ pub fn save_host(
     service.save(&request).map_err(AppErrorInfo::from)
 }
 
-/// 删除主机配置,同步清理 OS 安全存储中的凭据
+/// 删除主机配置：同步清理 OS 安全存储凭据，并在被删 endpoint 不再被
+/// 任何剩余配置引用时清理其信任记录
 ///
 /// # 参数
 /// - `host_id`: 要删除的主机 ID

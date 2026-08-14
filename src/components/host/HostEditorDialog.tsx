@@ -1,8 +1,8 @@
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useEffect, useState } from 'react';
-import { AutoComplete, Button, Form, Input, InputNumber, Modal, Select } from 'antd';
+import { AutoComplete, Button, Form, Input, InputNumber, Modal, Select, Space } from 'antd';
 import { AuthType, type HostConfig, type SaveHostRequest } from '@/types/host';
-import { translate } from '@/i18n';
+import { formatAppError, translate, type AppErrorInfo } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 
 interface Props {
@@ -10,6 +10,8 @@ interface Props {
   editingHost: HostConfig | null;
   /** 已有分组名列表，供分组字段下拉复用 */
   groups: string[];
+  /** 上次保存失败的结构化错误；展示在表单内，弹窗保持打开 */
+  saveError?: AppErrorInfo | null;
   onClose: () => void;
   onSave: (request: SaveHostRequest) => void;
 }
@@ -32,7 +34,7 @@ function formFromHost(host: HostConfig | null): SaveHostRequest {
 }
 
 /** 渲染新建或编辑主机的安全凭据表单。 */
-export default function HostEditorDialog({ open, editingHost, groups, onClose, onSave }: Props) {
+export default function HostEditorDialog({ open, editingHost, groups, saveError, onClose, onSave }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   const t = (key: Parameters<typeof translate>[1]) => translate(locale, key);
   const [form, setForm] = useState<SaveHostRequest>(() => formFromHost(editingHost));
@@ -76,8 +78,13 @@ export default function HostEditorDialog({ open, editingHost, groups, onClose, o
         options={[{ label: t('host.passwordAuth'), value: AuthType.Password }, { label: t('host.privateKeyAuth'), value: AuthType.PrivateKey }]} /></Form.Item>
       {form.authType === AuthType.Password ? <Form.Item label={t('host.password')}><Input.Password {...textProps} value={form.password}
         placeholder={t('host.passwordPlaceholder')} onChange={(event) => update('password', event.target.value)} /></Form.Item>
-        : <Form.Item label={t('host.privateKeyPath')} help={!form.privateKeyPath ? t('host.keyRequired') : undefined}><Input {...textProps} readOnly value={form.privateKeyPath}
-          placeholder={t('host.keyPlaceholder')} addonAfter={<Button onClick={pickPrivateKey}>{t('host.browse')}</Button>} /></Form.Item>}
+        : <Form.Item label={t('host.privateKeyPath')}>
+          <Space.Compact block>
+            <Input {...textProps} readOnly value={form.privateKeyPath}
+              placeholder={t('host.keyPlaceholder')} />
+            <Button onClick={pickPrivateKey}>{t('host.browse')}</Button>
+          </Space.Compact>
+        </Form.Item>}
       {form.authType === AuthType.PrivateKey && <Form.Item label={t('host.passphrase')}><Input.Password {...textProps}
         value={form.passphrase} placeholder={t('host.passphrasePlaceholder')} onChange={(event) => update('passphrase', event.target.value)} /></Form.Item>}
       <Form.Item label={t('host.group')}><AutoComplete aria-label={t('host.group')} value={form.group} placeholder={t('host.groupPlaceholder')}
@@ -86,5 +93,6 @@ export default function HostEditorDialog({ open, editingHost, groups, onClose, o
       <Form.Item label={t('host.remark')}><Input.TextArea {...textProps} rows={3} value={form.remark}
         placeholder={t('host.remarkPlaceholder')} onChange={(event) => update('remark', event.target.value)} /></Form.Item>
     </Form>
+    {saveError && <p className="host-editor-save-error" data-testid="host-editor-save-error" role="alert">{formatAppError(locale, saveError)}</p>}
   </Modal>;
 }

@@ -1,17 +1,23 @@
+use crate::commands::run_blocking_op;
 use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 
 /// 为指定会话启动监控任务
 ///
-/// 从 session_manager 读取主机配置后，委托 monitor_service 读取凭据并创建后台采集任务。
+/// 从 session_manager 读取主机配置与主机身份统一校验器后，
+/// 委托 monitor_service 读取凭据并创建后台采集任务；监控连接与其他 capability
+/// 一样在握手后、认证前经过统一校验。
 /// 返回包含 task_id 的 TaskInfo，前端可用于跟踪任务状态。
 /// 凭据读取失败或 session 不存在时返回错误字符串。
+///
+/// 异步 command：凭据读取会访问 OS 安全存储（Linux DBus/keyring 可能等待
+/// 授权或守护响应），必须在阻塞线程池执行，不得占用 Tauri 主线程（否则前端卡死）。
 #[tauri::command]
-pub fn start_monitoring(
-    app: AppHandle,
+pub async fn start_monitoring<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
     session_manager: State<'_, SessionManager>,
     monitor_service: State<'_, MonitorService>,
@@ -19,9 +25,11 @@ pub fn start_monitoring(
     let host = session_manager
         .host_config(&session_id)
         .map_err(AppErrorInfo::from)?;
-    monitor_service
-        .start_monitoring(session_id, host, app)
-        .map_err(AppErrorInfo::from)
+    let verifier = session_manager
+        .host_key_verifier(&app, &session_id)
+        .map_err(AppErrorInfo::from)?;
+    let service = monitor_service.inner().clone();
+    run_blocking_op(move || service.start_monitoring(session_id, host, verifier, app)).await
 }
 
 /// 停止指定 task_id 对应的监控任务

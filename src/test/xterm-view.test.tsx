@@ -34,13 +34,13 @@ describe('XtermView', () => {
   });
 
   it('挂载时初始化终端与尺寸插件', () => {
-    render(<XtermView sessionId="session-1" active onInput={vi.fn()} onResize={vi.fn()} />);
+    render(<XtermView sessionId="session-1" active interactive onInput={vi.fn()} onResize={vi.fn()} />);
     expect(terminal.loadAddon).toHaveBeenCalledOnce();
     expect(terminal.open).toHaveBeenCalledOnce();
   });
 
   it('仅写入匹配 sessionId 的后端数据', async () => {
-    render(<XtermView sessionId="session-1" active onInput={vi.fn()} onResize={vi.fn()} />);
+    render(<XtermView sessionId="session-1" active interactive onInput={vi.fn()} onResize={vi.fn()} />);
     await act(async () => {});
     act(() => {
       emitMockEvent('terminal:data', { sessionId: 'session-2', data: 'skip' });
@@ -52,9 +52,19 @@ describe('XtermView', () => {
 
   it('用户输入携带正确会话 ID 上送', () => {
     const onInput = vi.fn();
-    render(<XtermView sessionId="session-1" active onInput={onInput} onResize={vi.fn()} />);
+    render(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
     inputHandler('ls\r');
     expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: 'ls\r' });
+  });
+
+  it('Connected 前不接收用户输入，转为可交互后恢复上送', () => {
+    const onInput = vi.fn();
+    const view = render(<XtermView sessionId="session-1" active interactive={false} onInput={onInput} onResize={vi.fn()} />);
+    inputHandler('ls\r');
+    expect(onInput).not.toHaveBeenCalled();
+    view.rerender(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
+    inputHandler('pwd\r');
+    expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: 'pwd\r' });
   });
 
   it('终端色板与 slate 视觉体系一致', () => {
@@ -65,7 +75,7 @@ describe('XtermView', () => {
   });
 
   it('每个全局 SSH 终端主题都会应用到已挂载和新建终端，且不受应用主题切换影响', () => {
-    const first = render(<XtermView sessionId="session-1" active onInput={vi.fn()} onResize={vi.fn()} />);
+    const first = render(<XtermView sessionId="session-1" active interactive onInput={vi.fn()} onResize={vi.fn()} />);
     for (const theme of TERMINAL_THEME_NAMES) {
       act(() => useTerminalThemeStore.getState().setTerminalTheme(theme));
       expect(terminal.options.theme).toEqual(terminalThemes[theme]);
@@ -73,12 +83,12 @@ describe('XtermView', () => {
     act(() => useThemeStore.getState().setTheme('dark'));
     expect(terminal.options.theme).toEqual(terminalThemes.solarizedDark);
     first.unmount();
-    render(<XtermView sessionId="session-2" active onInput={vi.fn()} onResize={vi.fn()} />);
+    render(<XtermView sessionId="session-2" active interactive onInput={vi.fn()} onResize={vi.fn()} />);
     expect(terminal.options.theme).toEqual(terminalThemes.solarizedDark);
   });
 
   it('卸载时释放终端资源', async () => {
-    const view = render(<XtermView sessionId="session-1" active onInput={vi.fn()} onResize={vi.fn()} />);
+    const view = render(<XtermView sessionId="session-1" active interactive onInput={vi.fn()} onResize={vi.fn()} />);
     await act(async () => {});
     view.unmount();
     expect(inputDisposable.dispose).toHaveBeenCalledOnce();

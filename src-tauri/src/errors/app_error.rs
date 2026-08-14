@@ -66,6 +66,63 @@ pub enum AppError {
     /// 传输中断（含传输中通道断开）
     #[error("SFTP 传输错误: {0}")]
     SftpTransferError(String),
+
+    /// 本地文件打开失败（上传读取源）
+    #[error("SFTP 打开失败: {0}")]
+    SftpOpenError(String),
+
+    /// 传输读取失败（远端读取或本地读取）
+    #[error("SFTP 读取失败: {0}")]
+    SftpReadError(String),
+
+    /// 传输写入失败（远端写入或本地写入）
+    #[error("SFTP 写入失败: {0}")]
+    SftpWriteError(String),
+
+    /// 目标文件创建失败（本地或远端）
+    #[error("SFTP 创建失败: {0}")]
+    SftpCreateError(String),
+
+    /// 取消目标任务不存在（未入队或已从 registry 移除）
+    #[error("SFTP 任务不存在: {0}")]
+    SftpTaskNotFound(String),
+
+    /// 下载目标已存在且冲突策略为 Reject（前端据此逐文件确认覆盖）
+    #[error("SFTP 目标已存在: {0}")]
+    SftpTargetExists(String),
+
+    /// 同一 Session 已有 Pending/Running 下载占用相同最终目标
+    #[error("SFTP 目标正被占用: {0}")]
+    SftpTargetBusy(String),
+
+    /// 临时文件发布到最终目标失败（原目标文件不受影响）
+    #[error("SFTP 发布失败: {0}")]
+    SftpPublishError(String),
+
+    /// 用户拒绝了未知主机身份；detail 携带 endpoint 与指纹，连接不得进入认证
+    #[error("已拒绝未知主机身份: {0}")]
+    HostKeyRejected(String),
+
+    /// 主机身份确认请求不存在（已解决或从未创建）
+    #[error("主机身份确认请求不存在: {0}")]
+    HostKeyChallengeNotFound(String),
+
+    /// 等待主机身份确认期间会话被关闭，验证已取消
+    #[error("主机身份验证已取消: {0}")]
+    HostKeyVerificationCancelled(String),
+
+    /// TitanSSH 独立信任存储不可读、不可解析或写入失败；fail-closed，绝不静默视为空
+    #[error("信任存储错误: {0}")]
+    TrustStoreError(String),
+
+    /// "接受并保存"持久化失败；challenge 保持未决，不自动降级为临时信任
+    #[error("主机信任保存失败: {0}")]
+    HostKeySaveFailed(String),
+
+    /// HostConfig 保存/删除后的 endpoint 信任记录自动清理失败；
+    /// 配置变更已生效，但清理未完成的管理动作必须显式报错，不得静默报告为成功
+    #[error("主机信任记录清理失败: {0}")]
+    HostTrustCleanupFailed(String),
 }
 
 impl AppError {
@@ -85,6 +142,57 @@ impl AppError {
             Self::SftpPermissionDenied(_) => "SftpPermissionDenied",
             Self::SftpPathNotFound(_) => "SftpPathNotFound",
             Self::SftpTransferError(_) => "SftpTransferError",
+            Self::SftpOpenError(_) => "SftpOpenError",
+            Self::SftpReadError(_) => "SftpReadError",
+            Self::SftpWriteError(_) => "SftpWriteError",
+            Self::SftpCreateError(_) => "SftpCreateError",
+            Self::SftpTaskNotFound(_) => "SftpTaskNotFound",
+            Self::SftpTargetExists(_) => "SftpTargetExists",
+            Self::SftpTargetBusy(_) => "SftpTargetBusy",
+            Self::SftpPublishError(_) => "SftpPublishError",
+            Self::HostKeyRejected(_) => "HostKeyRejected",
+            Self::HostKeyChallengeNotFound(_) => "HostKeyChallengeNotFound",
+            Self::HostKeyVerificationCancelled(_) => "HostKeyVerificationCancelled",
+            Self::TrustStoreError(_) => "TrustStoreError",
+            Self::HostKeySaveFailed(_) => "HostKeySaveFailed",
+            Self::HostTrustCleanupFailed(_) => "HostTrustCleanupFailed",
+        }
+    }
+
+    /// 保持错误代码不变，把补充说明追加到 detail 末尾。
+    ///
+    /// 用于复合诊断（如传输失败叠加临时文件清理失败）：
+    /// 主错误代码仍是前端判定的稳定依据，detail 拼上清理失败的具体信息。
+    pub fn with_appended_detail(self, extra: &str) -> AppError {
+        let merged = format!("{}；{}", self, extra);
+        match self {
+            Self::SshConnectionError(_) => Self::SshConnectionError(merged),
+            Self::AuthenticationError(_) => Self::AuthenticationError(merged),
+            Self::SessionNotFound(_) => Self::SessionNotFound(merged),
+            Self::InvalidHostConfig(_) => Self::InvalidHostConfig(merged),
+            Self::StorageError(_) => Self::StorageError(merged),
+            Self::IoError(_) => Self::IoError(std::io::Error::other(merged)),
+            Self::SshProtocolError(_) => Self::SshProtocolError(merged),
+            Self::SecureStoreError(_) => Self::SecureStoreError(merged),
+            Self::CredentialNotFound(_) => Self::CredentialNotFound(merged),
+            Self::SftpChannelError(_) => Self::SftpChannelError(merged),
+            Self::SftpPermissionDenied(_) => Self::SftpPermissionDenied(merged),
+            Self::SftpPathNotFound(_) => Self::SftpPathNotFound(merged),
+            Self::SftpTransferError(_) => Self::SftpTransferError(merged),
+            Self::SftpOpenError(_) => Self::SftpOpenError(merged),
+            Self::SftpReadError(_) => Self::SftpReadError(merged),
+            Self::SftpWriteError(_) => Self::SftpWriteError(merged),
+            Self::SftpCreateError(_) => Self::SftpCreateError(merged),
+            Self::SftpTaskNotFound(_) => Self::SftpTaskNotFound(merged),
+            Self::SftpTargetExists(_) => Self::SftpTargetExists(merged),
+            Self::SftpTargetBusy(_) => Self::SftpTargetBusy(merged),
+            Self::SftpPublishError(_) => Self::SftpPublishError(merged),
+            Self::HostKeyRejected(_) => Self::HostKeyRejected(merged),
+            Self::HostKeyChallengeNotFound(_) => Self::HostKeyChallengeNotFound(merged),
+            Self::HostKeyVerificationCancelled(_) => Self::HostKeyVerificationCancelled(merged),
+            Self::TrustStoreError(_) => Self::TrustStoreError(merged),
+            Self::HostKeySaveFailed(_) => Self::HostKeySaveFailed(merged),
+            Self::HostTrustCleanupFailed(_) => Self::HostTrustCleanupFailed(merged),
         }
     }
 }
@@ -105,7 +213,21 @@ impl From<AppError> for AppErrorInfo {
             | AppError::SftpChannelError(detail)
             | AppError::SftpPermissionDenied(detail)
             | AppError::SftpPathNotFound(detail)
-            | AppError::SftpTransferError(detail) => detail,
+            | AppError::SftpTransferError(detail)
+            | AppError::SftpOpenError(detail)
+            | AppError::SftpReadError(detail)
+            | AppError::SftpWriteError(detail)
+            | AppError::SftpCreateError(detail)
+            | AppError::SftpTaskNotFound(detail)
+            | AppError::SftpTargetExists(detail)
+            | AppError::SftpTargetBusy(detail)
+            | AppError::SftpPublishError(detail) => detail,
+            AppError::HostKeyRejected(detail)
+            | AppError::HostKeyChallengeNotFound(detail)
+            | AppError::HostKeyVerificationCancelled(detail)
+            | AppError::TrustStoreError(detail)
+            | AppError::HostKeySaveFailed(detail)
+            | AppError::HostTrustCleanupFailed(detail) => detail,
             AppError::IoError(detail) => detail.to_string(),
         };
         Self {
@@ -147,5 +269,77 @@ mod tests {
             value,
             serde_json::json!({ "code": "AuthenticationError", "detail": "denied" })
         );
+    }
+
+    /// 下载冲突/占用/发布错误使用稳定英文代码，detail 携带目标路径。
+    #[test]
+    fn download_conflict_errors_have_stable_codes() {
+        assert_eq!(
+            AppError::SftpTargetExists("/tmp/a.txt".to_string()).code(),
+            "SftpTargetExists"
+        );
+        assert_eq!(
+            AppError::SftpTargetBusy("/tmp/a.txt".to_string()).code(),
+            "SftpTargetBusy"
+        );
+        assert_eq!(
+            AppError::SftpPublishError("/tmp/a.txt".to_string()).code(),
+            "SftpPublishError"
+        );
+    }
+
+    /// 主机身份错误使用稳定英文代码，供前端按 code 区分拒绝/取消/请求不存在。
+    #[test]
+    fn host_identity_errors_have_stable_codes() {
+        assert_eq!(
+            AppError::HostKeyRejected("10.0.0.8:22".to_string()).code(),
+            "HostKeyRejected"
+        );
+        assert_eq!(
+            AppError::HostKeyChallengeNotFound("challenge-1".to_string()).code(),
+            "HostKeyChallengeNotFound"
+        );
+        assert_eq!(
+            AppError::HostKeyVerificationCancelled("session-1".to_string()).code(),
+            "HostKeyVerificationCancelled"
+        );
+    }
+
+    /// 信任存储与保存失败使用稳定英文代码，供前端区分 fail-closed 与保存失败。
+    #[test]
+    fn trust_store_errors_have_stable_codes() {
+        assert_eq!(
+            AppError::TrustStoreError("known_hosts 解析失败".to_string()).code(),
+            "TrustStoreError"
+        );
+        assert_eq!(
+            AppError::HostKeySaveFailed("write denied".to_string()).code(),
+            "HostKeySaveFailed"
+        );
+    }
+
+    /// HostConfig 生命周期清理失败使用稳定英文代码，IPC payload 结构化且
+    /// 携带 endpoint 诊断：管理动作不得被静默报告为成功。
+    #[test]
+    fn host_trust_cleanup_error_has_stable_code_and_payload() {
+        let error = AppError::HostTrustCleanupFailed(
+            "endpoint 10.0.0.8:22 的信任记录清理失败: write denied".to_string(),
+        );
+        assert_eq!(error.code(), "HostTrustCleanupFailed");
+        let value = serde_json::to_value(AppErrorInfo::from(error)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "code": "HostTrustCleanupFailed", "detail": "endpoint 10.0.0.8:22 的信任记录清理失败: write denied" })
+        );
+    }
+
+    /// with_appended_detail 保持原错误代码不变，并把补充说明追加到 detail。
+    #[test]
+    fn appended_detail_preserves_code_and_appends_text() {
+        let error = AppError::SftpReadError("remote read reset".to_string())
+            .with_appended_detail("清理临时文件失败: /tmp/.f.part (permission denied)");
+        assert_eq!(error.code(), "SftpReadError");
+        assert!(error.to_string().contains("remote read reset"));
+        assert!(error.to_string().contains("清理临时文件失败: /tmp/.f.part"));
     }
 }

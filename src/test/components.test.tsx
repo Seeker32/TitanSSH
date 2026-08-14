@@ -1,5 +1,5 @@
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import FileExplorer from '@/components/sftp/FileExplorer';
@@ -10,13 +10,17 @@ import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import SftpPanel from '@/components/sftp/SftpPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
+import HostIdentityCard from '@/components/terminal/HostIdentityCard';
 import TransferQueue from '@/components/sftp/TransferQueue';
 import { AuthType } from '@/types/host';
-import { SessionStatus } from '@/types/session';
+import { ConnectionPhase, SessionStatus, type HostIdentityChallenge } from '@/types/session';
+import { useLocaleStore } from '@/stores/locale';
 import { makeHost, makeRemoteDir, makeRemoteEntry, makeSession, makeSnapshot, makeTransferTask } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({
-  default: ({ sessionId, active }: { sessionId: string; active: boolean }) => <div data-testid="xterm" data-session={sessionId} hidden={!active} />,
+  default: ({ sessionId, active, interactive }: { sessionId: string; active: boolean; interactive?: boolean }) => (
+    <div data-testid="xterm" data-session={sessionId} data-interactive={String(interactive ?? true)} hidden={!active} />
+  ),
 }));
 
 describe('React components', () => {
@@ -144,7 +148,7 @@ describe('React components', () => {
 
   it('终端面板保留每个会话实例，仅展示当前视图', () => {
     render(<TerminalPane sessions={[makeSession(), makeSession({ sessionId: 'session-2' })]} activeView="session-2"
-      onInput={vi.fn()} onResize={vi.fn()} />);
+      connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     const terminals = screen.getAllByTestId('xterm');
     expect(terminals).toHaveLength(2);
     expect(terminals[0]).not.toBeVisible();
@@ -153,23 +157,285 @@ describe('React components', () => {
 
   it('无会话时终端面板显示空态页并可新建主机', () => {
     const onCreateHost = vi.fn();
-    render(<TerminalPane sessions={[]} activeView={null} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} />);
+    render(<TerminalPane sessions={[]} activeView={null} connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByText(/选择左侧主机/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '新建主机' }));
     expect(onCreateHost).toHaveBeenCalledOnce();
   });
 
+  it('连接中的会话在终端区域显示加载动画与当前阶段', () => {
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    const overlay = screen.getByRole('status');
+    expect(overlay).toBeVisible();
+    expect(overlay).toHaveTextContent('正在进行 SSH 握手...');
+    expect(overlay.querySelector('.spinner')).not.toBeNull();
+    // 连接未完成时不提供任何操作按钮，也不接收输入
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.getByTestId('xterm')).not.toHaveAttribute('data-interactive', 'true');
+  });
+
+  it('连接失败的会话显示结构化错误且仅提供关闭标签操作', async () => {
+    const user = userEvent.setup();
+    const onCloseTab = vi.fn();
+    render(<TerminalPane sessions={[makeSession({ status: SessionStatus.Error })]} activeView="session-1"
+      connections={new Map([['session-1', { phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' } }]])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={onCloseTab}
+      onSaveIdentity={vi.fn()} saveErrors={new Map()} />);
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('SSH 连接失败: connection refused');
+    await user.click(screen.getByRole('button', { name: '关闭标签' }));
+    expect(onCloseTab).toHaveBeenCalledWith('session-1');
+  });
+
+  it('两个会话各自呈现连接阶段且互不覆盖，非当前标签不抢占焦点', () => {
+    render(<TerminalPane
+      sessions={[
+        makeSession({ sessionId: 'session-1' }),
+        makeSession({ sessionId: 'session-2', status: SessionStatus.AuthFailed }),
+      ]}
+      activeView="session-1"
+      connections={new Map([
+        ['session-1', { phase: ConnectionPhase.ConnectingTcp, error: null }],
+        ['session-2', { phase: null, error: null }],
+      ])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    const overlays = screen.getAllByRole('status').length + screen.getAllByRole('alert', { hidden: true }).length;
+    expect(overlays).toBe(2);
+    expect(screen.getByRole('status')).toHaveTextContent('正在建立 TCP 连接...');
+    expect(screen.getByRole('alert', { hidden: true })).not.toBeVisible();
+    expect(screen.getByRole('status')).toBeVisible();
+  });
+
+  it('连接中切换语言后覆盖层文案即时更新', () => {
+    const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    expect(screen.getByRole('status')).toHaveTextContent('正在进行 SSH 握手...');
+    act(() => useLocaleStore.setState({ locale: 'en-US' }));
+    rerender(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
+    act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
+  });
+
+  it('主机身份确认卡在终端区域内联呈现 endpoint、算法与指纹，并提供接受并保存/仅本次接受/拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const save = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 2222,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_000_000,
+    };
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
+      challenges={new Map([['session-1', challenge]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
+      onSaveIdentity={save} saveErrors={new Map()} onAcceptIdentity={accept} onRejectIdentity={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    expect(card).toHaveTextContent('10.0.0.8:2222');
+    expect(card).toHaveTextContent('ssh-ed25519');
+    expect(card).toHaveTextContent('SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD');
+    // 等待确认期间展示主机身份验证阶段；确认卡存在时不显示连接覆盖层；xterm 仍不可交互
+    expect(card).toHaveTextContent('正在验证主机身份...');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByTestId('xterm')).toHaveAttribute('data-interactive', 'false');
+    await user.click(screen.getByRole('button', { name: '接受并保存' }));
+    expect(save).toHaveBeenCalledWith('session-1');
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledWith('session-1');
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledWith('session-1');
+  });
+
+  it('保存失败时确认卡保持未决并展示结构化错误，用户仍可改选仅本次接受或拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
+      challenges={new Map([['session-1', challenge]])}
+      saveErrors={new Map([['session-1', { code: 'HostKeySaveFailed', detail: 'write denied' }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
+      onSaveIdentity={vi.fn()} onAcceptIdentity={accept} onRejectIdentity={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    const error = screen.getByTestId('host-identity-save-error');
+    expect(card).toContainElement(error);
+    expect(error).toHaveTextContent('保存信任记录失败');
+    expect(error).toHaveTextContent('write denied');
+    // 三个操作仍可用：重试保存、改选仅本次接受或拒绝
+    expect(screen.getByRole('button', { name: '接受并保存' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledWith('session-1');
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledWith('session-1');
+  });
+
+  it('非验证阶段的连接投影不向确认卡注入阶段文案', async () => {
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.Authenticating, error: null }]])}
+      challenges={new Map([['session-1', challenge]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
+      onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    expect(screen.getByTestId('host-identity-card')).not.toHaveTextContent('正在验证主机身份...');
+  });
+
+  it('英文环境下主机身份确认卡使用英文文案', async () => {
+    const user = userEvent.setup();
+    act(() => useLocaleStore.setState({ locale: 'en-US' }));
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    render(<HostIdentityCard challenge={challenge} onAcceptAndSave={vi.fn()} saveError={null} onAccept={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText('Cannot verify host identity')).toBeInTheDocument();
+    expect(screen.getByText('Host address')).toBeInTheDocument();
+    expect(screen.getByText('SHA-256 fingerprint')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Accept & Save' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Accept Once' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Accept Once' }));
+    act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
+  });
+
+  it('主机身份变更卡展示已保存与呈现的算法/指纹，提供仅本次接受/替换记录/拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const save = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-changed', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed',
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    render(<HostIdentityCard challenge={challenge} onAcceptAndSave={save} saveError={null} onAccept={accept} onReject={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    expect(card).toHaveTextContent('主机身份已变更');
+    expect(card).toHaveTextContent('10.0.0.8:22');
+    // 内联卡片清晰展示已保存旧记录与服务器呈现的算法/指纹
+    const stored = within(card).getByTestId('host-identity-stored');
+    expect(stored).toHaveTextContent('已保存算法');
+    expect(stored).toHaveTextContent('ssh-ed25519');
+    expect(stored).toHaveTextContent('已保存 SHA-256 指纹');
+    expect(stored).toHaveTextContent('SHA256:oldfp');
+    const presented = within(card).getByTestId('host-identity-presented');
+    expect(presented).toHaveTextContent('呈现算法');
+    expect(presented).toHaveTextContent('ssh-rsa');
+    expect(presented).toHaveTextContent('呈现 SHA-256 指纹');
+    expect(presented).toHaveTextContent('SHA256:newfp');
+    // Changed 不提供一次性"接受并保存"，提供 仅本次接受/替换记录/拒绝
+    expect(screen.queryByTestId('host-identity-save')).toBeNull();
+    expect(screen.getByTestId('host-identity-replace')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledTimes(1);
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('替换记录必须经过第二次内联确认：取消不回调，确认替换才回调；challenge 更换重置确认', async () => {
+    const user = userEvent.setup();
+    const save = vi.fn();
+    const makeChallenge = (challengeId: string): HostIdentityChallenge => ({
+      challengeId, sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed',
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    });
+    const { rerender } = render(<HostIdentityCard challenge={makeChallenge('challenge-1')}
+      onAcceptAndSave={save} saveError={null} onAccept={vi.fn()} onReject={vi.fn()} />);
+
+    // 第一次点击"替换记录"只进入二次确认，不触发替换
+    await user.click(screen.getByTestId('host-identity-replace'));
+    expect(screen.getByTestId('host-identity-replace-confirm')).toHaveTextContent('确认替换长期信任记录？');
+    expect(save).not.toHaveBeenCalled();
+    // 取消：退回主操作，仍不触发替换
+    await user.click(screen.getByTestId('host-identity-replace-cancel'));
+    expect(screen.queryByTestId('host-identity-replace-confirm')).toBeNull();
+    expect(save).not.toHaveBeenCalled();
+    // 第二次进入确认并点击"确认替换"才真正替换
+    await user.click(screen.getByTestId('host-identity-replace'));
+    await user.click(screen.getByTestId('host-identity-replace-confirm-btn'));
+    expect(save).toHaveBeenCalledTimes(1);
+
+    // 服务端再次换 key（新 challenge 事件）：确认状态重置，不残留二次确认
+    rerender(<HostIdentityCard challenge={makeChallenge('challenge-2')}
+      onAcceptAndSave={save} saveError={null} onAccept={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByTestId('host-identity-replace-confirm')).toBeNull();
+  });
+
+  it('替换失败时确认卡保持未决并展示替换失败文案，可改选仅本次接受或拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-replace-fail', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed',
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    render(<HostIdentityCard challenge={challenge} onAcceptAndSave={vi.fn()}
+      saveError={{ code: 'HostKeySaveFailed', detail: 'write denied' }} onAccept={accept} onReject={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    const error = screen.getByTestId('host-identity-save-error');
+    expect(card).toContainElement(error);
+    expect(error).toHaveTextContent('替换信任记录失败');
+    expect(error).toHaveTextContent('write denied');
+    // 替换失败后仍可改选仅本次接受或拒绝
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledTimes(1);
+  });
+
+  it('英文环境下连接阶段与失败操作使用英文文案', async () => {
+    const user = userEvent.setup();
+    act(() => useLocaleStore.setState({ locale: 'en-US' }));
+    const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
+    rerender(<TerminalPane sessions={[makeSession({ status: SessionStatus.Timeout })]} activeView="session-1"
+      connections={new Map([['session-1', { phase: null, error: null }]])}
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('Connection timed out');
+    await user.click(screen.getByRole('button', { name: 'Close Tab' }));
+    act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
+  });
+
   it('文件行与传输队列使用 lucide 图标而非 emoji', () => {
-    const state = { currentPath: '/', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
     const { container } = render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
     const rows = container.querySelectorAll('.file-row');
     expect(rows[0].querySelector('svg')).not.toBeNull();
     expect(rows[1].querySelector('svg')).not.toBeNull();
     const tasks = new Map([[makeTransferTask().taskId, makeTransferTask()]]);
-    render(<TransferQueue tasks={tasks} onCancel={vi.fn()} onRetry={vi.fn()} />);
+    render(<TransferQueue tasks={tasks} actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={vi.fn()} onClearTerminal={vi.fn()} />);
     expect(container.querySelectorAll('svg').length).toBeGreaterThan(0);
     expect(screen.queryByText('📁')).not.toBeInTheDocument();
     expect(screen.queryByText('⬇')).not.toBeInTheDocument();
+  });
+
+  it('折叠窄条箭头朝上提示展开，展开面板箭头朝下提示收起', () => {
+    const { container, rerender } = render(<ServerStatusPanel snapshot={null} collapsed onToggle={vi.fn()} />);
+    expect(container.querySelector('.monitor-strip-chevron')).toHaveClass('lucide-chevron-up');
+    rerender(<ServerStatusPanel snapshot={null} collapsed={false} onToggle={vi.fn()} />);
+    expect(container.querySelector('.monitor-collapse-btn svg')).toHaveClass('lucide-chevron-down');
   });
 
   it('服务器状态正确显示占位、指标和磁盘容量', () => {
@@ -179,6 +445,18 @@ describe('React components', () => {
     expect(screen.getByText('21.5%')).toBeInTheDocument();
     expect(screen.getByText(/剩余 300.0 GB \/ 总量 500.0 GB/)).toBeInTheDocument();
     expect(screen.queryByText(/^Updated:/)).not.toBeInTheDocument();
+  });
+
+  it('指标缺失时显示未知（--）而非伪造 0%', () => {
+    render(<ServerStatusPanel snapshot={makeSnapshot({
+      cpuUsage: null,
+      memoryUsage: null,
+      diskUsage: null,
+      diskAvailableBytes: null,
+      diskTotalBytes: null,
+    })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getAllByText('--')).toHaveLength(3);
+    expect(screen.queryByText('0.0%')).not.toBeInTheDocument();
   });
 
   it('服务器状态显示默认网卡速率，并区分无网卡和网络不可用', () => {
@@ -254,7 +532,7 @@ describe('React components', () => {
     const navigate = vi.fn();
     const select = vi.fn();
     const download = vi.fn();
-    const state = { currentPath: '/var/log', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/var/log', entries: [makeRemoteEntry(), makeRemoteDir()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
     render(<FileExplorer state={state} onNavigate={navigate} onSelect={select} onUpload={vi.fn()} onDownload={download} />);
     expect(screen.getAllByTestId('file-row')[0]).toHaveTextContent('nginx');
     await user.click(screen.getByText('syslog'));
@@ -265,9 +543,51 @@ describe('React components', () => {
     expect(download).toHaveBeenCalledWith(['/var/log/syslog']);
   });
 
+  it('文件浏览器刷新当前目录', async () => {
+    const user = userEvent.setup();
+    const navigate = vi.fn();
+    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
+    render(<FileExplorer state={state} onNavigate={navigate} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+
+    expect(navigate).toHaveBeenCalledWith('/var/log');
+  });
+
+  it('文件浏览器加载目录时禁用刷新', () => {
+    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
+    render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+
+    expect(screen.getByRole('button', { name: '刷新' })).toBeDisabled();
+  });
+
+  it('文件浏览器右键文件可下载该文件', async () => {
+    const user = userEvent.setup();
+    const download = vi.fn();
+    const state = { currentPath: '/var/log', entries: [makeRemoteEntry()], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
+    render(<FileExplorer state={state} onNavigate={vi.fn()} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={download} />);
+
+    fireEvent.contextMenu(screen.getByText('syslog'));
+    await user.click(await screen.findByRole('menuitem', { name: '下载' }));
+
+    expect(download).toHaveBeenCalledWith(['/var/log/syslog']);
+  });
+
+  it('文件浏览器右键空白区域可刷新当前目录', async () => {
+    const user = userEvent.setup();
+    const navigate = vi.fn();
+    const state = { currentPath: '/var/log', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
+    const { container } = render(<FileExplorer state={state} onNavigate={navigate} onSelect={vi.fn()} onUpload={vi.fn()} onDownload={vi.fn()} />);
+
+    fireEvent.contextMenu(container.querySelector('.file-explorer')!);
+    await user.click(await screen.findByRole('menuitem', { name: '刷新' }));
+
+    expect(navigate).toHaveBeenCalledWith('/var/log');
+  });
+
   it('文件浏览器显示 loading、error 与空目录状态', () => {
     const props = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn() };
-    const base = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map() };
+    const base = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: true, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
     const { rerender } = render(<FileExplorer state={base} {...props} />);
     expect(screen.getByText('加载中...')).toBeInTheDocument();
     rerender(<FileExplorer state={{ ...base, loading: false, error: { code: 'Unknown', detail: 'denied' } }} {...props} />);
@@ -282,7 +602,7 @@ describe('React components', () => {
     const retry = vi.fn();
     const running = makeTransferTask({ transferredBytes: 25600, speedBps: 1024, status: 'Running' });
     const failed = makeTransferTask({ taskId: 'task-2', status: 'Failed', error: { code: 'SftpTransferError', detail: 'network' } });
-    render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} onCancel={cancel} onRetry={retry} />);
+    render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} actionErrors={new Map()} onCancel={cancel} onRetry={retry} onOverwrite={vi.fn()} onClearTerminal={vi.fn()} />);
     expect(screen.getByText('50%')).toBeInTheDocument();
     expect(screen.getByText(/network/)).toBeInTheDocument();
     await user.click(screen.getByTestId('cancel-btn'));
@@ -291,16 +611,116 @@ describe('React components', () => {
     expect(retry).toHaveBeenCalledWith(failed);
   });
 
+  it('冲突失败任务行显示覆盖按钮，点击仅回调该任务', async () => {
+    const user = userEvent.setup();
+    const overwrite = vi.fn();
+    const conflict = makeTransferTask({
+      taskId: 'task-conflict', status: 'Failed',
+      error: { code: 'SftpTargetExists', detail: '/Users/user/Downloads/syslog' },
+    });
+    const other = makeTransferTask({ taskId: 'task-other', status: 'Failed', error: { code: 'SftpReadError', detail: 'reset' } });
+    render(<TransferQueue tasks={new Map([[conflict.taskId, conflict], [other.taskId, other]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={overwrite} onClearTerminal={vi.fn()} />);
+    expect(screen.getByText(/目标文件已存在/)).toBeInTheDocument();
+    expect(screen.getByTestId('overwrite-btn')).toHaveTextContent('覆盖下载');
+    await user.click(screen.getByTestId('overwrite-btn'));
+    expect(overwrite).toHaveBeenCalledWith(conflict);
+  });
+
+  it('上传冲突失败任务行显示覆盖按钮，点击仅回调该任务', async () => {
+    const user = userEvent.setup();
+    const overwrite = vi.fn();
+    const conflict = makeTransferTask({
+      taskId: 'task-upload-conflict', transferType: 'Upload', remotePath: '/var/log/syslog',
+      fileName: 'syslog', localPath: '/tmp/syslog', status: 'Failed',
+      error: { code: 'SftpTargetExists', detail: '/var/log/syslog' },
+    });
+    render(<TransferQueue tasks={new Map([[conflict.taskId, conflict]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={overwrite} onClearTerminal={vi.fn()} />);
+    expect(screen.getByTestId('overwrite-btn')).toHaveTextContent('覆盖上传');
+    await user.click(screen.getByTestId('overwrite-btn'));
+    expect(overwrite).toHaveBeenCalledWith(conflict);
+  });
+
+  it('非冲突失败任务不显示覆盖按钮', () => {
+    const task = makeTransferTask({ status: 'Failed', error: { code: 'SftpReadError', detail: 'reset' } });
+    render(<TransferQueue tasks={new Map([[task.taskId, task]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={vi.fn()} onClearTerminal={vi.fn()} />);
+    expect(screen.queryByTestId('overwrite-btn')).toBeNull();
+  });
+
+  it('取消后临时文件清理失败的错误在任务行可见', () => {
+    const task = makeTransferTask({
+      status: 'Cancelled',
+      error: { code: 'SftpTransferError', detail: '清理临时文件失败: /tmp/.syslog.task.part (not empty)' },
+    });
+    render(<TransferQueue tasks={new Map([[task.taskId, task]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={vi.fn()} onClearTerminal={vi.fn()} />);
+    expect(screen.getByText(/清理临时文件失败/)).toBeInTheDocument();
+  });
+
+  it('任务行渲染取消/重试操作失败的结构化错误', () => {
+    const task = makeTransferTask({ status: 'Running' });
+    const actionErrors = new Map([[task.taskId, { code: 'SftpTaskNotFound', detail: task.taskId }]]);
+    render(<TransferQueue tasks={new Map([[task.taskId, task]])} actionErrors={actionErrors} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={vi.fn()} onClearTerminal={vi.fn()} />);
+    expect(screen.getByTestId('task-action-error')).toHaveTextContent('SFTP 任务不存在');
+    expect(screen.getByTestId('task-action-error')).toHaveTextContent(task.taskId);
+  });
+
+  it('传输队列按 createdAt 最新优先展示任务', () => {
+    const oldTask = makeTransferTask({ taskId: 'task-old', fileName: 'old.log', createdAt: 1_000 });
+    const newTask = makeTransferTask({ taskId: 'task-new', fileName: 'new.log', createdAt: 2_000 });
+    const { container } = render(<TransferQueue tasks={new Map([[oldTask.taskId, oldTask], [newTask.taskId, newTask]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onOverwrite={vi.fn()} onClearTerminal={vi.fn()} />);
+    const names = [...container.querySelectorAll('.task-name')].map((node) => node.textContent);
+    expect(names).toEqual(['new.log', 'old.log']);
+  });
+
+  it('传输队列存在终态任务时显示清除按钮并回调，仅活动任务时不显示', async () => {
+    const user = userEvent.setup();
+    const onClearTerminal = vi.fn();
+    const done = makeTransferTask({ taskId: 'task-done', status: 'Done' });
+    const running = makeTransferTask({ taskId: 'task-running', status: 'Running' });
+    const props = { actionErrors: new Map(), onCancel: vi.fn(), onRetry: vi.fn(), onOverwrite: vi.fn() };
+    const { rerender } = render(<TransferQueue tasks={new Map([[done.taskId, done], [running.taskId, running]])}
+      {...props} onClearTerminal={onClearTerminal} />);
+    await user.click(screen.getByTestId('clear-terminal-btn'));
+    expect(onClearTerminal).toHaveBeenCalledOnce();
+    rerender(<TransferQueue tasks={new Map([[running.taskId, running]])} {...props} onClearTerminal={onClearTerminal} />);
+    expect(screen.queryByTestId('clear-terminal-btn')).not.toBeInTheDocument();
+  });
+
   it('SFTP 面板在浏览器和队列间切换并保留占位', async () => {
     const user = userEvent.setup();
-    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn() };
+    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn(), onOverwrite: vi.fn(), onClearTerminal: vi.fn() };
     const { rerender } = render(<SftpPanel sessionId="session-1" state={null} {...handlers} />);
     expect(screen.getByText('请选择会话')).toBeInTheDocument();
-    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map() };
+    const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
     rerender(<SftpPanel sessionId="session-1" state={state} {...handlers} />);
     await user.click(screen.getByTestId('tab-queue'));
     expect(screen.getByText('暂无传输任务')).toBeInTheDocument();
     expect(screen.getByTestId('sftp-resizer')).toHaveAttribute('aria-orientation', 'horizontal');
+  });
+
+  it('SFTP 高度拖动阻止文本选中：阻止默认行为并仅拖动期间加禁选类', () => {
+    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn(), onOverwrite: vi.fn(), onClearTerminal: vi.fn() };
+    render(<SftpPanel sessionId="session-1" state={null} {...handlers} />);
+    const resizer = screen.getByTestId('sftp-resizer');
+    const start = new Event('pointerdown', { bubbles: true, cancelable: true });
+    const preventDefault = vi.spyOn(start, 'preventDefault');
+    Object.defineProperty(start, 'clientY', { value: 400 });
+    fireEvent(resizer, start);
+    expect(preventDefault).toHaveBeenCalled();
+    expect(document.body.classList.contains('sftp-resizing')).toBe(true);
+    fireEvent(window, new Event('pointerup'));
+    expect(document.body.classList.contains('sftp-resizing')).toBe(false);
+  });
+
+  it('保存失败错误显示在表单内', () => {
+    render(<HostEditorDialog open editingHost={null} groups={[]} onClose={vi.fn()} onSave={vi.fn()}
+      saveError={{ code: 'SecureStoreError', detail: 'The name org.freedesktop.secrets was not provided by any .service files' }} />);
+    expect(screen.getByTestId('host-editor-save-error'))
+      .toHaveTextContent('安全存储错误: The name org.freedesktop.secrets was not provided by any .service files');
   });
 
   it('主机表单编辑时不回填密码，并按认证方式清理字段', async () => {
@@ -360,9 +780,9 @@ describe('React components', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
-  it('私钥路径为空时禁用保存并显示引导文案', () => {
+  it('私钥路径为空时禁用保存', () => {
     render(<HostEditorDialog open editingHost={makeHost({ authType: AuthType.PrivateKey })} groups={[]} onClose={vi.fn()} onSave={vi.fn()} />);
-    expect(screen.getByText('请先选择私钥文件')).toBeInTheDocument();
+    expect(screen.queryByText('请先选择私钥文件')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /保存连接/ })).toBeDisabled();
   });
 });

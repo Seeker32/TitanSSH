@@ -4,10 +4,11 @@ import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
 import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, readMonitorCollapsed, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
-import { useSessionStore } from '@/stores/session';
+import { connectionLabel, useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { TaskStatus } from '@/types/monitor';
+import { uploadTargetDir, type RemoteEntry, type TransferTask } from '@/types/sftp';
 import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
@@ -45,6 +46,19 @@ describe('Zustand stores', () => {
     mockInvoke.mockRejectedValueOnce(new Error('offline'));
     await useHostStore.getState().loadHosts();
     expect(useHostStore.getState()).toMatchObject({ loading: false, error: 'Error: offline' });
+  });
+
+  it('保存时信任清理失败：结构化错误显式抛出，不静默报告为成功', async () => {
+    const host = makeHost();
+    mockInvoke.mockRejectedValueOnce({
+      code: 'HostTrustCleanupFailed',
+      detail: 'endpoint 10.0.0.1:22 的信任记录清理失败: write denied',
+    });
+    await expect(
+      useHostStore.getState().saveHost({ ...host, authType: host.authType, password: 'secret' }),
+    ).rejects.toMatchObject({ code: 'HostTrustCleanupFailed' });
+    expect(useHostStore.getState().loading).toBe(false);
+    expect(useHostStore.getState().error).toBeTruthy();
   });
 
   it('主机搜索跨名称、地址与分组名过滤且不区分大小写', () => {
@@ -188,18 +202,67 @@ describe('Zustand stores', () => {
     await expect(useSessionStore.getState().openSession('host-1')).resolves.toMatchObject({ sessionId: 'session-1' });
   });
 
-  it('会话状态和进度事件更新公开状态', async () => {
-    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? makeSession() : makeTaskInfo());
+  it('连接阶段与失败错误按 sessionId 更新且互不覆盖', async () => {
+    let openCount = 0;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') {
+        openCount += 1;
+        return makeSession({ sessionId: `session-${openCount}` });
+      }
+      return makeTaskInfo();
+    });
     await useSessionStore.getState().openSession('host-1');
+    await useSessionStore.getState().openSession('host-1');
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({ phase: null, error: null });
     const cleanup = await useSessionStore.getState().initListeners();
+
     emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.SshHandshake, timestamp: Date.now() });
-    expect(useSessionStore.getState().statusMessage).toContain('SSH 握手');
-    emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.AuthFailed, error: null });
-    expect(useSessionStore.getState().statusMessage).toContain('认证失败');
+    emitMockEvent('session:progress', { sessionId: 'session-2', phase: ConnectionPhase.Authenticating, timestamp: Date.now() });
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({ phase: ConnectionPhase.SshHandshake, error: null });
+    expect(useSessionStore.getState().connections.get('session-2')).toEqual({ phase: ConnectionPhase.Authenticating, error: null });
+
+    emitMockEvent('session:status', { sessionId: 'session-2', status: SessionStatus.AuthFailed, error: null });
+    expect(useSessionStore.getState().connections.get('session-2')).toEqual({ phase: null, error: null });
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({ phase: ConnectionPhase.SshHandshake, error: null });
+
+    emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, error: null });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().sessions.get('session-2')?.status).toBe(SessionStatus.AuthFailed);
     cleanup();
   });
 
-  it('会话状态只消费后端事实并在连接成功时初始化文件传输', async () => {
+  it('连接失败保留结构化错误供所属标签渲染', async () => {
+    useSessionStore.setState({ sessions: new Map([['session-1', makeSession()]]) });
+    useSessionStore.getState().applySessionStatus({
+      sessionId: 'session-1', status: SessionStatus.Error, error: { code: 'SshConnectionError', detail: 'connection refused' },
+    });
+    expect(useSessionStore.getState().connections.get('session-1')).toEqual({
+      phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' },
+    });
+  });
+
+  it('断开的会话清除连接投影，不再残留不可见状态', () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession({ status: SessionStatus.Connected })]]),
+      connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
+    });
+    useSessionStore.getState().applySessionStatus({ sessionId: 'session-1', status: SessionStatus.Disconnected, error: null });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+  });
+
+  it('连接文案在渲染时生成且随语言切换即时生效', () => {
+    const session = makeSession();
+    const failed = makeSession({ status: SessionStatus.Error });
+    const connecting = { phase: ConnectionPhase.SshHandshake, error: null };
+    const failedConnection = { phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' } };
+    expect(connectionLabel(session, connecting, 'zh-CN')).toContain('SSH 握手');
+    expect(connectionLabel(session, connecting, 'en-US')).toContain('SSH handshake');
+    expect(connectionLabel(session, undefined, 'zh-CN')).toContain('正在连接');
+    expect(connectionLabel(failed, failedConnection, 'zh-CN')).toContain('SSH 连接失败');
+    expect(connectionLabel(failed, failedConnection, 'en-US')).toContain('SSH connection failed');
+  });
+
+  it('打开会话时初始化文件传输且连接成功事件不重复请求目录', async () => {
     mockInvoke.mockImplementation(async (command) => {
       if (command === 'open_session') return makeSession();
       if (command === 'start_monitoring') return makeTaskInfo();
@@ -207,6 +270,7 @@ describe('Zustand stores', () => {
       return undefined;
     });
     await useSessionStore.getState().openSession('host-1');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/' });
     const cleanup = await useSessionStore.getState().initListeners();
     mockInvoke.mockClear();
 
@@ -214,8 +278,30 @@ describe('Zustand stores', () => {
       sessionId: 'session-1', status: SessionStatus.Connected, error: null,
     });
 
-    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/' });
+    expect(mockInvoke).not.toHaveBeenCalledWith('sftp_list_dir', expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith('sync_session_status', expect.anything());
+    cleanup();
+  });
+
+  it('open_session 返回前到达连接成功事件时仍初始化文件传输', async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') {
+        emitMockEvent('session:status', {
+          sessionId: 'session-1', status: SessionStatus.Connected, error: null,
+        });
+        return makeSession();
+      }
+      if (command === 'start_monitoring') return makeTaskInfo();
+      if (command === 'sftp_list_dir') return [makeRemoteEntry()];
+      return undefined;
+    });
+    const cleanup = await useSessionStore.getState().initListeners();
+
+    await useSessionStore.getState().openSession('host-1');
+
+    await vi.waitFor(() => {
+      expect(useSftpStore.getState().getState('session-1')?.entries).toHaveLength(1);
+    });
     cleanup();
   });
 
@@ -230,7 +316,11 @@ describe('Zustand stores', () => {
 
   it('关闭活动会话只调用后端 teardown 并清理前端 projection', async () => {
     const task = makeTaskInfo();
-    useSessionStore.setState({ sessions: new Map([['session-1', makeSession()]]), activeView: 'session-1' });
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      activeView: 'session-1',
+      connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
+    });
     useMonitorStore.setState({
       sessionTaskMap: new Map([['session-1', task.taskId]]),
       tasks: new Map([[task.taskId, task]]),
@@ -242,11 +332,258 @@ describe('Zustand stores', () => {
 
     expect(useSessionStore.getState().activeView).toBeNull();
     expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
     expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
     expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
+  });
+
+  it('主机身份确认事件按 sessionId 投影，接受后调用后端并清除确认卡', async () => {
+    const challenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    mockInvoke.mockResolvedValue(undefined);
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('host-identity:challenge', challenge);
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+    expect(mockInvoke).toHaveBeenCalledWith('accept_host_identity', { challengeId: 'challenge-1' });
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    cleanup();
+  });
+
+  it('拒绝主机身份调用后端拒绝，后端已 teardown 不重复 close_session，并清理会话与 SFTP/监控投影', async () => {
+    const challenge = {
+      challengeId: 'challenge-2', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      activeView: 'session-1',
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    mockInvoke.mockResolvedValue(undefined);
+
+    await useSessionStore.getState().rejectHostIdentity('session-1');
+
+    expect(mockInvoke).toHaveBeenCalledWith('reject_host_identity', { challengeId: 'challenge-2' });
+    // 后端在拒绝命令内完成 teardown，前端不得重复 close_session（性能规则：无冗余 invoke）
+    expect(mockInvoke).not.toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
+    expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
+  });
+
+  it('接受主机身份时 challenge 已不存在（重复操作）仅撤下过期确认卡，不抛错', async () => {
+    const challenge = {
+      challengeId: 'challenge-gone', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-gone' });
+
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(true);
+  });
+
+  it('接受主机身份其他错误保留确认卡，避免掩盖未决决定', async () => {
+    const challenge = {
+      challengeId: 'challenge-err', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockRejectedValue({ code: 'SshProtocolError', detail: 'boom' });
+
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(true);
+  });
+
+  it('拒绝主机身份时 challenge 已不存在仅撤下确认卡，不误杀仍存活的会话投影', async () => {
+    const challenge = {
+      challengeId: 'challenge-gone', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      activeView: 'session-1',
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-gone' });
+
+    await useSessionStore.getState().rejectHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(true);
+    expect(useSessionStore.getState().activeView).toBe('session-1');
+  });
+
+  it('接受并保存成功：调用后端命令并清除确认卡', async () => {
+    const challenge = {
+      challengeId: 'challenge-save', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockResolvedValue(undefined);
+
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+
+    expect(mockInvoke).toHaveBeenCalledWith('accept_and_save_host_identity', { challengeId: 'challenge-save' });
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+  });
+
+  it('接受并保存失败：保持确认卡并记录结构化错误，不自动降级为临时信任', async () => {
+    const challenge = {
+      challengeId: 'challenge-fail', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockRejectedValue({ code: 'HostKeySaveFailed', detail: 'write denied' });
+
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+
+    // 未调用 accept_host_identity：失败绝不静默降级为临时信任
+    expect(mockInvoke).not.toHaveBeenCalledWith('accept_host_identity', expect.anything());
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+    expect(useSessionStore.getState().hostKeySaveErrors.get('session-1')).toEqual({ code: 'HostKeySaveFailed', detail: 'write denied' });
+
+    // 用户改选仅本次接受：清除错误投影并正常解决
+    mockInvoke.mockResolvedValue(undefined);
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+  });
+
+  it('接受并保存时 challenge 已不存在（重复操作）仅撤下过期确认卡', async () => {
+    const challenge = {
+      challengeId: 'challenge-save-gone', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-save-gone' });
+
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+  });
+
+  it('无确认卡时接受并保存为无操作：不发起 invoke 也不写入错误', async () => {
+    useSessionStore.setState({ hostKeyChallenges: new Map() });
+
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+  });
+
+  it('Changed challenge 事件按 sessionId 投影并携带 kind、旧记录与新呈现信息，替换走同一保存契约', async () => {
+    const challenge = {
+      challengeId: 'challenge-changed', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed' as const,
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    mockInvoke.mockResolvedValue(undefined);
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('host-identity:challenge', challenge);
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+    cleanup();
+
+    // 替换记录与接受并保存共用同一后端契约（替换由确认卡二次确认把关）
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+    expect(mockInvoke).toHaveBeenCalledWith('accept_and_save_host_identity', { challengeId: 'challenge-changed' });
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+  });
+
+  it('替换失败（Changed challenge）保持确认卡与结构化错误，可改选仅本次接受或拒绝', async () => {
+    const challenge = {
+      challengeId: 'challenge-replace-fail', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      kind: 'Changed' as const,
+      keyAlgorithm: 'ssh-rsa', fingerprint: 'SHA256:newfp',
+      storedAlgorithm: 'ssh-ed25519', storedFingerprint: 'SHA256:oldfp',
+      timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockRejectedValue({ code: 'HostKeySaveFailed', detail: 'write denied' });
+
+    await useSessionStore.getState().acceptAndSaveHostIdentity('session-1');
+
+    // 替换写入失败：未降级为临时信任，challenge 保持未决
+    expect(mockInvoke).not.toHaveBeenCalledWith('accept_host_identity', expect.anything());
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+    expect(useSessionStore.getState().hostKeySaveErrors.get('session-1')).toEqual({ code: 'HostKeySaveFailed', detail: 'write denied' });
+
+    // 用户明确改选仅本次接受：正常解决并清除错误投影
+    mockInvoke.mockResolvedValue(undefined);
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+  });
+
+  it('会话状态进入 Connected（跨 Session 保存放行）时清理确认卡与保存错误投影', async () => {
+    const challenge = {
+      challengeId: 'challenge-cross', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+      hostKeySaveErrors: new Map([['session-1', { code: 'HostKeySaveFailed', detail: 'write denied' }]]),
+    });
+    const cleanup = await useSessionStore.getState().initListeners();
+
+    emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, error: null });
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+    cleanup();
+  });
+
+  it('非 Connected 状态不隐式清理确认卡：未决 challenge 保持可见可决', async () => {
+    const challenge = {
+      challengeId: 'challenge-keep', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    const cleanup = await useSessionStore.getState().initListeners();
+
+    emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Timeout, error: null });
+
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(challenge);
+    cleanup();
+  });
+
+  it('新 challenge 到达时清除此前的保存错误投影', async () => {
+    const previous = {
+      challengeId: 'challenge-old', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:old', timestamp: 1_710_000_000_000,
+    };
+    const next = { ...previous, challengeId: 'challenge-new', fingerprint: 'SHA256:new' };
+    useSessionStore.setState({
+      hostKeyChallenges: new Map([['session-1', previous]]),
+      hostKeySaveErrors: new Map([['session-1', { code: 'HostKeySaveFailed', detail: 'write denied' }]]),
+    });
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('host-identity:challenge', next);
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(next);
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+    cleanup();
   });
 
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {
@@ -373,11 +710,133 @@ describe('Zustand stores', () => {
     expect(useSftpStore.getState().getState('b')?.entries).toHaveLength(0);
   });
 
+  it('SFTP 同会话乱序目录响应仅最新请求可更新路径、条目、loading 与 error', async () => {
+    let resolveOld!: (entries: RemoteEntry[]) => void;
+    let resolveNew!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveNew = resolve; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 新请求先完成
+    resolveNew([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await newRequest;
+    // 旧请求后完成，不得让投影倒退
+    resolveOld([makeRemoteEntry({ name: 'old.txt', path: '/old/old.txt' })]);
+    await oldRequest;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.currentPath).toBe('/new');
+    expect(state?.entries).toEqual([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    expect(state?.loading).toBe(false);
+    expect(state?.error).toBeNull();
+  });
+
+  it('SFTP 旧目录请求失败不得结束最新请求的 loading 或写入错误', async () => {
+    let rejectOld!: (error: unknown) => void;
+    let resolveNew!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((_, reject) => { rejectOld = reject; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveNew = resolve; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 旧请求失败，最新请求仍挂起
+    rejectOld({ code: 'SftpPermissionDenied', detail: '/old' });
+    await oldRequest;
+
+    const pending = useSftpStore.getState().getState('session-1');
+    expect(pending?.loading).toBe(true);
+    expect(pending?.error).toBeNull();
+
+    resolveNew([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await newRequest;
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.loading).toBe(false);
+    expect(state?.error).toBeNull();
+    expect(state?.currentPath).toBe('/new');
+  });
+
+  it('SFTP 旧目录请求成功不得结束最新请求的 loading 或写入投影', async () => {
+    let resolveOld!: (entries: RemoteEntry[]) => void;
+    let resolveNew!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveNew = resolve; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 旧请求成功，最新请求仍挂起
+    resolveOld([makeRemoteEntry({ name: 'old.txt', path: '/old/old.txt' })]);
+    await oldRequest;
+
+    const pending = useSftpStore.getState().getState('session-1');
+    expect(pending?.loading).toBe(true);
+    expect(pending?.entries).toHaveLength(0);
+    expect(pending?.currentPath).toBe('/');
+
+    resolveNew([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await newRequest;
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.loading).toBe(false);
+    expect(state?.currentPath).toBe('/new');
+    expect(state?.entries.map((entry) => entry.name)).toEqual(['new.txt']);
+  });
+
+  it('SFTP 最新目录请求失败后旧请求成功不得倒退错误与路径', async () => {
+    let resolveOld!: (entries: RemoteEntry[]) => void;
+    let rejectNew!: (error: unknown) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((_, reject) => { rejectNew = reject; }));
+
+    const oldRequest = useSftpStore.getState().listDir('session-1', '/old');
+    const newRequest = useSftpStore.getState().listDir('session-1', '/new');
+    // 最新请求失败：错误按既有契约展示，路径停留在最后成功加载的位置
+    rejectNew({ code: 'SftpPathNotFound', detail: '/new' });
+    await newRequest;
+    // 旧请求成功后不得覆盖最新投影（错误、路径、条目均不得倒退）
+    resolveOld([makeRemoteEntry({ name: 'old.txt', path: '/old/old.txt' })]);
+    await oldRequest;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.currentPath).toBe('/');
+    expect(state?.error).toEqual({ code: 'SftpPathNotFound', detail: '/new' });
+    expect(state?.entries).toHaveLength(0);
+    expect(state?.loading).toBe(false);
+  });
+
+  it('SFTP 不同会话的目录请求序号互不影响', async () => {
+    let resolveAOld!: (entries: RemoteEntry[]) => void;
+    let resolveANew!: (entries: RemoteEntry[]) => void;
+    let resolveB!: (entries: RemoteEntry[]) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveAOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveB = resolve; }))
+      .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveANew = resolve; }));
+
+    const aOld = useSftpStore.getState().listDir('a', '/a-old');
+    const b = useSftpStore.getState().listDir('b', '/b');
+    const aNew = useSftpStore.getState().listDir('a', '/a-new');
+    resolveB([makeRemoteEntry({ name: 'b.txt', path: '/b/b.txt' })]);
+    await b;
+    resolveANew([makeRemoteEntry({ name: 'a-new.txt', path: '/a-new/a-new.txt' })]);
+    await aNew;
+    resolveAOld([makeRemoteEntry({ name: 'a-old.txt', path: '/a-old/a-old.txt' })]);
+    await aOld;
+
+    expect(useSftpStore.getState().getState('a')?.currentPath).toBe('/a-new');
+    expect(useSftpStore.getState().getState('a')?.entries.map((entry) => entry.name)).toEqual(['a-new.txt']);
+    expect(useSftpStore.getState().getState('b')?.currentPath).toBe('/b');
+    expect(useSftpStore.getState().getState('b')?.entries.map((entry) => entry.name)).toEqual(['b.txt']);
+  });
+
   it('SFTP 进度、完成和失败事件更新对应任务', () => {
     const task = makeTransferTask();
     useSftpStore.setState({ sessionStates: new Map([['session-1', {
       currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
-      tasks: new Map([[task.taskId, task]]),
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
     }]]) });
     useSftpStore.getState().applyProgress({ taskId: task.taskId, sessionId: 'session-1', transferredBytes: 20, totalBytes: 100, speedBps: 5 });
     expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.speedBps).toBe(5);
@@ -389,10 +848,208 @@ describe('Zustand stores', () => {
     mockInvoke.mockResolvedValue(undefined);
     useSftpStore.getState().toggleSelect('session-1', '/a');
     expect(useSftpStore.getState().getState('session-1')?.selectedPaths.has('/a')).toBe(true);
-    await useSftpStore.getState().cancelTask('task-1');
+    await useSftpStore.getState().cancelTask('task-1', 'session-1');
     expect(mockInvoke).toHaveBeenCalledWith('sftp_cancel_task', { taskId: 'task-1' });
     useSftpStore.getState().clearSession('session-1');
     expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
+  });
+
+  it('SFTP 下载 invoke 失败时错误写入文件浏览器错误区且不抛出未处理异常', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpPathNotFound', detail: '/var/log/missing' });
+    await expect(
+      useSftpStore.getState().download('session-1', '/var/log/missing', '/tmp/missing'),
+    ).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error).toEqual({
+      code: 'SftpPathNotFound', detail: '/var/log/missing',
+    });
+    expect(useSftpStore.getState().getState('session-1')?.tasks.size).toBe(0);
+  });
+
+  it('SFTP 上传 invoke 失败时错误写入文件浏览器错误区', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpTransferError', detail: '本地文件不存在' });
+    await expect(
+      useSftpStore.getState().upload('session-1', '/tmp/ghost', '/var/log'),
+    ).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error?.code).toBe('SftpTransferError');
+  });
+
+  it('SFTP 下载请求显式携带 Reject 冲突策略（默认）', async () => {
+    mockInvoke.mockResolvedValueOnce(makeTransferTask());
+    await useSftpStore.getState().download('session-1', '/var/log/syslog', '/tmp/syslog');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_download', {
+      sessionId: 'session-1', remotePath: '/var/log/syslog', localPath: '/tmp/syslog',
+      conflictStrategy: 'Reject',
+    });
+  });
+
+  it('SFTP 上传请求显式携带 Reject 冲突策略（默认）', async () => {
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ transferType: 'Upload' }));
+    await useSftpStore.getState().upload('session-1', '/tmp/syslog', '/var/log');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_upload', {
+      sessionId: 'session-1', localPath: '/tmp/syslog', remotePath: '/var/log',
+      conflictStrategy: 'Reject',
+    });
+  });
+
+  it('SFTP 上传冲突确认后以 Overwrite 策略重新发起，并清除原任务行 actionError', async () => {
+    const task = makeTransferTask({ transferType: 'Upload', status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpTargetExists', detail: '/var/log/syslog' }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ transferType: 'Upload', taskId: 'task-overwrite-2' }));
+    await useSftpStore.getState().upload('session-1', task.localPath, uploadTargetDir(task), task.taskId, 'Overwrite');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_upload', {
+      sessionId: 'session-1', localPath: task.localPath, remotePath: uploadTargetDir(task),
+      conflictStrategy: 'Overwrite',
+    });
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.has(task.taskId)).toBe(false);
+    expect(state?.tasks.has('task-overwrite-2')).toBe(true);
+  });
+
+  it('上传任务 Done 且用户仍位于目标目录时自动刷新该目录', async () => {
+    const task = makeTransferTask({ transferType: 'Upload', remotePath: '/var/log/syslog', fileName: 'syslog', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/var/log', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce([makeRemoteEntry()]);
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_list_dir', { sessionId: 'session-1', path: '/var/log' });
+    await Promise.resolve();
+    expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.status).toBe('Done');
+  });
+
+  it('上传任务 Done 但用户已离开目标目录时不刷新，不把用户拉回目标目录', () => {
+    const task = makeTransferTask({ transferType: 'Upload', remotePath: '/var/log/syslog', fileName: 'syslog', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/home/user', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useSftpStore.getState().getState('session-1')?.tasks.get(task.taskId)?.status).toBe('Done');
+  });
+
+  it('下载任务 Done 不触发目录刷新', () => {
+    const task = makeTransferTask({ status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/var/log', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('上传 Done 触发的刷新服从最新目录请求规则：晚到的刷新响应不得覆盖更新的导航', async () => {
+    const task = makeTransferTask({ transferType: 'Upload', remotePath: '/var/log/syslog', fileName: 'syslog', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/var/log', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    let resolveRefresh!: (entries: RemoteEntry[]) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveRefresh = resolve; }));
+    useSftpStore.getState().applyTaskStatus({ taskId: task.taskId, sessionId: 'session-1', status: 'Done', error: null });
+
+    // 刷新在途时用户导航到新目录：最新请求序号更高
+    mockInvoke.mockResolvedValueOnce([makeRemoteEntry({ name: 'new.txt', path: '/new/new.txt' })]);
+    await useSftpStore.getState().listDir('session-1', '/new');
+    // 刷新响应晚到：不得让投影倒退到旧目录
+    resolveRefresh([makeRemoteEntry({ name: 'syslog', path: '/var/log/syslog' })]);
+    await Promise.resolve();
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.currentPath).toBe('/new');
+    expect(state?.entries.map((entry) => entry.path)).toEqual(['/new/new.txt']);
+  });
+
+  it('uploadTargetDir 从完整远端目标路径提取目标目录', () => {
+    expect(uploadTargetDir({ remotePath: '/var/log/syslog', fileName: 'syslog' })).toBe('/var/log');
+    expect(uploadTargetDir({ remotePath: '/syslog', fileName: 'syslog' })).toBe('/');
+    expect(uploadTargetDir({ remotePath: '/a/b/c.txt', fileName: 'c.txt' })).toBe('/a/b');
+  });
+
+  it('SFTP 冲突确认后以 Overwrite 策略重新发起，并清除原任务行 actionError', async () => {
+    const task = makeTransferTask({ status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpTargetExists', detail: '/tmp/syslog' }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ taskId: 'task-overwrite-2' }));
+    await useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId, 'Overwrite');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_download', {
+      sessionId: 'session-1', remotePath: task.remotePath, localPath: task.localPath,
+      conflictStrategy: 'Overwrite',
+    });
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.has(task.taskId)).toBe(false);
+    expect(state?.tasks.has('task-overwrite-2')).toBe(true);
+  });
+
+  it('SFTP 重试 invoke 失败时仅在原任务行记录 actionError，不写入文件浏览器错误区', async () => {
+    const task = makeTransferTask({ status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpPermissionDenied', detail: '/var/log' });
+    await expect(
+      useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId),
+    ).resolves.toBeUndefined();
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.get(task.taskId)).toEqual({
+      code: 'SftpPermissionDenied', detail: '/var/log',
+    });
+    expect(state?.error).toBeNull();
+  });
+
+  it('SFTP 重试 invoke 成功时清除原任务行的 actionError', async () => {
+    const task = makeTransferTask({ status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpPermissionDenied', detail: '/var/log' }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ taskId: 'task-retry-2' }));
+    await useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId);
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.has(task.taskId)).toBe(false);
+    expect(state?.tasks.has('task-retry-2')).toBe(true);
+  });
+
+  it('SFTP 取消 invoke 失败时在对应任务行记录 actionError', async () => {
+    const task = makeTransferTask({ status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpTaskNotFound', detail: task.taskId });
+    await expect(
+      useSftpStore.getState().cancelTask(task.taskId, 'session-1'),
+    ).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.taskActionErrors.get(task.taskId)).toEqual({
+      code: 'SftpTaskNotFound', detail: task.taskId,
+    });
+  });
+
+  it('SFTP 任务到达终态时清除对应任务行的 actionError', () => {
+    const task = makeTransferTask({ status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpTaskNotFound', detail: task.taskId }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    useSftpStore.getState().applyTaskStatus({
+      taskId: task.taskId, sessionId: 'session-1', status: 'Cancelled', error: null,
+    });
+    expect(useSftpStore.getState().getState('session-1')?.taskActionErrors.has(task.taskId)).toBe(false);
   });
 
   it('监控任务事件先于 invoke 返回时补投最新状态，终态不丢失', async () => {
@@ -425,11 +1082,102 @@ describe('Zustand stores', () => {
     expect(useSftpStore.getState().pendingTaskEvents.has('task-sftp-1')).toBe(false);
   });
 
-  it('clearSession 清理同会话的缓存任务事件', () => {
+  it('clearSession 清理同会话的缓存任务事件并拒绝迟到事件落回缓存', () => {
+    useSftpStore.getState().ensureState('session-1');
+    useSftpStore.getState().ensureState('session-2');
     useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Running', error: null });
     useSftpStore.getState().applyTaskStatus({ taskId: 'task-y', sessionId: 'session-2', status: 'Running', error: null });
     useSftpStore.getState().clearSession('session-1');
     expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
     expect(useSftpStore.getState().pendingTaskEvents.has('task-y')).toBe(true);
+    // 关闭后到达的迟到状态事件（后端 cleanup 的 Cancelled）直接丢弃，不再落回缓存
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Cancelled', error: null });
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
+  });
+
+  it('打开会话时从后端权威快照恢复任务投影', async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') return makeSession();
+      if (command === 'start_monitoring') return makeTaskInfo();
+      if (command === 'sftp_list_dir') return [];
+      if (command === 'sftp_task_snapshot') return [makeTransferTask()];
+      return undefined;
+    });
+    await useSessionStore.getState().openSession('host-1');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_task_snapshot', { sessionId: 'session-1' });
+    const task = useSftpStore.getState().getState('session-1')?.tasks.get('task-sftp-1');
+    expect(task).toBeDefined();
+  });
+
+  it('SFTP 任务快照替换旧投影并补投加载期间早到的事件', async () => {
+    let resolveInvoke!: (tasks: TransferTask[]) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<TransferTask[]>((resolve) => { resolveInvoke = resolve; }));
+    const stale = makeTransferTask({ taskId: 'task-stale', status: 'Done' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[stale.taskId, stale]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+
+    const loadPromise = useSftpStore.getState().loadTaskSnapshot('session-1');
+    // invoke 返回前到达的早到事件：任务未知，先进入缓存
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-sftp-1', sessionId: 'session-1', status: 'Done', error: null });
+    resolveInvoke([makeTransferTask()]);
+    await loadPromise;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.tasks.has('task-stale')).toBe(false);
+    const task = state?.tasks.get('task-sftp-1');
+    expect(task?.status).toBe('Done');
+    expect(task?.transferredBytes).toBe(makeTransferTask().totalBytes);
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-sftp-1')).toBe(false);
+  });
+
+  it('SFTP 快照返回时保留请求开始后入队的新任务', async () => {
+    let resolveSnapshot!: (tasks: TransferTask[]) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<TransferTask[]>((resolve) => { resolveSnapshot = resolve; }));
+    const fresh = makeTransferTask({ taskId: 'task-fresh', createdAt: Date.now() });
+    mockInvoke.mockResolvedValueOnce(fresh); // sftp_download enqueue 响应
+    const loadPromise = useSftpStore.getState().loadTaskSnapshot('session-1');
+    await useSftpStore.getState().download('session-1', '/var/log/syslog', '/tmp/syslog');
+    resolveSnapshot([]); // 后端快照采集早于 enqueue：不包含新任务
+    await loadPromise;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.tasks.get('task-fresh')?.status).toBe('Pending');
+    expect(state?.tasks.size).toBe(1);
+  });
+
+  it('SFTP 任务快照 invoke 失败时写入文件浏览器错误区', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpChannelError', detail: 'session 已关闭' });
+    await expect(useSftpStore.getState().loadTaskSnapshot('session-1')).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error).toEqual({
+      code: 'SftpChannelError', detail: 'session 已关闭',
+    });
+  });
+
+  it('SFTP 清除终态任务仅移除终态、保留活动任务并清理对应 actionError', async () => {
+    const done = makeTransferTask({ taskId: 'task-done', status: 'Done' });
+    const failed = makeTransferTask({ taskId: 'task-failed', status: 'Failed' });
+    const running = makeTransferTask({ taskId: 'task-running', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[done.taskId, done], [failed.taskId, failed], [running.taskId, running]]),
+      taskActionErrors: new Map([[done.taskId, { code: 'SftpTaskNotFound', detail: done.taskId }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValue(undefined);
+    await useSftpStore.getState().clearTerminalTasks('session-1');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_clear_terminal_tasks', { sessionId: 'session-1' });
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.tasks.has('task-running')).toBe(true);
+    expect(state?.tasks.has('task-done')).toBe(false);
+    expect(state?.tasks.has('task-failed')).toBe(false);
+    expect(state?.taskActionErrors.has('task-done')).toBe(false);
+  });
+
+  it('SFTP 清除终态任务 invoke 失败时写入文件浏览器错误区', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpChannelError', detail: 'registry locked' });
+    await expect(useSftpStore.getState().clearTerminalTasks('session-1')).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error?.code).toBe('SftpChannelError');
   });
 });

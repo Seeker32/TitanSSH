@@ -1,4 +1,5 @@
 pub mod host;
+pub mod host_identity;
 pub mod monitor;
 pub mod session;
 pub mod sftp;
@@ -30,11 +31,11 @@ mod tests {
             serde_json::to_value(MonitorSnapshot {
                 session_id: "session-1".into(),
                 timestamp: 1,
-                cpu_usage: 1.0,
-                memory_usage: 2.0,
-                disk_usage: 3.0,
-                disk_available_bytes: 4,
-                disk_total_bytes: 5,
+                cpu_usage: Some(1.0),
+                memory_usage: Some(2.0),
+                disk_usage: Some(3.0),
+                disk_available_bytes: Some(4),
+                disk_total_bytes: Some(5),
                 network: NetworkSnapshot {
                     available: true,
                     interfaces: vec![NetworkInterface {
@@ -94,11 +95,11 @@ mod tests {
         let monitor = serde_json::to_value(MonitorSnapshot {
             session_id: "session-1".into(),
             timestamp: 1,
-            cpu_usage: 1.0,
-            memory_usage: 2.0,
-            disk_usage: 3.0,
-            disk_available_bytes: 4,
-            disk_total_bytes: 5,
+            cpu_usage: Some(1.0),
+            memory_usage: Some(2.0),
+            disk_usage: Some(3.0),
+            disk_available_bytes: Some(4),
+            disk_total_bytes: Some(5),
             network: NetworkSnapshot {
                 available: true,
                 interfaces: vec![NetworkInterface {

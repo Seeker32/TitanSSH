@@ -11,22 +11,26 @@ export { terminalThemes, TERMINAL_THEME_NAMES } from './terminalThemes';
 interface Props {
   sessionId: string;
   active: boolean;
+  /** 仅 Connected 后允许用户输入；连接完成前 xterm 不接受键盘输入。必填以强制调用方显式决定。 */
+  interactive: boolean;
   onInput: (event: { sessionId: string; data: string }) => void;
   onResize: (event: { sessionId: string; cols: number; rows: number }) => void;
 }
 
 /** 挂载 xterm，并将输入、尺寸和后端数据流连接到指定会话。 */
-export default function XtermView({ sessionId, active, onInput, onResize }: Props) {
+export default function XtermView({ sessionId, active, interactive, onInput, onResize }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const viewportRef = useRef<HTMLElement | null>(null);
   const activeRef = useRef(active);
+  const interactiveRef = useRef(interactive);
   const inputRef = useRef(onInput);
   const resizeRef = useRef(onResize);
   const terminalTheme = useTerminalThemeStore((state) => state.terminalTheme);
   activeRef.current = active;
+  interactiveRef.current = interactive;
   inputRef.current = onInput;
   resizeRef.current = onResize;
 
@@ -78,7 +82,11 @@ export default function XtermView({ sessionId, active, onInput, onResize }: Prop
     const screen = container.querySelector('.xterm-screen');
     const mutationObserver = new MutationObserver(updateThumb);
     if (screen) mutationObserver.observe(screen, { childList: true, subtree: true, attributes: true });
-    const inputDisposable = terminal.onData((data) => inputRef.current({ sessionId, data }));
+    const inputDisposable = terminal.onData((data) => {
+      // Connected 前不接收用户输入，防止连接未完成时向 PTY 写入指令
+      if (!interactiveRef.current) return;
+      inputRef.current({ sessionId, data });
+    });
     const resizeObserver = new ResizeObserver(() => { fit(); updateThumb(); });
     resizeObserver.observe(container);
     let disposed = false;
@@ -142,6 +150,7 @@ export default function XtermView({ sessionId, active, onInput, onResize }: Prop
   }
 
   return <div ref={containerRef} className="terminal-view" hidden={!active}
+    data-interactive={interactive}
     style={{ background: terminalThemes[terminalTheme].background }}>
     <div className="custom-scrollbar"><div ref={thumbRef} className="custom-scrollbar__thumb" onMouseDown={startThumbDrag} /></div>
   </div>;

@@ -1,3 +1,4 @@
+use crate::core::host_identity::HostKeyVerifier;
 use crate::core::ssh_transport;
 use crate::core::ssh_transport::ExecTransport;
 use crate::errors::app_error::AppError;
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 /// 采集脚本：通过 SSH 执行并返回服务器关键指标
 const STATUS_SCRIPT: &str = r#"MEMINFO_LINE=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {available=$2} END {printf "MEM_TOTAL_KB=%s\nMEM_AVAILABLE_KB=%s\n", total, available}' /proc/meminfo 2>/dev/null)
-CPU_LINE=$(awk '/^cpu / {printf "CPU_TOTAL=%s\nCPU_IDLE=%s\n", ($2+$3+$4+$5+$6+$7+$8+$9+$10), ($5+$6)}' /proc/stat 2>/dev/null)
+CPU_LINE=$(awk '/^cpu / {printf "CPU_TOTAL=%s\nCPU_IDLE=%s\n", ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6)}' /proc/stat 2>/dev/null)
 DISK_LINE=$(df -B1 / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); printf "DISK=%s\nDISK_AVAIL=%s\nDISK_TOTAL=%s\n", $5, $4, $2}')
 NETWORK_STATUS=unavailable
 if [ -r /proc/net/dev ]; then
@@ -58,33 +59,47 @@ impl NetworkSample {
     }
 }
 
+/// 监控循环的输入参数（不含回调），集中传递避免过长参数列表。
+pub struct MonitorLoopParams {
+    /// 主机配置（不含明文凭据）
+    pub host: HostConfig,
+    /// 运行时密码（Password 认证时必须提供）
+    pub password: Option<String>,
+    /// 运行时私钥口令（PrivateKey 认证时可选）
+    pub passphrase: Option<String>,
+    /// 关联的会话 ID
+    pub session_id: String,
+    /// 关闭标志，true 时退出循环
+    pub shutdown: Arc<AtomicBool>,
+}
+
 /// 监控采集主循环（可注入 connect_fn，便于单元测试）
 ///
 /// 在调用方线程内运行，持有独立 SSH 长连接，每 2 秒采集一次快照。
 /// 连接失败或采集出错时调用 on_error 后退出，不自动重连。
-/// shutdown=true 时正常退出，不调用 on_error。
+/// params.shutdown 为 true 时正常退出，不调用 on_error。
 ///
 /// # 参数
 /// - `connect_fn`: SSH 连接函数，可注入 mock 供测试使用
-/// - `host`: 主机配置（不含明文凭据）
-/// - `password`: 运行时密码（Password 认证时必须提供）
-/// - `passphrase`: 运行时私钥口令（PrivateKey 认证时可选）
-/// - `session_id`: 关联的会话 ID
-/// - `shutdown`: 关闭标志，true 时退出循环
+/// - `params`: 循环输入参数（主机配置、运行时凭据、会话 ID、关闭标志）
 /// - `on_snapshot`: 采集成功回调
 /// - `on_error`: 采集失败回调，调用后循环退出
 pub fn run_monitor_loop_with<ConnFn>(
     connect_fn: ConnFn,
-    host: HostConfig,
-    password: Option<String>,
-    passphrase: Option<String>,
-    session_id: String,
-    shutdown: Arc<AtomicBool>,
+    params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) where
     ConnFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<ExecTransport, AppError>,
 {
+    let MonitorLoopParams {
+        host,
+        password,
+        passphrase,
+        session_id,
+        shutdown,
+    } = params;
+
     // 保存上一轮 CPU 原始计数，用于根据 /proc/stat 增量计算使用率
     let mut previous_cpu_sample = None;
     // 保存上一轮网卡累计计数，用于根据真实采样间隔计算速率。
@@ -133,25 +148,21 @@ pub fn run_monitor_loop_with<ConnFn>(
     }
 }
 
-/// 监控采集主循环（使用真实 ssh_client::connect）
+/// 监控采集主循环（使用真实 ssh transport）
 ///
 /// 是 run_monitor_loop_with 的薄包装，生产代码使用此函数。
+/// 监控连接与其他 capability 一样经过主机身份统一校验：握手后、认证前生效。
 pub fn run_monitor_loop(
-    host: HostConfig,
-    password: Option<String>,
-    passphrase: Option<String>,
-    session_id: String,
-    shutdown: Arc<AtomicBool>,
+    verifier: HostKeyVerifier,
+    params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) {
     run_monitor_loop_with(
-        ssh_transport::connect_exec,
-        host,
-        password,
-        passphrase,
-        session_id,
-        shutdown,
+        move |host, password, passphrase| {
+            ssh_transport::connect_exec(host, password, passphrase, &verifier)
+        },
+        params,
         on_snapshot,
         on_error,
     )
@@ -189,11 +200,11 @@ fn parse_snapshot_at(
     previous_network_sample: Option<NetworkSample>,
     timestamp: i64,
 ) -> Result<(MonitorSnapshot, Option<CpuSample>, Option<NetworkSample>), AppError> {
-    let mut memory_total_kb = 0.0_f64;
-    let mut memory_available_kb = 0.0_f64;
-    let mut disk_usage = 0.0_f64;
-    let mut disk_available_bytes = 0_u64;
-    let mut disk_total_bytes = 0_u64;
+    let mut memory_total_kb: Option<f64> = None;
+    let mut memory_available_kb: Option<f64> = None;
+    let mut disk_usage: Option<f64> = None;
+    let mut disk_available_bytes: Option<u64> = None;
+    let mut disk_total_bytes: Option<u64> = None;
     let mut cpu_total = None;
     let mut cpu_idle = None;
     let mut network_available = false;
@@ -206,15 +217,15 @@ fn parse_snapshot_at(
         } else if let Some(v) = line.strip_prefix("CPU_IDLE=") {
             cpu_idle = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("MEM_TOTAL_KB=") {
-            memory_total_kb = v.trim().parse().unwrap_or_default();
+            memory_total_kb = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("MEM_AVAILABLE_KB=") {
-            memory_available_kb = v.trim().parse().unwrap_or_default();
+            memory_available_kb = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("DISK=") {
-            disk_usage = v.trim().parse().unwrap_or_default();
+            disk_usage = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("DISK_AVAIL=") {
-            disk_available_bytes = v.trim().parse().unwrap_or_default();
+            disk_available_bytes = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("DISK_TOTAL=") {
-            disk_total_bytes = v.trim().parse().unwrap_or_default();
+            disk_total_bytes = v.trim().parse().ok();
         } else if line == "NETWORK_STATUS=available" {
             network_available = true;
         } else if let Some(v) = line.strip_prefix("NET=") {
@@ -231,7 +242,7 @@ fn parse_snapshot_at(
     let current_cpu_sample = cpu_total.zip(cpu_idle);
     let cpu_usage = compute_cpu_usage(previous_cpu_sample, current_cpu_sample);
     let memory_usage = resolve_memory_usage(memory_total_kb, memory_available_kb);
-    let current_network_sample = network_available.then(|| NetworkSample {
+    let current_network_sample = network_available.then_some(NetworkSample {
         timestamp,
         interfaces: network_interfaces,
     });
@@ -337,42 +348,44 @@ fn rate_between(
 
 /// 根据 /proc/stat 连续两次原始计数，计算 CPU 使用率百分比。
 ///
-/// 首轮无基线样本、计数未增长或字段缺失时统一返回 0.0。
-fn compute_cpu_usage(previous_sample: Option<CpuSample>, current_sample: Option<CpuSample>) -> f64 {
-    let (previous_total, previous_idle) = match previous_sample {
-        Some(sample) => sample,
-        None => return 0.0,
-    };
-    let (current_total, current_idle) = match current_sample {
-        Some(sample) => sample,
-        None => return 0.0,
-    };
+/// 首轮无基线样本或字段缺失时返回 None（未知，与网络首轮 null 语义一致）；
+/// 计数未增长视为真实空闲，返回 Some(0.0)。
+fn compute_cpu_usage(
+    previous_sample: Option<CpuSample>,
+    current_sample: Option<CpuSample>,
+) -> Option<f64> {
+    let (previous_total, previous_idle) = previous_sample?;
+    let (current_total, current_idle) = current_sample?;
 
     let total_delta = current_total.saturating_sub(previous_total);
     let idle_delta = current_idle.saturating_sub(previous_idle);
     if total_delta == 0 {
-        return 0.0;
+        return Some(0.0);
     }
 
     let busy_ratio = ((total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64) * 100.0;
-    (busy_ratio * 10.0).round() / 10.0
+    Some((busy_ratio * 10.0).round() / 10.0)
 }
 
 /// 根据 /proc/meminfo 的原始字段，计算最终内存使用率。
 ///
-/// MemTotal 缺失或非法时回退为 0.0；MemAvailable 超出总量时按 0 已用处理。
-fn resolve_memory_usage(total_kb: f64, available_kb: f64) -> f64 {
-    if total_kb <= 0.0 {
-        return 0.0;
+/// MemTotal 或 MemAvailable 任一缺失/非法时返回 None（未知），
+/// 避免把"未知"误报为 100%（旧内核无 MemAvailable）或 0%。
+/// MemAvailable 超出总量时按 0 已用处理。
+fn resolve_memory_usage(total_kb: Option<f64>, available_kb: Option<f64>) -> Option<f64> {
+    let total = total_kb?;
+    if total <= 0.0 {
+        return None;
     }
+    let available = available_kb?;
 
-    let used_ratio = ((total_kb - available_kb).max(0.0) / total_kb) * 100.0;
-    (used_ratio * 10.0).round() / 10.0
+    let used_ratio = ((total - available).max(0.0) / total) * 100.0;
+    Some((used_ratio * 10.0).round() / 10.0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkSample, compute_cpu_usage, parse_snapshot_at};
+    use super::{NetworkSample, STATUS_SCRIPT, compute_cpu_usage, parse_snapshot_at};
 
     /// 验证 parse_snapshot 能正确解析原始脚本输出，并由 Rust 计算内存与磁盘指标
     #[test]
@@ -381,26 +394,47 @@ mod tests {
         let (snap, cpu_sample, _) =
             parse_snapshot_at("session-1", raw, None, None, 2_000).expect("应能正常解析");
         assert_eq!(snap.session_id, "session-1");
-        assert_eq!(snap.cpu_usage, 0.0);
-        assert!((snap.memory_usage - 42.3).abs() < 0.01);
-        assert!((snap.disk_usage - 65.0).abs() < f64::EPSILON);
-        assert_eq!(snap.disk_available_bytes, 137_438_953_472);
-        assert_eq!(snap.disk_total_bytes, 549_755_813_888);
+        assert_eq!(snap.cpu_usage, None);
+        assert!((snap.memory_usage.unwrap() - 42.3).abs() < 0.01);
+        assert!((snap.disk_usage.unwrap() - 65.0).abs() < f64::EPSILON);
+        assert_eq!(snap.disk_available_bytes, Some(137_438_953_472));
+        assert_eq!(snap.disk_total_bytes, Some(549_755_813_888));
         assert_eq!(snap.timestamp, 2_000);
         assert_eq!(cpu_sample, None);
     }
 
-    /// 验证 parse_snapshot 在脚本输出为空时不报错，各指标默认为 0.0
+    /// 验证 parse_snapshot 在脚本输出为空时不报错，各指标为未知（None）
     #[test]
     fn parse_snapshot_defaults_on_missing_fields() {
         let (snap, cpu_sample, _) =
             parse_snapshot_at("session-2", "", None, None, 2_000).expect("空输出不应返回错误");
-        assert_eq!(snap.cpu_usage, 0.0);
-        assert_eq!(snap.memory_usage, 0.0);
-        assert_eq!(snap.disk_usage, 0.0);
-        assert_eq!(snap.disk_available_bytes, 0);
-        assert_eq!(snap.disk_total_bytes, 0);
+        assert_eq!(snap.cpu_usage, None);
+        assert_eq!(snap.memory_usage, None);
+        assert_eq!(snap.disk_usage, None);
+        assert_eq!(snap.disk_available_bytes, None);
+        assert_eq!(snap.disk_total_bytes, None);
         assert_eq!(cpu_sample, None);
+    }
+
+    /// 验证 MemAvailable 缺失（旧内核）时内存使用率为未知而非误报 100%。
+    #[test]
+    fn parse_snapshot_reports_unknown_memory_when_available_is_missing() {
+        let raw = "MEM_TOTAL_KB=1000\nDISK=65";
+        let (snap, _, _) =
+            parse_snapshot_at("session-3", raw, None, None, 2_000).expect("应能解析快照");
+        assert_eq!(
+            snap.memory_usage, None,
+            "MemAvailable 缺失时应为未知，不得误报为 100% 已用"
+        );
+    }
+
+    /// 验证 MemTotal 缺失时内存使用率同样为未知，失败模式与 available 缺失一致。
+    #[test]
+    fn parse_snapshot_reports_unknown_memory_when_total_is_missing() {
+        let raw = "MEM_AVAILABLE_KB=250\nDISK=65";
+        let (snap, _, _) =
+            parse_snapshot_at("session-3", raw, None, None, 2_000).expect("应能解析快照");
+        assert_eq!(snap.memory_usage, None);
     }
 
     /// 验证 parse_snapshot 在仅收到内存总量/可用量时，仍能推导出内存使用率
@@ -409,7 +443,7 @@ mod tests {
         let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=250\nDISK=65";
         let (snap, _, _) = parse_snapshot_at("session-3", raw, None, None, 2_000)
             .expect("应能从 meminfo 字段推导内存占用");
-        assert!((snap.memory_usage - 75.0).abs() < 0.01);
+        assert!((snap.memory_usage.unwrap() - 75.0).abs() < 0.01);
     }
 
     /// 验证 parse_snapshot 在有上一轮 CPU 原始计数时能计算本轮 CPU 使用率
@@ -419,7 +453,7 @@ mod tests {
         let (snap, cpu_sample, _) =
             parse_snapshot_at("session-4", raw, Some((100, 20)), None, 2_000)
                 .expect("应能根据 /proc/stat 计数推导 CPU 占用");
-        assert!((snap.cpu_usage - 83.3).abs() < 0.01);
+        assert!((snap.cpu_usage.unwrap() - 83.3).abs() < 0.01);
         assert_eq!(cpu_sample, Some((160, 30)));
     }
 
@@ -427,15 +461,37 @@ mod tests {
     #[test]
     fn compute_cpu_usage_uses_proc_stat_delta() {
         let usage = compute_cpu_usage(Some((100, 20)), Some((160, 30)));
-        assert!((usage - 83.3).abs() < 0.01);
+        assert!((usage.unwrap() - 83.3).abs() < 0.01);
     }
 
-    /// 验证首轮采样或无效增量时 CPU 使用率回退为 0.0
+    /// 验证首轮采样或无效增量时 CPU 使用率为未知（与网络首轮 null 语义一致）
     #[test]
     fn compute_cpu_usage_defaults_on_missing_or_invalid_delta() {
-        assert_eq!(compute_cpu_usage(None, Some((160, 30))), 0.0);
-        assert_eq!(compute_cpu_usage(Some((200, 50)), Some((200, 60))), 0.0);
-        assert_eq!(compute_cpu_usage(Some((200, 50)), None), 0.0);
+        assert_eq!(compute_cpu_usage(None, Some((160, 30))), None);
+        assert_eq!(
+            compute_cpu_usage(Some((200, 50)), Some((200, 60))),
+            Some(0.0)
+        );
+        assert_eq!(compute_cpu_usage(Some((200, 50)), None), None);
+    }
+
+    /// 验证采集脚本的 CPU 累计不包含 guest 字段：
+    /// guest 已计入 user（$2），再加 $10 会造成双重计数（KVM 场景低估使用率）。
+    #[test]
+    fn status_script_cpu_total_excludes_guest_time() {
+        let cpu_line = STATUS_SCRIPT
+            .lines()
+            .find(|line| line.contains("CPU_TOTAL="))
+            .expect("脚本应包含 CPU_TOTAL 采集行");
+        assert!(
+            cpu_line.contains("($2+$3+$4+$5+$6+$7+$8+$9)"),
+            "CPU 累计应只含 $2..$9（guest 已计入 user），实际: {cpu_line}"
+        );
+        assert!(!cpu_line.contains("$10"), "CPU 累计不得包含 guest($10)");
+        assert!(
+            !cpu_line.contains("$11"),
+            "CPU 累计不得包含 guest_nice($11)"
+        );
     }
 
     /// 验证网络接口保留远端顺序、跳过 lo，并按真实采样间隔计算双向速率。
@@ -536,9 +592,9 @@ mod tests {
         assert!(!snapshot.network.available);
         assert!(snapshot.network.interfaces.is_empty());
         assert_eq!(network_sample, None);
-        assert!((snapshot.cpu_usage - 83.3).abs() < 0.01);
-        assert!((snapshot.memory_usage - 50.0).abs() < 0.01);
-        assert_eq!(snapshot.disk_usage, 65.0);
+        assert!((snapshot.cpu_usage.unwrap() - 83.3).abs() < 0.01);
+        assert!((snapshot.memory_usage.unwrap() - 50.0).abs() < 0.01);
+        assert_eq!(snapshot.disk_usage, Some(65.0));
     }
 
     /// 验证畸形网卡记录只让网络区域不可用，其他指标仍正常返回。
@@ -552,9 +608,9 @@ mod tests {
         assert!(!snapshot.network.available);
         assert!(snapshot.network.interfaces.is_empty());
         assert_eq!(network_sample, None);
-        assert!((snapshot.cpu_usage - 83.3).abs() < 0.01);
-        assert!((snapshot.memory_usage - 50.0).abs() < 0.01);
-        assert_eq!(snapshot.disk_usage, 65.0);
+        assert!((snapshot.cpu_usage.unwrap() - 83.3).abs() < 0.01);
+        assert!((snapshot.memory_usage.unwrap() - 50.0).abs() < 0.01);
+        assert_eq!(snapshot.disk_usage, Some(65.0));
     }
 
     /// 验证网络采集成功但只有 lo 时仍返回可用的空候选列表。
@@ -597,6 +653,63 @@ mod loop_tests {
         }
     }
 
+    /// 构造测试用监控循环参数
+    fn make_params(shutdown: Arc<AtomicBool>) -> MonitorLoopParams {
+        MonitorLoopParams {
+            host: make_host(),
+            password: Some("pw".to_string()),
+            passphrase: None,
+            session_id: "session-1".to_string(),
+            shutdown,
+        }
+    }
+
+    /// 监控连接与其他 capability 一样先经过主机身份统一校验：
+    /// 校验被拒绝时监控连接失败（on_error 携带 HostKeyRejected），不进入采集。
+    #[test]
+    fn rejected_host_identity_fails_monitor_before_collection() {
+        use crate::core::host_identity::PresentedHostKey;
+        use std::sync::atomic::Ordering;
+
+        let snapshots: Arc<Mutex<Vec<MonitorSnapshot>>> = Arc::new(Mutex::new(vec![]));
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let snap_ref = Arc::clone(&snapshots);
+        let err_ref = Arc::clone(&errors);
+
+        // 模拟生产 transport 顺序：握手后、认证前调用统一校验器
+        let verifier: HostKeyVerifier = Arc::new(|_presented: &PresentedHostKey| {
+            Err(AppError::HostKeyRejected("10.0.0.8:22".to_string()))
+        });
+        let connect_fn = move |_host: &HostConfig,
+                               _pw: Option<&str>,
+                               _pp: Option<&str>|
+              -> Result<ExecTransport, AppError> {
+            verifier(&PresentedHostKey {
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:monitor".to_string(),
+                blob: b"blob".to_vec(),
+            })?;
+            unreachable!("主机身份被拒绝时不得建立监控连接");
+        };
+
+        run_monitor_loop_with(
+            connect_fn,
+            make_params(shutdown),
+            move |snapshot| snap_ref.lock().unwrap().push(snapshot),
+            move |error| err_ref.lock().unwrap().push(error.to_string()),
+        );
+
+        assert_eq!(snapshots.lock().unwrap().len(), 0);
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("主机身份"), "错误应携带主机身份语义");
+        let _ = Ordering::Relaxed;
+    }
+
     /// 连接失败时 on_error 被调用，on_snapshot 不被调用
     #[test]
     fn connect_failure_calls_on_error_not_on_snapshot() {
@@ -615,11 +728,7 @@ mod loop_tests {
 
         run_monitor_loop_with(
             connect_fn,
-            make_host(),
-            Some("pw".to_string()),
-            None,
-            "session-1".to_string(),
-            shutdown,
+            make_params(shutdown),
             move |snap| {
                 snap_ref.lock().unwrap().push(snap);
             },
@@ -654,11 +763,7 @@ mod loop_tests {
 
         run_monitor_loop_with(
             connect_fn,
-            make_host(),
-            None,
-            None,
-            "session-1".to_string(),
-            shutdown,
+            make_params(shutdown),
             |_| {},
             move |err| {
                 err_ref.lock().unwrap().push(err.to_string());
@@ -687,11 +792,7 @@ mod loop_tests {
                     shutdown_for_transport,
                 ))
             },
-            make_host(),
-            Some("pw".to_string()),
-            None,
-            "session-1".to_string(),
-            shutdown,
+            make_params(shutdown),
             move |snapshot| snapshots_for_callback.lock().unwrap().push(snapshot),
             |_| panic!("采集成功时不应调用 on_error"),
         );
@@ -699,6 +800,6 @@ mod loop_tests {
         let snapshots = snapshots.lock().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].session_id, "session-1");
-        assert_eq!(snapshots[0].disk_usage, 25.0);
+        assert_eq!(snapshots[0].disk_usage, Some(25.0));
     }
 }

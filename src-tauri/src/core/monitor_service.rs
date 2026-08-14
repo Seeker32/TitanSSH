@@ -1,3 +1,4 @@
+use crate::core::host_identity::HostKeyVerifier;
 use crate::core::monitor_worker;
 use crate::errors::app_error::AppError;
 use crate::errors::app_error::AppErrorInfo;
@@ -57,6 +58,7 @@ impl MonitorService {
         &self,
         session_id: String,
         host: HostConfig,
+        verifier: HostKeyVerifier,
         app: AppHandle<R>,
     ) -> Result<TaskInfo, AppError> {
         // 凭据读取必须先于任务注册，确保失败时不留下幽灵任务或事件。
@@ -127,11 +129,14 @@ impl MonitorService {
             let session_id_for_snap = session_id.clone();
 
             monitor_worker::run_monitor_loop(
-                host,
-                password,
-                passphrase,
-                session_id,
-                shutdown,
+                verifier,
+                monitor_worker::MonitorLoopParams {
+                    host,
+                    password,
+                    passphrase,
+                    session_id,
+                    shutdown,
+                },
                 move |snapshot| {
                     // 更新快照缓存
                     {
@@ -277,7 +282,14 @@ fn emit_task_status<R: Runtime>(
 #[cfg(test)]
 mod service_tests {
     use super::*;
+    use crate::core::host_identity::HostKeyVerifier;
     use crate::models::host::{AuthType, HostConfig};
+    use std::sync::Arc;
+
+    /// 构建总是放行的主机身份校验器，供监控服务测试使用。
+    fn test_allow_all_verifier() -> HostKeyVerifier {
+        Arc::new(|_presented| Ok(()))
+    }
 
     /// 构造测试用 HostConfig
     fn make_host() -> HostConfig {
@@ -314,7 +326,12 @@ mod service_tests {
             event_counter.fetch_add(1, Ordering::Relaxed);
         });
 
-        let result = service.start_monitoring("session-1".to_string(), host, app.handle().clone());
+        let result = service.start_monitoring(
+            "session-1".to_string(),
+            host,
+            test_allow_all_verifier(),
+            app.handle().clone(),
+        );
 
         assert!(matches!(result, Err(AppError::InvalidHostConfig(_))));
         assert!(service.tasks.lock().unwrap().is_empty());
@@ -328,7 +345,12 @@ mod service_tests {
         let app = mock_app();
         let service = MonitorService::new();
         let task = service
-            .start_monitoring("session-1".to_string(), make_host(), app.handle().clone())
+            .start_monitoring(
+                "session-1".to_string(),
+                make_host(),
+                test_allow_all_verifier(),
+                app.handle().clone(),
+            )
             .unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
         assert!(!task.task_id.is_empty());
@@ -342,7 +364,12 @@ mod service_tests {
         let app = mock_app();
         let service = MonitorService::new();
         let task = service
-            .start_monitoring("session-1".to_string(), make_host(), app.handle().clone())
+            .start_monitoring(
+                "session-1".to_string(),
+                make_host(),
+                test_allow_all_verifier(),
+                app.handle().clone(),
+            )
             .unwrap();
         service.stop_monitoring(&task.task_id);
         // 任务已从 HashMap 移除
@@ -569,11 +596,11 @@ mod service_tests {
                 MonitorSnapshot {
                     session_id: session_id.to_string(),
                     timestamp: 1_710_000_000_000,
-                    cpu_usage: 10.0,
-                    memory_usage: 20.0,
-                    disk_usage: 30.0,
-                    disk_available_bytes: 40,
-                    disk_total_bytes: 50,
+                    cpu_usage: Some(10.0),
+                    memory_usage: Some(20.0),
+                    disk_usage: Some(30.0),
+                    disk_available_bytes: Some(40),
+                    disk_total_bytes: Some(50),
                     network: crate::models::monitor::NetworkSnapshot {
                         available: true,
                         interfaces: vec![],

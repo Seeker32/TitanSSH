@@ -100,7 +100,7 @@ impl HostStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate_legacy_hosts, HostStore};
+    use super::{HostStore, migrate_legacy_hosts};
     use crate::models::host::{AuthType, HostConfig};
     use proptest::prelude::*;
     use std::fs;

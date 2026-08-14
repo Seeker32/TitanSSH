@@ -9,6 +9,7 @@ import SftpPanel from '@/components/sftp/SftpPanel';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
+import TrustedHostsSection from '@/components/settings/TrustedHostsSection';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
@@ -16,11 +17,12 @@ import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useThemeStore } from '@/stores/theme';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
-import { translate } from '@/i18n';
+import { useTrustedHostsStore } from '@/stores/trusted-hosts';
+import { translate, toAppError, type AppErrorInfo } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
-import type { TransferTask } from '@/types/sftp';
+import { uploadTargetDir, type TransferTask } from '@/types/sftp';
 
 /** 协调主机、会话、终端、监控与 SFTP 视图。 */
 export default function HomePage() {
@@ -29,6 +31,9 @@ export default function HomePage() {
   const selectedHostId = useHostStore((state) => state.selectedHostId);
   const sessionsMap = useSessionStore((state) => state.sessions);
   const activeView = useSessionStore((state) => state.activeView);
+  const connections = useSessionStore((state) => state.connections);
+  const hostKeyChallenges = useSessionStore((state) => state.hostKeyChallenges);
+  const hostKeySaveErrors = useSessionStore((state) => state.hostKeySaveErrors);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
   const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
   const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
@@ -42,6 +47,8 @@ export default function HomePage() {
   const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
+  /** 最近一次主机保存失败的结构化错误；在编辑弹窗内展示，保存成功后清空 */
+  const [editorError, setEditorError] = useState<AppErrorInfo | null>(null);
   const resizingRef = useRef(false);
 
   useEffect(() => {
@@ -87,9 +94,15 @@ export default function HomePage() {
     await useSessionStore.getState().openSession(hostId);
   }
 
+  /** 关闭 SSH 会话：标签栏与终端错误覆盖层共用同一入口。 */
+  async function closeSession(sessionId: string) {
+    await useSessionStore.getState().closeSession(sessionId);
+  }
+
   /** 打开新建主机表单。 */
   function createHost() {
     setEditingHost(null);
+    setEditorError(null);
     setEditorOpen(true);
   }
 
@@ -98,14 +111,19 @@ export default function HomePage() {
     const host = hosts.find((item) => item.id === hostId);
     if (!host) return;
     setEditingHost(host);
+    setEditorError(null);
     setEditorOpen(true);
   }
 
-  /** 保存主机并关闭编辑表单。 */
+  /** 保存主机并关闭编辑表单；失败时在弹窗内展示错误，弹窗保持打开。 */
   async function saveHost(request: SaveHostRequest) {
-    await useHostStore.getState().saveHost(request);
-    setEditorOpen(false);
-    setEditingHost(null);
+    try {
+      await useHostStore.getState().saveHost(request);
+      setEditorOpen(false);
+      setEditingHost(null);
+    } catch (error) {
+      setEditorError(toAppError(error));
+    }
   }
 
   /** 删除主机，并清理当前激活主机标识。 */
@@ -125,8 +143,9 @@ export default function HomePage() {
     useLayoutStore.getState().removeCollapsedGroup(name);
   }
 
-  /** 启动侧栏宽度拖动。 */
-  function startSidebarResize() {
+  /** 启动侧栏宽度拖动：阻止默认行为防止拖动过程中文本被选中。 */
+  function startSidebarResize(event: React.PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
     resizingRef.current = true;
     document.body.classList.add('sidebar-resizing');
   }
@@ -145,12 +164,22 @@ export default function HomePage() {
     if (typeof localPath === 'string') await useSftpStore.getState().upload(sessionId, localPath, remotePath);
   }
 
-  /** 根据原任务方向重新发起传输。 */
+  /** 根据原任务方向重新发起传输；失败在原任务行与文件浏览器错误区可见。
+   *  上传的 remotePath 为完整目标路径，重试必须回到其目标目录。 */
   async function retry(task: TransferTask) {
     if (task.transferType === 'Download') {
-      await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath);
+      await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId);
     } else {
-      await useSftpStore.getState().upload(task.sessionId, task.localPath, task.remotePath);
+      await useSftpStore.getState().upload(task.sessionId, task.localPath, uploadTargetDir(task), task.taskId);
+    }
+  }
+
+  /** 对单个冲突文件确认覆盖：以 Overwrite 策略按方向重新发起传输，不扩展到批次或会话。 */
+  async function overwrite(task: TransferTask) {
+    if (task.transferType === 'Download') {
+      await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId, 'Overwrite');
+    } else {
+      await useSftpStore.getState().upload(task.sessionId, task.localPath, uploadTargetDir(task), task.taskId, 'Overwrite');
     }
   }
 
@@ -191,20 +220,27 @@ export default function HomePage() {
     <section className="main-panel">
       {sessions.length > 0 && <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
         onActivate={(view) => useSessionStore.getState().setActiveView(view)}
-        onClose={(sessionId) => useSessionStore.getState().closeSession(sessionId)} /></div>}
+        onClose={closeSession} /></div>}
       <div className="content-area">
-        <TerminalPane sessions={sessions} activeView={activeView}
+        <TerminalPane sessions={sessions} activeView={activeView} connections={connections}
+          challenges={hostKeyChallenges} saveErrors={hostKeySaveErrors}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
-          onCreateHost={createHost} />
+          onCreateHost={createHost}
+          onCloseTab={closeSession}
+          onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
+          onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
+          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />
         {activeView !== null && <SftpPanel sessionId={activeView} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
-          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId)} onRetry={retry} />}
+          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry}
+          onOverwrite={overwrite}
+          onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeView)} />}
       </div>
     </section>
-    <HostEditorDialog open={editorOpen} editingHost={editingHost} groups={useMemo(
+    <HostEditorDialog open={editorOpen} editingHost={editingHost} saveError={editorError} groups={useMemo(
       () => [...new Set(hosts.map((host) => host.group).filter(Boolean))], [hosts])}
       onClose={() => setEditorOpen(false)} onSave={saveHost} />
   </div>;
@@ -213,12 +249,19 @@ export default function HomePage() {
 /** 侧栏底部全局入口：应用主题切换与 SSH 终端主题设置。 */
 function FooterActions({ theme }: { theme: string }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<'general' | 'terminal' | 'logging'>('general');
+  const [settingsSection, setSettingsSection] = useState<'general' | 'terminal' | 'trustedHosts' | 'logging'>('general');
   const terminalTheme = useTerminalThemeStore((state) => state.terminalTheme);
   const logLevel = useLogLevelStore((state) => state.logLevel);
   const locale = useLocaleStore((state) => state.locale);
 
   useEffect(() => { void useLogLevelStore.getState().setLogLevel(logLevel); }, []);
+
+  // 每次打开/切换到“可信主机”区域都重新加载：保存/替换/自动清理后清单反映后端当前记录
+  useEffect(() => {
+    if (settingsOpen && settingsSection === 'trustedHosts') {
+      void useTrustedHostsStore.getState().load();
+    }
+  }, [settingsOpen, settingsSection]);
 
   /** 保存日志等级并立即同步后端日志过滤器。 */
   function setLogLevel(level: LogLevel) {
@@ -235,7 +278,7 @@ function FooterActions({ theme }: { theme: string }) {
       <Modal open={settingsOpen} title={translate(locale, 'settings.title')} footer={null} width={680} onCancel={() => setSettingsOpen(false)}>
         <div className="settings-layout">
           <nav className="settings-nav" aria-label={translate(locale, 'settings.title')}>
-            {(['general', 'terminal', 'logging'] as const).map((section) => <button key={section} type="button" data-testid={`settings-section-${section}`}
+            {(['general', 'terminal', 'trustedHosts', 'logging'] as const).map((section) => <button key={section} type="button" data-testid={`settings-section-${section}`}
               className={settingsSection === section ? 'settings-nav-btn settings-nav-btn--active' : 'settings-nav-btn'}
               aria-current={settingsSection === section ? 'page' : undefined} onClick={() => setSettingsSection(section)}>
               {translate(locale, `settings.${section}` as Parameters<typeof translate>[1])}
@@ -244,22 +287,25 @@ function FooterActions({ theme }: { theme: string }) {
           <section className="settings-content">
             {settingsSection === 'general' && <label className="settings-field">{translate(locale, 'settings.language')} <Select value={locale} onChange={(value) => useLocaleStore.getState().setLocale(value)}
               options={[{ value: 'zh-CN', label: translate(locale, 'locale.zh-CN') }, { value: 'en-US', label: translate(locale, 'locale.en-US') }]} /></label>}
-            {settingsSection === 'terminal' && <div className="terminal-theme-options">
+            {settingsSection === 'terminal' && <>
               <Typography.Text type="secondary">{translate(locale, 'settings.terminalTheme')}</Typography.Text>
-              {TERMINAL_THEME_NAMES.map((name) => {
-                const palette = terminalThemes[name];
-                const selected = name === terminalTheme;
-                return <button key={name} type="button" aria-pressed={selected}
-                  aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
-                  onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
-                  <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
-                    <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
-                  </span>
-                  <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
-                  {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
-                </button>;
-              })}
-            </div>}
+              <div className="terminal-theme-options">
+                {TERMINAL_THEME_NAMES.map((name) => {
+                  const palette = terminalThemes[name];
+                  const selected = name === terminalTheme;
+                  return <button key={name} type="button" aria-pressed={selected}
+                    aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
+                    onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
+                    <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
+                      <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
+                    </span>
+                    <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
+                    {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
+                  </button>;
+                })}
+              </div>
+            </>}
+            {settingsSection === 'trustedHosts' && <TrustedHostsSection onRetry={() => void useTrustedHostsStore.getState().load()} />}
             {settingsSection === 'logging' && <label className="settings-field">{translate(locale, 'settings.logLevel')}
               <select value={logLevel} onChange={(event) => setLogLevel(event.target.value as LogLevel)}>
                 {LOG_LEVELS.map((level) => <option key={level} value={level}>{translate(locale, `settings.logLevel.${level}` as Parameters<typeof translate>[1])}</option>)}
