@@ -10,6 +10,9 @@ export interface RemoteEntry {
 
 export type TransferType = 'Upload' | 'Download';
 
+/** 下载目标已存在时的冲突处理策略；未显式指定时默认 Reject */
+export type DownloadConflictStrategy = 'Reject' | 'Overwrite';
+
 /** SFTP 任务专用状态，Cancelled 区分主动取消与失败 */
 export type SftpTaskStatus = 'Pending' | 'Running' | 'Done' | 'Failed' | 'Cancelled';
 
@@ -25,7 +28,7 @@ export interface TransferTask {
   transferredBytes: number;
   speedBps: number;
   status: SftpTaskStatus;
-  /** 失败原因；Failed 时为结构化错误，Cancelled 时为 null */
+  /** 失败原因；Failed 或取消后临时文件清理失败时为结构化错误，其余为 null */
   error: AppErrorInfo | null;
   /** Unix 毫秒时间戳 */
   createdAt: number;

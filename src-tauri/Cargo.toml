@@ -20,6 +20,9 @@ ssh2 = "0.9"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# 下载安全发布：persist_noclobber（Reject 竞态安全）与 persist（Overwrite 原子替换，
+# Windows 走 MoveFileEx REPLACE_EXISTING）；默认 features 即可
+tempfile = "3.27"
 thiserror = "1.0"
 anyhow = "1.0"
 log = "0.4"

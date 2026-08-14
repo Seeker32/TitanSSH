@@ -155,6 +155,11 @@ export default function HomePage() {
     }
   }
 
+  /** 对单个冲突文件确认覆盖：以 Overwrite 策略重新发起下载，不扩展到批次或会话。 */
+  async function overwrite(task: TransferTask) {
+    await useSftpStore.getState().download(task.sessionId, task.remotePath, task.localPath, task.taskId, 'Overwrite');
+  }
+
   return <div className="page-shell">
     <aside className="sidebar" style={{ width: sidebarWidth }}>
       <div data-testid="sidebar-resizer" className="sidebar-resizer" role="separator" aria-orientation="vertical" onPointerDown={startSidebarResize} />
@@ -203,6 +208,7 @@ export default function HomePage() {
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
           onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry}
+          onOverwrite={overwrite}
           onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeView)} />}
       </div>
     </section>

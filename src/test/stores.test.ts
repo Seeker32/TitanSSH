@@ -560,6 +560,34 @@ describe('Zustand stores', () => {
     expect(useSftpStore.getState().getState('session-1')?.error?.code).toBe('SftpTransferError');
   });
 
+  it('SFTP 下载请求显式携带 Reject 冲突策略（默认）', async () => {
+    mockInvoke.mockResolvedValueOnce(makeTransferTask());
+    await useSftpStore.getState().download('session-1', '/var/log/syslog', '/tmp/syslog');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_download', {
+      sessionId: 'session-1', remotePath: '/var/log/syslog', localPath: '/tmp/syslog',
+      conflictStrategy: 'Reject',
+    });
+  });
+
+  it('SFTP 冲突确认后以 Overwrite 策略重新发起，并清除原任务行 actionError', async () => {
+    const task = makeTransferTask({ status: 'Failed' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[task.taskId, task]]),
+      taskActionErrors: new Map([[task.taskId, { code: 'SftpTargetExists', detail: '/tmp/syslog' }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValueOnce(makeTransferTask({ taskId: 'task-overwrite-2' }));
+    await useSftpStore.getState().download('session-1', task.remotePath, task.localPath, task.taskId, 'Overwrite');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_download', {
+      sessionId: 'session-1', remotePath: task.remotePath, localPath: task.localPath,
+      conflictStrategy: 'Overwrite',
+    });
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.taskActionErrors.has(task.taskId)).toBe(false);
+    expect(state?.tasks.has('task-overwrite-2')).toBe(true);
+  });
+
   it('SFTP 重试 invoke 失败时仅在原任务行记录 actionError，不写入文件浏览器错误区', async () => {
     const task = makeTransferTask({ status: 'Failed' });
     useSftpStore.setState({ sessionStates: new Map([['session-1', {

@@ -81,6 +81,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'sftp.noTasks': 'No transfer tasks',
   'sftp.cancel': 'Cancel',
   'sftp.retry': 'Retry',
+  'sftp.overwriteDownload': 'Overwrite',
   'sftp.pending': 'Pending',
   'sftp.running': 'Transferring',
   'sftp.done': 'Done',
@@ -145,6 +146,9 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.SftpWriteError': 'SFTP write failed',
   'error.SftpCreateError': 'SFTP create failed',
   'error.SftpTaskNotFound': 'SFTP task not found',
+  'error.SftpTargetExists': 'Target file exists and was not overwritten',
+  'error.SftpTargetBusy': 'Target is being downloaded by another task in this session',
+  'error.SftpPublishError': 'Failed to publish download; existing file left untouched',
   'error.MonitorError': 'Monitor error',
   'error.Unknown': 'Unknown error',
 };

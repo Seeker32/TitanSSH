@@ -86,6 +86,18 @@ pub enum AppError {
     /// 取消目标任务不存在（未入队或已从 registry 移除）
     #[error("SFTP 任务不存在: {0}")]
     SftpTaskNotFound(String),
+
+    /// 下载目标已存在且冲突策略为 Reject（前端据此逐文件确认覆盖）
+    #[error("SFTP 目标已存在: {0}")]
+    SftpTargetExists(String),
+
+    /// 同一 Session 已有 Pending/Running 下载占用相同最终目标
+    #[error("SFTP 目标正被占用: {0}")]
+    SftpTargetBusy(String),
+
+    /// 临时文件发布到最终目标失败（原目标文件不受影响）
+    #[error("SFTP 发布失败: {0}")]
+    SftpPublishError(String),
 }
 
 impl AppError {
@@ -110,6 +122,40 @@ impl AppError {
             Self::SftpWriteError(_) => "SftpWriteError",
             Self::SftpCreateError(_) => "SftpCreateError",
             Self::SftpTaskNotFound(_) => "SftpTaskNotFound",
+            Self::SftpTargetExists(_) => "SftpTargetExists",
+            Self::SftpTargetBusy(_) => "SftpTargetBusy",
+            Self::SftpPublishError(_) => "SftpPublishError",
+        }
+    }
+
+    /// 保持错误代码不变，把补充说明追加到 detail 末尾。
+    ///
+    /// 用于复合诊断（如传输失败叠加临时文件清理失败）：
+    /// 主错误代码仍是前端判定的稳定依据，detail 拼上清理失败的具体信息。
+    pub fn with_appended_detail(self, extra: &str) -> AppError {
+        let merged = format!("{}；{}", self, extra);
+        match self {
+            Self::SshConnectionError(_) => Self::SshConnectionError(merged),
+            Self::AuthenticationError(_) => Self::AuthenticationError(merged),
+            Self::SessionNotFound(_) => Self::SessionNotFound(merged),
+            Self::InvalidHostConfig(_) => Self::InvalidHostConfig(merged),
+            Self::StorageError(_) => Self::StorageError(merged),
+            Self::IoError(_) => Self::IoError(std::io::Error::other(merged)),
+            Self::SshProtocolError(_) => Self::SshProtocolError(merged),
+            Self::SecureStoreError(_) => Self::SecureStoreError(merged),
+            Self::CredentialNotFound(_) => Self::CredentialNotFound(merged),
+            Self::SftpChannelError(_) => Self::SftpChannelError(merged),
+            Self::SftpPermissionDenied(_) => Self::SftpPermissionDenied(merged),
+            Self::SftpPathNotFound(_) => Self::SftpPathNotFound(merged),
+            Self::SftpTransferError(_) => Self::SftpTransferError(merged),
+            Self::SftpOpenError(_) => Self::SftpOpenError(merged),
+            Self::SftpReadError(_) => Self::SftpReadError(merged),
+            Self::SftpWriteError(_) => Self::SftpWriteError(merged),
+            Self::SftpCreateError(_) => Self::SftpCreateError(merged),
+            Self::SftpTaskNotFound(_) => Self::SftpTaskNotFound(merged),
+            Self::SftpTargetExists(_) => Self::SftpTargetExists(merged),
+            Self::SftpTargetBusy(_) => Self::SftpTargetBusy(merged),
+            Self::SftpPublishError(_) => Self::SftpPublishError(merged),
         }
     }
 }
@@ -135,7 +181,10 @@ impl From<AppError> for AppErrorInfo {
             | AppError::SftpReadError(detail)
             | AppError::SftpWriteError(detail)
             | AppError::SftpCreateError(detail)
-            | AppError::SftpTaskNotFound(detail) => detail,
+            | AppError::SftpTaskNotFound(detail)
+            | AppError::SftpTargetExists(detail)
+            | AppError::SftpTargetBusy(detail)
+            | AppError::SftpPublishError(detail) => detail,
             AppError::IoError(detail) => detail.to_string(),
         };
         Self {
@@ -177,5 +226,32 @@ mod tests {
             value,
             serde_json::json!({ "code": "AuthenticationError", "detail": "denied" })
         );
+    }
+
+    /// 下载冲突/占用/发布错误使用稳定英文代码，detail 携带目标路径。
+    #[test]
+    fn download_conflict_errors_have_stable_codes() {
+        assert_eq!(
+            AppError::SftpTargetExists("/tmp/a.txt".to_string()).code(),
+            "SftpTargetExists"
+        );
+        assert_eq!(
+            AppError::SftpTargetBusy("/tmp/a.txt".to_string()).code(),
+            "SftpTargetBusy"
+        );
+        assert_eq!(
+            AppError::SftpPublishError("/tmp/a.txt".to_string()).code(),
+            "SftpPublishError"
+        );
+    }
+
+    /// with_appended_detail 保持原错误代码不变，并把补充说明追加到 detail。
+    #[test]
+    fn appended_detail_preserves_code_and_appends_text() {
+        let error = AppError::SftpReadError("remote read reset".to_string())
+            .with_appended_detail("清理临时文件失败: /tmp/.f.part (permission denied)");
+        assert_eq!(error.code(), "SftpReadError");
+        assert!(error.to_string().contains("remote read reset"));
+        assert!(error.to_string().contains("清理临时文件失败: /tmp/.f.part"));
     }
 }

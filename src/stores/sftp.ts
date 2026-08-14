@@ -4,6 +4,7 @@ import { create } from 'zustand';
 import { toAppError, type AppErrorInfo } from '@/i18n';
 import { isTerminalStatus } from '@/types/sftp';
 import type {
+  DownloadConflictStrategy,
   RemoteEntry,
   SftpProgressEvent,
   SftpSessionState,
@@ -22,7 +23,7 @@ interface SftpState {
   ensureState: (sessionId: string) => SftpSessionState;
   listDir: (sessionId: string, path: string) => Promise<void>;
   loadTaskSnapshot: (sessionId: string) => Promise<void>;
-  download: (sessionId: string, remotePath: string, localPath: string, parentTaskId?: string) => Promise<void>;
+  download: (sessionId: string, remotePath: string, localPath: string, parentTaskId?: string, conflictStrategy?: DownloadConflictStrategy) => Promise<void>;
   upload: (sessionId: string, localPath: string, remotePath: string, parentTaskId?: string) => Promise<void>;
   cancelTask: (taskId: string, sessionId: string) => Promise<void>;
   clearTerminalTasks: (sessionId: string) => Promise<void>;
@@ -177,11 +178,15 @@ export const useSftpStore = create<SftpState>((set, get) => ({
   },
 
   /** 发起下载任务并写入对应会话的任务队列；补投 invoke 返回前到达的事件。
-   *  invoke 拒绝（启动失败）不向外抛出：重试场景（parentTaskId）只在原任务行
-   *  标注 actionError，否则写入文件浏览器错误区；成功后清除原任务行的旧操作错误。 */
-  async download(sessionId, remotePath, localPath, parentTaskId) {
+   *  冲突策略默认 Reject；仅当用户对单个冲突文件确认覆盖时才传 Overwrite，
+   *  确认不扩展到批次或 Session。invoke 拒绝（启动失败）不向外抛出：重试场景
+   *  （parentTaskId）只在原任务行标注 actionError，否则写入文件浏览器错误区；
+   *  成功后清除原任务行的旧操作错误。 */
+  async download(sessionId, remotePath, localPath, parentTaskId, conflictStrategy = 'Reject') {
     try {
-      const task = await invoke<TransferTask>('sftp_download', { sessionId, remotePath, localPath });
+      const task = await invoke<TransferTask>('sftp_download', {
+        sessionId, remotePath, localPath, conflictStrategy,
+      });
       updateSession(set, sessionId, (state) => ({
         ...state,
         tasks: new Map(state.tasks).set(task.taskId, task),

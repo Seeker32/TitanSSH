@@ -10,6 +10,8 @@ interface Props {
   actionErrors: Map<string, AppErrorInfo>;
   onCancel: (taskId: string) => void;
   onRetry: (task: TransferTask) => void;
+  /** 对单个冲突文件确认覆盖：仅 Failed + SftpTargetExists 任务行出现入口 */
+  onOverwrite: (task: TransferTask) => void;
   onClearTerminal: () => void;
 }
 
@@ -32,7 +34,7 @@ function taskStatusLabel(status: SftpTaskStatus, locale: ReturnType<typeof useLo
 }
 
 /** 渲染当前会话的传输任务列表（createdAt 最新优先）。 */
-export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry, onClearTerminal }: Props) {
+export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry, onOverwrite, onClearTerminal }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   if (tasks.size === 0) return <div className="empty-msg">{translate(locale, 'sftp.noTasks')}</div>;
   const sorted = [...tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
@@ -56,13 +58,16 @@ export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry, 
           {active && <button data-testid="cancel-btn" className="task-btn" title={translate(locale, 'sftp.cancel')} onClick={() => onCancel(task.taskId)}><X size={12} /></button>}
           {(task.status === 'Failed' || task.status === 'Cancelled')
             && <button data-testid="retry-btn" className="task-btn" title={translate(locale, 'sftp.retry')} onClick={() => onRetry(task)}><RotateCcw size={12} /></button>}
+          {task.status === 'Failed' && task.error?.code === 'SftpTargetExists'
+            && <button data-testid="overwrite-btn" className="task-btn" title={translate(locale, 'sftp.overwriteDownload')}
+              onClick={() => onOverwrite(task)}>{translate(locale, 'sftp.overwriteDownload')}</button>}
         </div>
         <div className="progress-bar" data-testid="progress-bar">
           <div className={`progress-fill ${task.status === 'Done' ? 'progress-fill--done' : ''}`}
             data-testid="progress-fill" style={{ width: `${percent}%` }} />
         </div>
         <div className="task-meta"><span>{formatSpeed(task.speedBps)}</span><span>{percent}%</span></div>
-        {task.status === 'Failed' && task.error && <div className="task-error">{formatAppError(locale, task.error)}</div>}
+        {task.error && <div className="task-error">{formatAppError(locale, task.error)}</div>}
         {actionError && <div data-testid="task-action-error" className="task-error">{formatAppError(locale, actionError)}</div>}
       </div>;
     })}</div>;
