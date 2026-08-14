@@ -1,25 +1,30 @@
+use crate::commands::run_blocking_op;
 use crate::core::sftp_service::SftpService;
 use crate::errors::app_error::AppErrorInfo;
 use crate::models::sftp::{ConflictStrategy, RemoteEntry, TransferTask};
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 /// 列举远程目录内容，按目录优先、名称排序
+///
+/// 异步 command：会等待控制连接就绪（TCP/SSH 握手、host-identity challenge 未决），
+/// 等待发生在阻塞线程池，不得占用 Tauri 主线程（否则前端整体卡死）。
 ///
 /// # 参数
 /// - `session_id`: 关联的 SSH 会话 ID
 /// - `path`: 远程目录绝对路径
 #[tauri::command]
-pub fn sftp_list_dir(
+pub async fn sftp_list_dir<R: Runtime>(
     session_id: String,
     path: String,
-    sftp_service: State<'_, SftpService>,
+    app: AppHandle<R>,
 ) -> Result<Vec<RemoteEntry>, AppErrorInfo> {
-    sftp_service
-        .list_dir(&session_id, &path)
-        .map_err(AppErrorInfo::from)
+    let service = app.state::<SftpService>().inner().clone();
+    run_blocking_op(move || service.list_dir(&session_id, &path)).await
 }
 
 /// 发起文件下载任务，立即返回 status = Pending 的 TransferTask
+///
+/// 异步 command：入队前需在控制连接上查询远端文件大小，等待发生在阻塞线程池。
 ///
 /// # 参数
 /// - `session_id`: 关联的 SSH 会话 ID
@@ -27,23 +32,24 @@ pub fn sftp_list_dir(
 /// - `local_path`: 本地保存路径（父目录必须存在）
 /// - `conflict_strategy`: 目标已存在时的处理策略，缺省 Reject（拒绝覆盖）
 #[tauri::command]
-pub fn sftp_download<R: Runtime>(
+pub async fn sftp_download<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
     remote_path: String,
     local_path: String,
     conflict_strategy: Option<ConflictStrategy>,
-    sftp_service: State<'_, SftpService>,
 ) -> Result<TransferTask, AppErrorInfo> {
-    sftp_service
-        .enqueue_download(
+    let service = app.state::<SftpService>().inner().clone();
+    run_blocking_op(move || {
+        service.enqueue_download(
             session_id,
             remote_path,
             local_path,
             conflict_strategy.unwrap_or_default(),
             app,
         )
-        .map_err(AppErrorInfo::from)
+    })
+    .await
 }
 
 /// 发起文件上传任务，立即返回 status = Pending 的 TransferTask
@@ -112,11 +118,12 @@ pub fn sftp_clear_terminal_tasks(session_id: String, sftp_service: State<'_, Sft
 
 #[cfg(test)]
 mod tests {
-    use super::{sftp_download, sftp_upload};
+    use super::{sftp_download, sftp_list_dir, sftp_upload};
     use crate::core::sftp_service::SftpService;
     use crate::core::ssh_transport::test_support::memory_sftp;
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::sftp::{SftpTaskStatus, TransferTask};
+    use std::sync::mpsc;
     use std::time::Duration;
     use tauri::ipc::{CallbackFn, InvokeBody};
     use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder, mock_context, noop_assets};
@@ -171,6 +178,63 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("任务 {} 未在 2 秒内到达终态", task_id);
+    }
+
+    /// 回归（Linux 双击连接界面卡死）：sftp_list_dir 会等待控制连接就绪
+    /// （TCP 握手 / SSH 握手 / 主机身份 challenge 未决）。invoke 调度（on_message）
+    /// 必须立即返回：真实应用中同步 command 在 Tauri 主线程内联执行命令体，
+    /// 主线程被 Condvar 等待占用时前端所有交互（含 challenge 确认点击）被阻塞，
+    /// 界面整体卡死。
+    #[test]
+    fn sftp_list_dir_dispatch_does_not_block_invoke_caller() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // connector 闭包要求 Sync：Receiver 包裹在 Mutex 中（连接器仅调用一次）
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let service = SftpService::with_connector(move |_host, _role| {
+            release_rx
+                .lock()
+                .expect("release rx 锁应可用")
+                .recv()
+                .expect("release 信号应送达");
+            Ok(memory_sftp(vec![]))
+        });
+        let managed = service.clone();
+        service.register_session("session-1".to_string(), make_host());
+
+        let app = mock_builder()
+            .manage(managed)
+            .invoke_handler(tauri::generate_handler![sftp_list_dir])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        // 在独立线程调用 invoke，模拟 Tauri 主线程
+        let (dispatched_tx, dispatched_rx) = mpsc::channel::<()>();
+        let dispatch = std::thread::spawn({
+            let webview = webview.clone();
+            move || {
+                webview.on_message(
+                    request(
+                        "sftp_list_dir",
+                        serde_json::json!({ "sessionId": "session-1", "path": "/" }),
+                    ),
+                    Box::new(|_window, _cmd, _response, _callback, _error| {}),
+                );
+                dispatched_tx.send(()).expect("dispatch 完成信号应送达");
+            }
+        });
+
+        // 控制连接未决时 invoke 调度必须立即返回；同步 command 会在调用线程
+        // 内联等待连接就绪，释放前无法返回。
+        dispatched_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invoke 调度必须立即返回（同步 command 会阻塞调用线程直到连接就绪）");
+
+        // 解除阻塞后命令在后台正常完成
+        release_tx.send(()).expect("release 信号应送达");
+        dispatch.join().expect("调用线程应正常返回");
     }
 
     /// 缺省 conflictStrategy 时按 Reject 处理：目标已存在的下载最终 Failed，

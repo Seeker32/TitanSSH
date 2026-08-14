@@ -102,7 +102,7 @@ button { cursor: pointer; }
   border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card-bg); color: var(--color-text-secondary); }
 .sidebar-footer-btn:hover:not(:disabled) { border-color: var(--color-border-focus); color: var(--color-accent); }
 .sidebar-footer-btn:disabled { opacity: .4; cursor: default; }
-.terminal-theme-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.terminal-theme-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
 .settings-layout { display: flex; min-height: 280px; }
 .settings-nav { display: flex; flex: 0 0 120px; flex-direction: column; gap: 4px; padding-right: 12px; border-right: 1px solid var(--color-border); }
 .settings-nav-btn { padding: 7px 10px; border: 0; border-radius: 6px; background: none; color: var(--color-text-secondary); text-align: left; }
@@ -220,6 +220,8 @@ body.sftp-resizing { cursor: row-resize; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 .form-full { grid-column: 1 / -1; }
 .host-form .ant-input-number { width: 100%; }
+
+.host-editor-save-error { margin: 0 0 12px; padding: 8px 10px; border: 1px solid var(--color-danger, #ef4444); border-radius: 6px; background: rgba(239, 68, 68, .08); font-size: 12px; line-height: 1.6; color: var(--color-danger, #ef4444); }
 
 .sftp-panel { display: flex; flex-direction: column; flex-shrink: 0; border-top: 1px solid var(--color-border); background: var(--color-panel-bg); overflow: hidden; }
 .sftp-resizer { height: 5px; flex-shrink: 0; cursor: row-resize; position: relative; }

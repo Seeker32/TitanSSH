@@ -325,6 +325,58 @@ describe('HomePage integration', () => {
     expect(screen.getByText('新建连接')).toBeInTheDocument();
   });
 
+  it('保存主机失败时展示错误并保持编辑弹窗打开', async () => {
+    const user = userEvent.setup();
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'list_hosts') return [makeHost()];
+      if (command === 'save_host') throw { code: 'SecureStoreError', detail: 'The name org.freedesktop.secrets was not provided by any .service files' };
+      return undefined;
+    });
+    const { container } = render(<HomePage />);
+    const emptyState = container.querySelector('.empty-state') as HTMLElement;
+    await user.click(within(emptyState).getByRole('button', { name: '新建主机' }));
+    await user.type(screen.getByPlaceholderText('生产服务器'), 'prod');
+    await user.type(screen.getByPlaceholderText('192.168.1.12'), '10.0.0.8');
+    await user.type(screen.getByPlaceholderText('root'), 'root');
+    await user.type(screen.getByPlaceholderText('留空则保持原密码不变'), 'secret');
+    await user.click(screen.getByRole('button', { name: '保存连接' }));
+
+    expect(await screen.findByTestId('host-editor-save-error'))
+      .toHaveTextContent('安全存储错误: The name org.freedesktop.secrets was not provided by any .service files');
+    expect(screen.getByText('新建连接')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存连接' })).toBeInTheDocument();
+  });
+
+  it('保存主机成功后关闭编辑弹窗', async () => {
+    const user = userEvent.setup();
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'list_hosts') return [makeHost()];
+      if (command === 'save_host') return [makeHost()];
+      return undefined;
+    });
+    const { container } = render(<HomePage />);
+    const emptyState = container.querySelector('.empty-state') as HTMLElement;
+    await user.click(within(emptyState).getByRole('button', { name: '新建主机' }));
+    await user.type(screen.getByPlaceholderText('生产服务器'), 'prod');
+    await user.type(screen.getByPlaceholderText('192.168.1.12'), '10.0.0.8');
+    await user.type(screen.getByPlaceholderText('root'), 'root');
+    await user.type(screen.getByPlaceholderText('留空则保持原密码不变'), 'secret');
+    await user.click(screen.getByRole('button', { name: '保存连接' }));
+
+    await waitFor(() => expect(screen.queryByText('新建连接')).not.toBeInTheDocument());
+  });
+
+  it('语言选择器选项始终以语言自身名称展示', async () => {
+    const user = userEvent.setup();
+    useLocaleStore.getState().setLocale('en-US');
+    render(<HomePage />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('combobox'));
+    // 语言名使用自身语言（endonym）：英语界面下中文选项仍显示“简体中文”
+    expect(await screen.findByRole('option', { name: '简体中文' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'English' })).toBeInTheDocument();
+  });
+
   it('全局事件只由所属前端 module 监听一次', async () => {
     render(<HomePage />);
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('list_hosts'));
@@ -344,6 +396,23 @@ describe('HomePage integration', () => {
     const before = document.documentElement.dataset.theme;
     await user.click(toggle);
     expect(document.documentElement.dataset.theme).not.toBe(before);
+  });
+
+  it('终端主题卡片从标题下方左侧开始排列，标题不占网格首格', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.click(await screen.findByRole('button', { name: '设置' }));
+    const dialog = screen.getByRole('dialog', { name: '设置' });
+    await user.click(within(dialog).getByTestId('settings-section-terminal'));
+    const grid = document.querySelector('.terminal-theme-options') as HTMLElement;
+    expect(grid).not.toBeNull();
+    // 标题若作为网格子元素会占据首格，把第一张卡片挤到右侧；网格子元素必须全部是主题卡片
+    const children = [...grid.children];
+    expect(children).toHaveLength(6);
+    for (const child of children) {
+      expect(child.tagName).toBe('BUTTON');
+      expect(child).toHaveClass('terminal-theme-card');
+    }
   });
 
   it('设置对话框通过左侧导航切换内容，并保存日志等级', async () => {

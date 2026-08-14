@@ -431,6 +431,13 @@ describe('React components', () => {
     expect(screen.queryByText('⬇')).not.toBeInTheDocument();
   });
 
+  it('折叠窄条箭头朝上提示展开，展开面板箭头朝下提示收起', () => {
+    const { container, rerender } = render(<ServerStatusPanel snapshot={null} collapsed onToggle={vi.fn()} />);
+    expect(container.querySelector('.monitor-strip-chevron')).toHaveClass('lucide-chevron-up');
+    rerender(<ServerStatusPanel snapshot={null} collapsed={false} onToggle={vi.fn()} />);
+    expect(container.querySelector('.monitor-collapse-btn svg')).toHaveClass('lucide-chevron-down');
+  });
+
   it('服务器状态正确显示占位、指标和磁盘容量', () => {
     const { rerender } = render(<ServerStatusPanel snapshot={null} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getByText('未连接')).toBeInTheDocument();
@@ -707,6 +714,13 @@ describe('React components', () => {
     expect(document.body.classList.contains('sftp-resizing')).toBe(true);
     fireEvent(window, new Event('pointerup'));
     expect(document.body.classList.contains('sftp-resizing')).toBe(false);
+  });
+
+  it('保存失败错误显示在表单内', () => {
+    render(<HostEditorDialog open editingHost={null} groups={[]} onClose={vi.fn()} onSave={vi.fn()}
+      saveError={{ code: 'SecureStoreError', detail: 'The name org.freedesktop.secrets was not provided by any .service files' }} />);
+    expect(screen.getByTestId('host-editor-save-error'))
+      .toHaveTextContent('安全存储错误: The name org.freedesktop.secrets was not provided by any .service files');
   });
 
   it('主机表单编辑时不回填密码，并按认证方式清理字段', async () => {

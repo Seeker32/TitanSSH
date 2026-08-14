@@ -18,7 +18,7 @@ import { useSftpStore } from '@/stores/sftp';
 import { useThemeStore } from '@/stores/theme';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { useTrustedHostsStore } from '@/stores/trusted-hosts';
-import { translate } from '@/i18n';
+import { translate, toAppError, type AppErrorInfo } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
@@ -47,6 +47,8 @@ export default function HomePage() {
   const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
+  /** 最近一次主机保存失败的结构化错误；在编辑弹窗内展示，保存成功后清空 */
+  const [editorError, setEditorError] = useState<AppErrorInfo | null>(null);
   const resizingRef = useRef(false);
 
   useEffect(() => {
@@ -100,6 +102,7 @@ export default function HomePage() {
   /** 打开新建主机表单。 */
   function createHost() {
     setEditingHost(null);
+    setEditorError(null);
     setEditorOpen(true);
   }
 
@@ -108,14 +111,19 @@ export default function HomePage() {
     const host = hosts.find((item) => item.id === hostId);
     if (!host) return;
     setEditingHost(host);
+    setEditorError(null);
     setEditorOpen(true);
   }
 
-  /** 保存主机并关闭编辑表单。 */
+  /** 保存主机并关闭编辑表单；失败时在弹窗内展示错误，弹窗保持打开。 */
   async function saveHost(request: SaveHostRequest) {
-    await useHostStore.getState().saveHost(request);
-    setEditorOpen(false);
-    setEditingHost(null);
+    try {
+      await useHostStore.getState().saveHost(request);
+      setEditorOpen(false);
+      setEditingHost(null);
+    } catch (error) {
+      setEditorError(toAppError(error));
+    }
   }
 
   /** 删除主机，并清理当前激活主机标识。 */
@@ -232,7 +240,7 @@ export default function HomePage() {
           onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeView)} />}
       </div>
     </section>
-    <HostEditorDialog open={editorOpen} editingHost={editingHost} groups={useMemo(
+    <HostEditorDialog open={editorOpen} editingHost={editingHost} saveError={editorError} groups={useMemo(
       () => [...new Set(hosts.map((host) => host.group).filter(Boolean))], [hosts])}
       onClose={() => setEditorOpen(false)} onSave={saveHost} />
   </div>;
@@ -279,22 +287,24 @@ function FooterActions({ theme }: { theme: string }) {
           <section className="settings-content">
             {settingsSection === 'general' && <label className="settings-field">{translate(locale, 'settings.language')} <Select value={locale} onChange={(value) => useLocaleStore.getState().setLocale(value)}
               options={[{ value: 'zh-CN', label: translate(locale, 'locale.zh-CN') }, { value: 'en-US', label: translate(locale, 'locale.en-US') }]} /></label>}
-            {settingsSection === 'terminal' && <div className="terminal-theme-options">
+            {settingsSection === 'terminal' && <>
               <Typography.Text type="secondary">{translate(locale, 'settings.terminalTheme')}</Typography.Text>
-              {TERMINAL_THEME_NAMES.map((name) => {
-                const palette = terminalThemes[name];
-                const selected = name === terminalTheme;
-                return <button key={name} type="button" aria-pressed={selected}
-                  aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
-                  onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
-                  <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
-                    <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
-                  </span>
-                  <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
-                  {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
-                </button>;
-              })}
-            </div>}
+              <div className="terminal-theme-options">
+                {TERMINAL_THEME_NAMES.map((name) => {
+                  const palette = terminalThemes[name];
+                  const selected = name === terminalTheme;
+                  return <button key={name} type="button" aria-pressed={selected}
+                    aria-label={`${translate(locale, 'settings.terminalTheme')}: ${translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}`} className="terminal-theme-card"
+                    onClick={() => useTerminalThemeStore.getState().setTerminalTheme(name)}>
+                    <span className="terminal-theme-preview" style={{ background: palette.background, color: palette.foreground }}>
+                      <span>$ ssh titan</span><span style={{ color: palette.green }}>connected</span>
+                    </span>
+                    <span>{translate(locale, `terminalTheme.${name}` as Parameters<typeof translate>[1])}</span>
+                    {selected && <span className="terminal-theme-card__selected">{translate(locale, 'settings.selected')}</span>}
+                  </button>;
+                })}
+              </div>
+            </>}
             {settingsSection === 'trustedHosts' && <TrustedHostsSection onRetry={() => void useTrustedHostsStore.getState().load()} />}
             {settingsSection === 'logging' && <label className="settings-field">{translate(locale, 'settings.logLevel')}
               <select value={logLevel} onChange={(event) => setLogLevel(event.target.value as LogLevel)}>

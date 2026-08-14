@@ -29,7 +29,8 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'terminalTheme.dracula': 'Dracula',
   'terminalTheme.solarizedLight': 'Solarized Light',
   'terminalTheme.solarizedDark': 'Solarized Dark',
-  'locale.zh-CN': 'Simplified Chinese',
+  // 语言选项使用自身语言名称（endonym），任何界面语言下都不翻译
+  'locale.zh-CN': '简体中文',
   'locale.en-US': 'English',
   'theme.toggle': 'Toggle theme',
 
