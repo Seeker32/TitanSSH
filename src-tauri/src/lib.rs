@@ -59,6 +59,7 @@ pub fn run() {
             commands::host_identity::accept_host_identity,
             commands::host_identity::accept_and_save_host_identity,
             commands::host_identity::reject_host_identity,
+            commands::host_identity::list_trusted_hosts,
             commands::monitor::start_monitoring,
             commands::monitor::stop_monitoring,
             commands::monitor::get_monitor_status,

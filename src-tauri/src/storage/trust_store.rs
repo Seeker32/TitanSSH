@@ -132,6 +132,21 @@ impl TrustStore {
         Ok(())
     }
 
+    /// 列出全部信任记录，按 host 字典序 + port 稳定排序（Settings 清单展示顺序）。
+    ///
+    /// 文件缺失返回空列表；不可读或解析失败返回 TrustStoreError（fail-closed），
+    /// 绝不把错误伪装成空列表。
+    pub fn list(&self) -> Result<Vec<TrustRecord>, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = ensure_loaded(&mut state)?;
+        let mut sorted = records.to_vec();
+        sorted.sort_by(|a, b| a.host.cmp(&b.host).then(a.port.cmp(&b.port)));
+        Ok(sorted)
+    }
+
     /// 重新读取磁盘内容（测试用：观察真实文件状态，绕开内存缓存）。
     #[cfg(test)]
     pub(crate) fn reload(&self) -> Result<Vec<TrustRecord>, AppError> {
@@ -657,6 +672,56 @@ mod tests {
             b"blob-a",
             "失败的移除不得污染缓存"
         );
+    }
+
+    /// list 返回全部记录并按 host 字典序 + port 稳定排序（Settings 清单的稳定展示顺序）。
+    #[test]
+    fn list_returns_stable_sorted_order() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        for (host, port) in [
+            ("b.example.com", 22),
+            ("a.example.com", 2222),
+            ("a.example.com", 22),
+            ("c.example.com", 22),
+        ] {
+            store
+                .upsert(record(
+                    host,
+                    port,
+                    "ssh-ed25519",
+                    format!("blob-{host}-{port}").as_bytes(),
+                ))
+                .unwrap();
+        }
+
+        let records = store.list().unwrap();
+        let order: Vec<(String, u16)> = records
+            .iter()
+            .map(|record| (record.host.clone(), record.port))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("a.example.com".to_string(), 22),
+                ("a.example.com".to_string(), 2222),
+                ("b.example.com".to_string(), 22),
+                ("c.example.com".to_string(), 22),
+            ],
+            "清单按 host 字典序 + port 稳定排序"
+        );
+    }
+
+    /// 空信任存储的 list 返回空列表；不可解析文件 list 同样 fail-closed。
+    #[test]
+    fn list_empty_store_and_corrupt_file() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        assert_eq!(store.list().unwrap(), Vec::new());
+
+        fs::write(&path, "10.0.0.8 ssh-ed25519\n").unwrap();
+        let corrupt = TrustStore::from_file_path(path.clone());
+        assert_eq!(corrupt.list().unwrap_err().code(), "TrustStoreError");
     }
 
     /// 主机段格式序列化遵循 OpenSSH 规则（单元级向量）。

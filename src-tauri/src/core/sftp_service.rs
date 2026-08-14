@@ -1818,6 +1818,221 @@ mod tests {
         }
     }
 
+    /// capability 回归（issue #35）：传输连接与控制连接一样经过统一主机身份校验，
+    /// 不得绕过。第一次下载的传输连接以 Session 临时信任放行；服务端更换 key 后，
+    /// 第二次下载新建的传输连接必须阻塞在校验门后产生新 challenge，拒绝即失败且
+    /// 不进入认证。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transfer_connection_waits_for_host_identity_decision() {
+        use crate::core::host_identity::{HostIdentityService, PresentedHostKey};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let key_seq = Arc::new(AtomicUsize::new(0));
+        let control_attempts = Arc::new(AtomicUsize::new(0));
+        let transfer_attempts = Arc::new(AtomicUsize::new(0));
+        let key_for_connector = key_seq.clone();
+        let control_for_connector = control_attempts.clone();
+        let transfer_for_connector = transfer_attempts.clone();
+        let service = SftpService::with_verifying_connector(
+            move |host, role, verifier| {
+                // 建连尝试先计数，再进入统一校验（握手后、认证前）；任何角色都不得绕过
+                let transfer_attempt = match role {
+                    SftpRole::Control => {
+                        control_for_connector.fetch_add(1, Ordering::SeqCst);
+                        None
+                    }
+                    SftpRole::Transfer => {
+                        Some(transfer_for_connector.fetch_add(1, Ordering::SeqCst) + 1)
+                    }
+                };
+                verifier(&PresentedHostKey {
+                    host: host.host.clone(),
+                    port: host.port,
+                    algorithm: "ssh-ed25519".to_string(),
+                    fingerprint: format!("SHA256:key-{}", key_for_connector.load(Ordering::SeqCst)),
+                    blob: b"blob".to_vec(),
+                })?;
+                match role {
+                    SftpRole::Control => Ok(memory_sftp(vec![7u8; 8])),
+                    SftpRole::Transfer => {
+                        // 第一次传输连接读完即失败（通道错误）→ 不健康归还并淘汰，
+                        // 强制第二次下载新建传输连接（证明建连路径同样被校验门拦截）
+                        if transfer_attempt == Some(1) {
+                            Ok(channel_failing_transfer_sftp())
+                        } else {
+                            Ok(memory_sftp(vec![7u8; 8]))
+                        }
+                    }
+                }
+            },
+            TransferClock::system(),
+            TRANSFER_IDLE_TIMEOUT,
+        );
+        service.register_session_with_verifier(
+            "session-transfer".to_string(),
+            make_host(),
+            identity.verifier(app.handle().clone(), "session-transfer".to_string()),
+        );
+
+        // 控制连接 eager 到达校验门：challenge（key-0）→ 仅本次接受
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity.pending_challenge("session-transfer").is_none() && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity
+            .pending_challenge("session-transfer")
+            .expect("控制连接产生 challenge");
+        identity.accept(&challenge.challenge_id).unwrap();
+
+        // 第一次下载：传输连接呈现 key-0（Session 临时信任）→ 放行进入传输，
+        // 通道失败后连接被淘汰，任务以结构化通道错误失败
+        let local_path =
+            std::env::temp_dir().join(format!("titan-identity-transfer-{}.bin", Uuid::new_v4()));
+        let first = service
+            .enqueue_download(
+                "session-transfer".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path.to_string_lossy().to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("下载应入队");
+        assert_eq!(
+            wait_for_terminal(&service, &first.task_id),
+            SftpTaskStatus::Failed
+        );
+        assert_eq!(transfer_attempts.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&local_path);
+
+        // 服务端更换 key（key-1）：第二次下载必须新建传输连接（旧连接已淘汰），
+        // 新连接呈现 key-1 → 新 challenge，阻塞在校验门后，绝不借旧决定放行
+        key_seq.store(1, Ordering::SeqCst);
+        let local_path2 =
+            std::env::temp_dir().join(format!("titan-identity-transfer2-{}.bin", Uuid::new_v4()));
+        let second = service
+            .enqueue_download(
+                "session-transfer".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path2.to_string_lossy().to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("下载应入队");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity.pending_challenge("session-transfer").is_none() && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let challenge2 = identity
+            .pending_challenge("session-transfer")
+            .expect("新 key 的传输连接产生 challenge");
+        assert_eq!(challenge2.fingerprint, "SHA256:key-1");
+        assert_eq!(
+            transfer_attempts.load(Ordering::SeqCst),
+            2,
+            "第二次下载新建传输连接且经过校验器"
+        );
+        assert_eq!(
+            identity.waiting_connections(&challenge2.challenge_id),
+            1,
+            "传输连接阻塞在校验门后"
+        );
+
+        // 拒绝：传输以 HostKeyRejected 失败，不进入认证
+        identity.reject(&challenge2.challenge_id).unwrap();
+        assert_eq!(
+            wait_for_terminal(&service, &second.task_id),
+            SftpTaskStatus::Failed,
+            "拒绝后第二次下载必须失败"
+        );
+        let error = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&second.task_id)
+            .and_then(|task| task.error.clone())
+            .expect("失败任务应携带结构化错误");
+        assert_eq!(error.code, "HostKeyRejected", "拒绝不得让传输进入认证");
+        let _ = std::fs::remove_file(&local_path2);
+    }
+
+    /// capability 回归（issue #35）：失效控制连接自动重连时同样经过统一主机身份
+    /// 校验，不得绕过共享校验门。仅本次接受的 Session 临时信任直接放行重连，
+    /// 但校验器必须被再次调用。
+    #[test]
+    fn sftp_control_reconnect_still_goes_through_host_identity_verifier() {
+        use crate::core::host_identity::{HostIdentityService, HostKeyVerifier, PresentedHostKey};
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Instant;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_connector = attempts.clone();
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let service = SftpService::with_verifying_connector(
+            move |host, role, verifier| {
+                assert_eq!(role, SftpRole::Control, "本测试只驱动控制连接");
+                verifier(&PresentedHostKey {
+                    host: host.host.clone(),
+                    port: host.port,
+                    algorithm: "ssh-ed25519".to_string(),
+                    fingerprint: "SHA256:sftp-reconnect".to_string(),
+                    blob: b"blob".to_vec(),
+                })?;
+                if attempts_for_connector.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(failing_channel_sftp())
+                } else {
+                    Ok(empty_sftp())
+                }
+            },
+            TransferClock::system(),
+            TRANSFER_IDLE_TIMEOUT,
+        );
+        // 计数包装器观察每一次校验器调用；重连路径不得绕过
+        let inner = identity.verifier(app.handle().clone(), "session-reconnect".to_string());
+        let calls_for_wrapper = verifier_calls.clone();
+        let wrapped: HostKeyVerifier = Arc::new(move |presented| {
+            calls_for_wrapper.fetch_add(1, Ordering::SeqCst);
+            inner(presented)
+        });
+        service.register_session_with_verifier(
+            "session-reconnect".to_string(),
+            make_host(),
+            wrapped,
+        );
+
+        // 首次连接：challenge → 仅本次接受放行
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity.pending_challenge("session-reconnect").is_none() && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity
+            .pending_challenge("session-reconnect")
+            .expect("SFTP 连接产生主机身份 challenge");
+        identity.accept(&challenge.challenge_id).unwrap();
+
+        // 首次 Ready 连接失效 → 自动重连一次；重连同样经过统一校验器
+        assert!(
+            service.list_dir("session-reconnect", "/").is_ok(),
+            "重连后的目录操作应成功"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "失效连接应重连一次");
+        assert_eq!(
+            verifier_calls.load(Ordering::SeqCst),
+            2,
+            "重连同样经过统一主机身份校验，不得绕过"
+        );
+    }
+
     /// 后台 eager 失败只交付一次，下一次操作必须触发重连。
     #[test]
     fn eager_failure_is_reported_once_then_next_operation_retries() {

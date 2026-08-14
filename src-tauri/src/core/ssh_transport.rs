@@ -1979,4 +1979,133 @@ mod tests {
             "SFTP 完成前应收到 Terminal marker，实际输出: {output}"
         );
     }
+
+    /// 真实 SSH E2E（issue #35）：先采集真实主机 key 并建立可信记录，随后
+    /// Terminal streaming、SFTP transfer 与 Monitoring（Exec）全部经真实
+    /// HostIdentityService 精确匹配静默放行并正常工作。
+    #[test]
+    #[ignore = "需要配置 TITAN_SSH_E2E_* 并访问真实 SSH server"]
+    fn real_trusted_record_keeps_terminal_sftp_and_monitoring_working() {
+        use crate::core::host_identity::{HostIdentityService, HostKeyVerifier, PresentedHostKey};
+        use crate::storage::trust_store::{TrustRecord, TrustStore};
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        use tauri::test::mock_app;
+
+        let (host, password, passphrase) = e2e_host();
+
+        // 1. 首次握手：记录型校验器只采集呈现 key，不做持久化
+        let captured: Arc<Mutex<Option<PresentedHostKey>>> = Arc::new(Mutex::new(None));
+        let captured_for_verifier = captured.clone();
+        let capture_verifier: HostKeyVerifier = Arc::new(move |presented| {
+            *captured_for_verifier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(presented.clone());
+            Ok(())
+        });
+        {
+            let mut exec = super::connect_exec(
+                &host,
+                password.as_deref(),
+                passphrase.as_deref(),
+                &capture_verifier,
+            )
+            .expect("采集连接应成功");
+            exec.execute("true").expect("采集连接应可执行命令");
+        }
+        let presented = captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect("握手应呈现主机 key");
+
+        // 2. 把呈现 key 持久化为可信记录，构建真实 HostIdentityService
+        let trust_path = std::env::temp_dir().join(format!(
+            "titan-real-trust-{}.known_hosts",
+            uuid::Uuid::new_v4()
+        ));
+        let store = TrustStore::from_file_path(trust_path.clone());
+        store
+            .upsert(TrustRecord {
+                host: presented.host.clone(),
+                port: presented.port,
+                algorithm: presented.algorithm.clone(),
+                blob: presented.blob.clone(),
+            })
+            .expect("可信记录应写入成功");
+        let identity = HostIdentityService::with_trust_store(store);
+        let app = mock_app();
+        let verifier = identity.verifier(app.handle().clone(), "real-trusted".to_string());
+
+        // 3. Terminal streaming：可信记录精确匹配 → 静默放行，命令往返正常
+        let mut terminal = super::connect_terminal(
+            &host,
+            password.as_deref(),
+            passphrase.as_deref(),
+            &verifier,
+            |_| {},
+        )
+        .expect("Terminal 应连接成功");
+        terminal
+            .write("echo TITAN_TRUSTED_TERMINAL_MARKER\n")
+            .expect("Terminal 写入应成功");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = String::new();
+        let mut buffer = [0_u8; 4096];
+        while Instant::now() < deadline {
+            match terminal.read(&mut buffer) {
+                Ok(size) if size > 0 => {
+                    output.push_str(&String::from_utf8_lossy(&buffer[..size]));
+                    if output.contains("TITAN_TRUSTED_TERMINAL_MARKER") {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("Terminal 读取失败: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            output.contains("TITAN_TRUSTED_TERMINAL_MARKER"),
+            "可信记录放行后 Terminal 应可交互，实际输出: {output}"
+        );
+        terminal.close().expect("Terminal 应可关闭");
+
+        // 4. SFTP transfer：写入远端文件并读回，内容一致
+        let payload = format!("titan-real-sftp-{}", uuid::Uuid::new_v4());
+        let remote_path = format!("/tmp/titan-trusted-{}.bin", uuid::Uuid::new_v4());
+        let mut sftp =
+            super::connect_sftp(&host, password.as_deref(), passphrase.as_deref(), &verifier)
+                .expect("SFTP 应连接成功");
+        {
+            let mut file = sftp.create(&remote_path).expect("应创建远端文件");
+            file.write_all(payload.as_bytes()).expect("应写入远端文件");
+            file.flush().expect("应 flush 远端文件");
+        }
+        {
+            let mut file = sftp.open_read(&remote_path).expect("应打开远端文件");
+            let mut content = String::new();
+            file.read_to_string(&mut content).expect("应读取远端文件");
+            assert_eq!(content, payload, "SFTP 往返内容应一致");
+        }
+        sftp.unlink(&remote_path).expect("应清理远端文件");
+        drop(sftp);
+
+        // 5. Monitoring：Exec transport 执行采集命令并返回非空输出
+        let mut exec =
+            super::connect_exec(&host, password.as_deref(), passphrase.as_deref(), &verifier)
+                .expect("Exec 应连接成功");
+        let monitor_output = exec
+            .execute("head -n 1 /proc/meminfo 2>/dev/null || vm_stat | head -n 1")
+            .expect("监控采集命令应执行成功");
+        assert!(!monitor_output.trim().is_empty(), "监控采集应返回非空输出");
+
+        // 6. 全程无 challenge：可信记录精确匹配静默放行
+        assert!(
+            identity.pending_challenge("real-trusted").is_none(),
+            "可信记录精确匹配不得产生 challenge"
+        );
+        let _ = std::fs::remove_file(&trust_path);
+    }
 }

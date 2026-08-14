@@ -1,6 +1,23 @@
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::AppErrorInfo;
+use crate::models::host_identity::TrustedHostInfo;
 use tauri::{AppHandle, State};
+
+/// 列出 Settings“可信主机”只读清单
+///
+/// 薄 adapter：从 HostIdentityService 读取全部持久化信任记录（按 host 字典序 +
+/// port 稳定排序），返回 endpoint、算法与 SHA-256 指纹的 typed JSON。
+/// 信任存储读取/解析失败时以 TrustStoreError 结构化返回，绝不伪装成空列表；
+/// 前端只消费本结果，不解析 known_hosts 文本。
+#[tauri::command]
+pub fn list_trusted_hosts(
+    session_manager: State<'_, SessionManager>,
+) -> Result<Vec<TrustedHostInfo>, AppErrorInfo> {
+    session_manager
+        .identity_service()
+        .list_trusted_hosts()
+        .map_err(AppErrorInfo::from)
+}
 
 /// 仅本次接受未知主机身份
 ///

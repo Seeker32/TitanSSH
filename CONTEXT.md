@@ -59,3 +59,7 @@ _Avoid_: 临时信任（单独使用时）、跳过验证、记住本次
 **接受并保存 (accept and save)**:
 把 challenge 快照的算法与完整公钥持久化到信任存储并放行当前 Session 的决策；保存失败保持 challenge 未决并结构化报错，绝不静默降级为仅本次接受。
 _Avoid_: 永久信任、自动保存、记住密码式保存
+
+**可信主机清单 (trusted hosts list)**:
+Settings 中的只读区域，按 host 字典序 + port 稳定顺序展示每条信任记录的 endpoint、算法与 SHA-256 指纹。主机 key 与 `known_hosts` 文本由后端解析，React 只消费 typed JSON；不提供删除、编辑、导入或导出操作，信任记录随 HostConfig 生命周期自动管理。空信任存储、读取失败与解析失败是三种不同状态，错误绝不伪装成空列表。
+_Avoid_: 信任记录管理页、known_hosts 编辑器、指纹白名单页面

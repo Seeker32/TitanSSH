@@ -9,6 +9,7 @@ import SftpPanel from '@/components/sftp/SftpPanel';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
+import TrustedHostsSection from '@/components/settings/TrustedHostsSection';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
@@ -16,6 +17,7 @@ import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useThemeStore } from '@/stores/theme';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
+import { useTrustedHostsStore } from '@/stores/trusted-hosts';
 import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
@@ -239,12 +241,19 @@ export default function HomePage() {
 /** 侧栏底部全局入口：应用主题切换与 SSH 终端主题设置。 */
 function FooterActions({ theme }: { theme: string }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<'general' | 'terminal' | 'logging'>('general');
+  const [settingsSection, setSettingsSection] = useState<'general' | 'terminal' | 'trustedHosts' | 'logging'>('general');
   const terminalTheme = useTerminalThemeStore((state) => state.terminalTheme);
   const logLevel = useLogLevelStore((state) => state.logLevel);
   const locale = useLocaleStore((state) => state.locale);
 
   useEffect(() => { void useLogLevelStore.getState().setLogLevel(logLevel); }, []);
+
+  // 每次打开/切换到“可信主机”区域都重新加载：保存/替换/自动清理后清单反映后端当前记录
+  useEffect(() => {
+    if (settingsOpen && settingsSection === 'trustedHosts') {
+      void useTrustedHostsStore.getState().load();
+    }
+  }, [settingsOpen, settingsSection]);
 
   /** 保存日志等级并立即同步后端日志过滤器。 */
   function setLogLevel(level: LogLevel) {
@@ -261,7 +270,7 @@ function FooterActions({ theme }: { theme: string }) {
       <Modal open={settingsOpen} title={translate(locale, 'settings.title')} footer={null} width={680} onCancel={() => setSettingsOpen(false)}>
         <div className="settings-layout">
           <nav className="settings-nav" aria-label={translate(locale, 'settings.title')}>
-            {(['general', 'terminal', 'logging'] as const).map((section) => <button key={section} type="button" data-testid={`settings-section-${section}`}
+            {(['general', 'terminal', 'trustedHosts', 'logging'] as const).map((section) => <button key={section} type="button" data-testid={`settings-section-${section}`}
               className={settingsSection === section ? 'settings-nav-btn settings-nav-btn--active' : 'settings-nav-btn'}
               aria-current={settingsSection === section ? 'page' : undefined} onClick={() => setSettingsSection(section)}>
               {translate(locale, `settings.${section}` as Parameters<typeof translate>[1])}
@@ -286,6 +295,7 @@ function FooterActions({ theme }: { theme: string }) {
                 </button>;
               })}
             </div>}
+            {settingsSection === 'trustedHosts' && <TrustedHostsSection onRetry={() => void useTrustedHostsStore.getState().load()} />}
             {settingsSection === 'logging' && <label className="settings-field">{translate(locale, 'settings.logLevel')}
               <select value={logLevel} onChange={(event) => setLogLevel(event.target.value as LogLevel)}>
                 {LOG_LEVELS.map((level) => <option key={level} value={level}>{translate(locale, `settings.logLevel.${level}` as Parameters<typeof translate>[1])}</option>)}

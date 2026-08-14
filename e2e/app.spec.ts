@@ -39,9 +39,16 @@ test.beforeEach(async ({ page }) => {
     // 会话序号：每次 open_session 递增，支持同 endpoint 多 Runtime Session
     let sessionSeq = 0;
     // 持久化信任记录（issue #32/#34）：保存/替换成功后同 endpoint 的新 Session 静默放行
-    const savedTrust = new Map<string, { algorithm: string; fingerprint: string }>();
+    const savedTrust = new Map<string, { host: string; port: number; algorithm: string; fingerprint: string }>();
     /** 精确 endpoint 键：host + port（与后端信任记录归属一致）。 */
     const endpointKey = (host: string, port: number) => `${host}:${port}`;
+    /** 建模 issue #33 自动清理：移除不再被任何 HostConfig 引用的 endpoint 信任记录。 */
+    const cleanupUnreferencedTrust = () => {
+      for (const [endpoint, record] of [...savedTrust.entries()]) {
+        const referenced = hostsStore.some((item) => item.host === record.host && item.port === record.port);
+        if (!referenced) savedTrust.delete(endpoint);
+      }
+    };
     /** 向所有已注册监听器派发结构化 Tauri 事件。 */
     const emitEvent = (name: string, payload: unknown) => {
       if (name === 'host-identity:challenge' && payload && typeof payload === 'object' && 'sessionId' in payload) {
@@ -101,6 +108,8 @@ test.beforeEach(async ({ page }) => {
           } else {
             hostsStore = [...hostsStore, { ...host, ...request }];
           }
+          // 建模 issue #33：保存后自动清理不再被任何配置引用的 endpoint 信任记录
+          cleanupUnreferencedTrust();
           return hostsStore;
         }
         if (command === 'close_session') {
@@ -117,8 +126,10 @@ test.beforeEach(async ({ page }) => {
         }
         if (command === 'open_session') {
           const newSessionId = `session-${++sessionSeq}`;
-          const newSession = { ...session, sessionId: newSessionId };
-          const endpoint = endpointKey('10.0.0.8', 22);
+          // 连接目标取实际 HostConfig：endpoint 与 challenge 按真实 host + port 建模
+          const target = hostsStore.find((item) => item.id === String(args.hostId)) ?? host;
+          const newSession = { ...session, sessionId: newSessionId, hostId: target.id, host: target.host, port: target.port, username: target.username };
+          const endpoint = endpointKey(target.host, target.port);
           // 主机身份变更建模：信任存储已保存旧 key，服务端呈现新 key → Changed challenge；
           // 替换成功后同 endpoint 静默放行（模拟持久化信任精确匹配）。
           if (autoChangedIdentity) {
@@ -130,8 +141,8 @@ test.beforeEach(async ({ page }) => {
               emitEvent('host-identity:challenge', {
                 challengeId: `changed-${sessionSeq}`,
                 sessionId: newSessionId,
-                host: '10.0.0.8',
-                port: 22,
+                host: target.host,
+                port: target.port,
                 kind: 'Changed',
                 keyAlgorithm: 'ssh-rsa',
                 fingerprint: 'SHA256:newfp',
@@ -152,8 +163,8 @@ test.beforeEach(async ({ page }) => {
             emitEvent('host-identity:challenge', {
               challengeId: `challenge-${sessionSeq}`,
               sessionId: newSessionId,
-              host: '10.0.0.8',
-              port: 22,
+              host: target.host,
+              port: target.port,
               keyAlgorithm: 'ssh-ed25519',
               fingerprint: 'SHA256:aGVscG1l',
               timestamp: Date.now(),
@@ -174,7 +185,7 @@ test.beforeEach(async ({ page }) => {
           if (!entry) throw { code: 'HostKeyChallengeNotFound', detail: String(args.challengeId) };
           const { challenge } = entry;
           // 持久化：endpoint 只保留呈现 key；后续新 Session 同 endpoint 不再产生 challenge
-          savedTrust.set(endpointKey(challenge.host, challenge.port), { algorithm: challenge.keyAlgorithm, fingerprint: challenge.fingerprint });
+          savedTrust.set(endpointKey(challenge.host, challenge.port), { host: challenge.host, port: challenge.port, algorithm: challenge.keyAlgorithm, fingerprint: challenge.fingerprint });
           // 保存/替换只自动解决兼容的 challenge：同 endpoint + 同呈现 key 的其他 Session 一并放行
           const compatible = [...pendingChallenges.values()].filter((other) =>
             other.challenge.host === challenge.host
@@ -216,7 +227,15 @@ test.beforeEach(async ({ page }) => {
         }
         if (command === 'delete_host') {
           hostsStore = hostsStore.filter((item) => item.id !== (args.hostId as string));
+          // 建模 issue #33：删除后自动清理不再被任何配置引用的 endpoint 信任记录
+          cleanupUnreferencedTrust();
           return hostsStore;
+        }
+        if (command === 'list_trusted_hosts') {
+          // 与后端契约一致：按 host 字典序 + port 稳定排序的 typed JSON 只读清单
+          return [...savedTrust.values()]
+            .sort((a, b) => a.host.localeCompare(b.host) || a.port - b.port)
+            .map(({ host: recordHost, port, algorithm, fingerprint }) => ({ host: recordHost, port, algorithm, fingerprint }));
         }
         if (command === 'start_monitoring') return gateOnIdentity('start_monitoring', String(args.sessionId), () => task);
         if (command === 'sftp_list_dir') return gateOnIdentity('sftp_list_dir', String(args.sessionId), () => [{ name: 'syslog', path: '/syslog', isDir: false, size: 100, modifiedAt: Date.now(), permissions: 'rw-r--r--' }]);
@@ -243,7 +262,7 @@ test.beforeEach(async ({ page }) => {
          *  open_session 后 mock 后端派发 Changed challenge 并阻塞 capability。 */
         enableChangedIdentity() {
           autoChangedIdentity = true;
-          savedTrust.set(endpointKey('10.0.0.8', 22), { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:oldfp' });
+          savedTrust.set(endpointKey('10.0.0.8', 22), { host: '10.0.0.8', port: 22, algorithm: 'ssh-ed25519', fingerprint: 'SHA256:oldfp' });
         },
         /** 模拟服务端在 challenge 后再次更换 key：旧 challenge 取消（等待者以
          *  HostKeyVerificationCancelled 失败），并派发新呈现 key 的 Changed challenge。 */
@@ -283,7 +302,7 @@ test.beforeEach(async ({ page }) => {
         },
         /** 已保存信任记录快照（endpoint → 算法/指纹），验收：替换后只保留呈现 key。 */
         savedTrustSnapshot() {
-          return [...savedTrust.entries()].map(([endpoint, record]) => ({ endpoint, ...record }));
+          return [...savedTrust.entries()].map(([endpoint, { algorithm, fingerprint }]) => ({ endpoint, algorithm, fingerprint }));
         },
         /** 让下一次匹配 command 的 invoke 以结构化错误拒绝（与后端 AppErrorInfo 契约一致）。 */
         failNext(command: string, error: { code: string; detail?: string }) {
@@ -973,4 +992,116 @@ test('challenge 后服务端再次更换 key：卡片更新为新 key，旧等�
   }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
   expect(acceptCalls).toEqual([{ command: 'accept_host_identity', args: { challengeId: 'rotated-session-1' } }]);
   await expect(card).toHaveCount(0);
+});
+
+test('可信主机清单：空状态 → 保存后展示记录（稳定顺序）→ 替换后只保留呈现 key', async ({ page }) => {
+  await page.goto('/');
+  // 空信任存储：明确空状态，不伪装成错误
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-trustedHosts').click();
+  await expect(page.getByTestId('trusted-hosts-empty')).toBeVisible();
+  await expect(page.getByTestId('trusted-hosts-empty')).toContainText('尚无信任记录');
+  await page.locator('.ant-modal-close').click();
+
+  // 首次连接两个不同 endpoint → 接受并保存（先 10.0.0.9 后 10.0.0.8，
+  // 使保存顺序与稳定排序相反，证明清单顺序来自排序而非插入顺序）
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableHostIdentity: () => void };
+  }).__TAURI_TEST__.enableHostIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-2').dblclick();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toBeVisible();
+  await page.getByTestId('host-identity-save').click();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toBeVisible();
+  await page.getByTestId('host-identity-save').click();
+  await expect(page.getByText('syslog')).toBeVisible();
+
+  // 重新进入 Settings：清单展示两条记录，host 字典序 + port 稳定排序，字段与后端一致
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-trustedHosts').click();
+  await expect(page.getByTestId('trusted-hosts-list')).toBeVisible();
+  const row8 = page.getByTestId('trusted-host-row-10.0.0.8-22');
+  const row9 = page.getByTestId('trusted-host-row-10.0.0.9-22');
+  await expect(row8).toContainText('10.0.0.8:22');
+  await expect(row8).toContainText('ssh-ed25519');
+  await expect(row8).toContainText('SHA256:aGVscG1l');
+  await expect(row9).toContainText('10.0.0.9:22');
+  const order = await page.getByTestId('trusted-hosts-list').locator('tbody tr').allTextContents();
+  expect(order).toHaveLength(2);
+  expect(order[0]).toContain('10.0.0.8:22');
+  expect(order[1]).toContain('10.0.0.9:22');
+  // 只读清单：无任何管理控件（删除/编辑/导入/导出按钮、输入框或下拉）
+  expect(await page.getByTestId('trusted-hosts-list').locator('button, input, select, [role="button"]').count()).toBe(0);
+  await page.locator('.ant-modal-close').click();
+
+  // 主机身份变更 → 二次确认替换：清单只保留呈现 key，其他 endpoint 不受影响
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableChangedIdentity: () => void };
+  }).__TAURI_TEST__.enableChangedIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toBeVisible();
+  await page.getByTestId('host-identity-replace').click();
+  await page.getByTestId('host-identity-replace-confirm-btn').click();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-trustedHosts').click();
+  const replaced = page.getByTestId('trusted-host-row-10.0.0.8-22');
+  await expect(replaced).toContainText('ssh-rsa');
+  await expect(replaced).toContainText('SHA256:newfp');
+  await expect(page.getByTestId('trusted-host-row-10.0.0.9-22')).toContainText('ssh-ed25519');
+});
+
+test('可信主机清单读取失败：结构化错误状态而非空列表，重试恢复', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { failNext: (command: string, error: { code: string; detail?: string }) => void };
+  }).__TAURI_TEST__.failNext('list_trusted_hosts', { code: 'TrustStoreError', detail: '解析信任存储失败: 第 1 行' }));
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-trustedHosts').click();
+  await expect(page.getByTestId('trusted-hosts-error')).toBeVisible();
+  await expect(page.getByTestId('trusted-hosts-error')).toContainText('无法读取信任记录');
+  await expect(page.getByTestId('trusted-hosts-error')).toContainText('解析信任存储失败: 第 1 行');
+  // 读取失败绝不伪装成空列表
+  await expect(page.getByTestId('trusted-hosts-empty')).toHaveCount(0);
+  await expect(page.getByTestId('trusted-hosts-list')).toHaveCount(0);
+  // 重试：信任存储恢复后展示真实内容
+  await page.getByTestId('trusted-hosts-retry').click();
+  await expect(page.getByTestId('trusted-hosts-empty')).toBeVisible();
+});
+
+test('自动清理：重复引用保留记录，最后一个 HostConfig 引用移除后 endpoint 从清单消失', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableHostIdentity: () => void };
+  }).__TAURI_TEST__.enableHostIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await page.getByTestId('host-identity-save').click();
+  await expect(page.getByText('syslog')).toBeVisible();
+
+  // 新建第二个引用同一 endpoint（10.0.0.8:22）的 HostConfig
+  await page.getByLabel('新建主机').click();
+  await page.getByPlaceholder('生产服务器').fill('prod-copy');
+  await page.getByPlaceholder('192.168.1.12').fill('10.0.0.8');
+  await page.getByRole('button', { name: '保存连接' }).click();
+  await expect(page.locator('.sidebar').getByText('prod-copy')).toBeVisible();
+
+  // 删除 host-1：endpoint 仍被 prod-copy 引用，信任记录保留
+  const card1 = page.locator('.sidebar').getByTestId('host-card-host-1');
+  await card1.hover();
+  await card1.getByTestId('host-delete-btn').click();
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-trustedHosts').click();
+  await expect(page.getByTestId('trusted-host-row-10.0.0.8-22')).toBeVisible();
+  await page.locator('.ant-modal-close').click();
+
+  // 删除 prod-copy：最后一个引用移除，自动清理后清单为空
+  const card2 = page.locator('.sidebar [data-testid^="host-card-"]').filter({ hasText: 'prod-copy' });
+  await card2.hover();
+  await card2.getByTestId('host-delete-btn').click();
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-trustedHosts').click();
+  await expect(page.getByTestId('trusted-hosts-empty')).toBeVisible();
+  await expect(page.getByTestId('trusted-host-row-10.0.0.8-22')).toHaveCount(0);
 });

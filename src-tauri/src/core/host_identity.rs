@@ -7,6 +7,7 @@
 //! 不把策略复制到各 capability service。
 
 use crate::errors::app_error::AppError;
+use crate::models::host_identity::TrustedHostInfo;
 use crate::models::session::{HostIdentityChallenge, HostIdentityChallengeKind};
 use crate::storage::trust_store::{TrustRecord, TrustStore};
 use base64::Engine;
@@ -489,6 +490,33 @@ impl HostIdentityService {
         store.remove(host, port)
     }
 
+    /// 列出持久化信任记录（endpoint、算法与 SHA-256 指纹），供 Settings 只读清单展示。
+    ///
+    /// 每条记录按 host 字典序 + port 稳定排序；指纹由后端从完整公钥 blob 计算，
+    /// 前端只消费 typed JSON。存储未初始化（仅测试路径）等价空清单；读取或解析
+    /// 失败以 TrustStoreError 显式返回，绝不伪装成空列表。
+    pub fn list_trusted_hosts(&self) -> Result<Vec<TrustedHostInfo>, AppError> {
+        let store = self
+            .trust_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(store) = store else {
+            return Ok(Vec::new());
+        };
+        store.list().map(|records| {
+            records
+                .into_iter()
+                .map(|record| TrustedHostInfo {
+                    host: record.host,
+                    port: record.port,
+                    algorithm: record.algorithm,
+                    fingerprint: fingerprint_sha256(&record.blob),
+                })
+                .collect()
+        })
+    }
+
     /// 拒绝：唤醒全部等待者（其连接以 HostKeyRejected 失败），返回 challenge 供上层关闭 Session。
     pub fn reject(&self, challenge_id: &str) -> Result<HostIdentityChallenge, AppError> {
         let wait = self.remove_pending(challenge_id)?;
@@ -626,6 +654,7 @@ impl HostIdentityService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::host_identity::TrustedHostInfo;
     use crate::storage::trust_store::{TrustRecord, TrustStore};
     use serde_json::Value;
     use std::fs;
@@ -787,6 +816,80 @@ mod tests {
         assert!(
             service.pending_challenge("session-1").is_none(),
             "fail-closed 不得产生 challenge"
+        );
+    }
+
+    /// list_trusted_hosts 返回 typed DTO：endpoint 字段精确、指纹由后端从公钥 blob 计算。
+    #[test]
+    fn list_trusted_hosts_returns_typed_dto_with_fingerprint() {
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 2222,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+
+        let hosts = service.list_trusted_hosts().unwrap();
+        assert_eq!(
+            hosts,
+            vec![TrustedHostInfo {
+                host: "10.0.0.8".to_string(),
+                port: 2222,
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: fingerprint_sha256(b"blob"),
+            }]
+        );
+        assert_eq!(
+            hosts[0].fingerprint,
+            "SHA256:+iyMxPKBdrvu1Lc231aaNMec03I+nsQvlnS01GrGuLg"
+        );
+    }
+
+    /// 清单按 host 字典序 + port 稳定排序；读取/解析失败以 TrustStoreError 显式返回，
+    /// 绝不伪装成空列表；未初始化（仅测试路径）等价空信任存储。
+    #[test]
+    fn list_trusted_hosts_stable_order_and_store_error_propagation() {
+        let path = temp_trust_path();
+        let store = TrustStore::from_file_path(path.clone());
+        store
+            .upsert(TrustRecord {
+                host: "b.example.com".to_string(),
+                port: 22,
+                algorithm: "ssh-rsa".to_string(),
+                blob: b"blob-b".to_vec(),
+            })
+            .unwrap();
+        store
+            .upsert(TrustRecord {
+                host: "a.example.com".to_string(),
+                port: 2222,
+                algorithm: "ssh-ed25519".to_string(),
+                blob: b"blob-a".to_vec(),
+            })
+            .unwrap();
+        let service = HostIdentityService::with_trust_store(store);
+
+        let hosts = service.list_trusted_hosts().unwrap();
+        assert_eq!(
+            hosts
+                .iter()
+                .map(|info| (info.host.as_str(), info.port))
+                .collect::<Vec<_>>(),
+            vec![("a.example.com", 2222), ("b.example.com", 22)]
+        );
+
+        // 文件损坏：结构化 TrustStoreError，不得伪装成空列表
+        fs::write(&path, "10.0.0.8 ssh-ed25519\n").unwrap();
+        let corrupt = HostIdentityService::with_trust_store_path(path);
+        assert_eq!(
+            corrupt.list_trusted_hosts().unwrap_err().code(),
+            "TrustStoreError"
+        );
+
+        // 未初始化信任存储（仅测试路径）：等价空清单
+        assert_eq!(
+            HostIdentityService::new().list_trusted_hosts().unwrap(),
+            Vec::new()
         );
     }
 
