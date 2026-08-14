@@ -1,9 +1,9 @@
 use crate::core::ssh_transport::{self, SftpTransport};
+use crate::core::transfer_pool::{
+    CheckoutError, TRANSFER_IDLE_TIMEOUT, TransferCheckout, TransferClock, TransferPool,
+};
 #[cfg(test)]
 use crate::core::transfer_pool::{MAX_TRANSFER_CONNECTIONS_PER_SESSION, is_idle_expired};
-use crate::core::transfer_pool::{
-    TRANSFER_IDLE_TIMEOUT, TransferCheckout, TransferClock, TransferPool,
-};
 use crate::errors::app_error::AppError;
 use crate::errors::app_error::AppErrorInfo;
 use crate::models::host::{AuthType, HostConfig};
@@ -22,8 +22,10 @@ use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-/// 全局并发传输上限（跨所有 session 的信号量容量）
-const MAX_CONCURRENT_TRANSFERS: usize = 5;
+/// 全局并发传输上限：所有 Session 合计最多 20 个 Running 传输。
+/// 每个 Session 内部仍有五路连接上限（MAX_TRANSFER_CONNECTIONS_PER_SESSION），
+/// 任务先取得 Session 名额，再竞争全局 permit（tokio 信号量 FIFO 公平）。
+const MAX_CONCURRENT_TRANSFERS: usize = 20;
 
 /// 每个 Session 最多保留的终态任务条数（Done/Failed/Cancelled）；Pending/Running 不计入且永不淘汰
 const MAX_TERMINAL_TASKS_PER_SESSION: usize = 100;
@@ -38,24 +40,45 @@ fn get_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 
-/// 取消令牌，用于通知传输任务退出
+/// 取消令牌，用于通知传输任务退出；异步等待方经 Notify 被立即唤醒，
+/// 使等待全局 permit 的任务也能即时终止。
 #[derive(Clone)]
-pub struct CancelToken(Arc<std::sync::atomic::AtomicBool>);
+pub struct CancelToken {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    notified: Arc<tokio::sync::Notify>,
+}
 
 impl CancelToken {
     /// 创建新的取消令牌
     pub fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        Self {
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notified: Arc::new(tokio::sync::Notify::new()),
+        }
     }
 
-    /// 触发取消
+    /// 触发取消并唤醒所有等待方；重复调用幂等
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notified.notify_one();
     }
 
     /// 检查是否已取消
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 异步等待取消：已取消立即返回，未取消阻塞到 cancel() 触发。
+    /// 循环“检查标志 → 等待唤醒”：notify_one 在无等待者注册时暂存 permit，
+    /// 取消发生在注册窗口内也不会错过唤醒。
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.notified.notified().await;
+        }
     }
 }
 
@@ -225,10 +248,39 @@ struct SftpHandle {
     control: Arc<SftpConnection>,
     /// 传输连接池：上传/下载专用，基础一条按需建立，最多五条
     transfer_pool: Arc<TransferPool>,
-    /// 传输任务取消令牌表
-    cancel_tokens: Mutex<HashMap<String, CancelToken>>,
+    /// 传输任务取消条目表：cancel_task 同时触发取消并把等待者移出传输池 FIFO 队列
+    cancel_tokens: Mutex<HashMap<String, CancelEntry>>,
     /// Session 内任务入队序号：传输名额 FIFO 调度依据
     enqueue_seq: AtomicU64,
+}
+
+/// 活跃任务的取消令牌与 Session 内入队序号：入队序号唯一标识传输池等待队列
+/// 中的等待者，取消时据此精确移除，不扰动其余任务的 FIFO 顺序。
+struct CancelEntry {
+    token: CancelToken,
+    queue_seq: u64,
+}
+
+impl SftpHandle {
+    /// 登记任务取消条目并分配 Session 内入队序号：序号决定传输名额的 FIFO 顺序，
+    /// 也是取消时把等待者移出传输池队列的依据。返回入队序号。
+    fn register_cancel_entry(&self, task_id: String, token: CancelToken) -> u64 {
+        let queue_seq = self.enqueue_seq.fetch_add(1, Ordering::Relaxed);
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id, CancelEntry { token, queue_seq });
+        queue_seq
+    }
+
+    /// 读取任务的取消条目副本（令牌与入队序号），随后立即释放锁。
+    fn cancel_entry(&self, task_id: &str) -> Option<(CancelToken, u64)> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(task_id)
+            .map(|entry| (entry.token.clone(), entry.queue_seq))
+    }
 }
 
 /// File Transfer module，registry 锁不会跨远程 IO seam。
@@ -516,13 +568,8 @@ impl SftpService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(task_id.clone(), task.clone());
-        handle
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(task_id.clone(), cancel_token.clone());
-        // 入队序号决定 Session 内传输名额的 FIFO 顺序
-        let queue_seq = handle.enqueue_seq.fetch_add(1, Ordering::Relaxed);
+        // 入队序号决定 Session 内传输名额的 FIFO 顺序，也是取消时移出队列的依据
+        let queue_seq = handle.register_cancel_entry(task_id.clone(), cancel_token.clone());
 
         self.spawn_transfer_task(
             queue_seq,
@@ -626,13 +673,8 @@ impl SftpService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(task_id.clone(), task.clone());
-        handle
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(task_id.clone(), cancel_token.clone());
-        // 入队序号决定 Session 内传输名额的 FIFO 顺序
-        let queue_seq = handle.enqueue_seq.fetch_add(1, Ordering::Relaxed);
+        // 入队序号决定 Session 内传输名额的 FIFO 顺序，也是取消时移出队列的依据
+        let queue_seq = handle.register_cancel_entry(task_id.clone(), cancel_token.clone());
         self.spawn_transfer_task(
             queue_seq,
             task_id,
@@ -667,13 +709,12 @@ impl SftpService {
             .cloned()
             .collect();
         for handle in handles {
-            if let Some(token) = handle
-                .cancel_tokens
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(task_id)
-            {
+            if let Some((token, queue_seq)) = handle.cancel_entry(task_id) {
+                // 先触发取消令牌：任何阶段的 worker 都能感知；
+                // 再把等待者移出 Session FIFO 队列并唤醒：Pending 任务立即迁移
+                // Cancelled，其余等待者的 FIFO 顺序不受影响
                 token.cancel();
+                handle.transfer_pool.cancel_waiter(queue_seq);
                 return Ok(());
             }
         }
@@ -794,7 +835,7 @@ impl SftpService {
                     .filter(|(task_id, _)| {
                         matches!(tasks.get(*task_id), Some(task) if !is_terminal(&task.status))
                     })
-                    .map(|(task_id, token)| (task_id.clone(), token.clone()))
+                    .map(|(task_id, entry)| (task_id.clone(), entry.token.clone()))
                     .collect()
             };
             for (task_id, token) in active {
@@ -884,19 +925,34 @@ impl SftpService {
             let checkout_result = {
                 let service = service.clone();
                 let session_id = session_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    let handle = service.handle(&session_id)?;
-                    handle.transfer_pool.checkout(queue_seq)
+                tokio::task::spawn_blocking(move || match service.handle(&session_id) {
+                    Ok(handle) => handle.transfer_pool.checkout(queue_seq),
+                    Err(error) => Err(CheckoutError::Connect(error)),
                 })
                 .await
             };
             let checkout = match checkout_result {
                 Ok(Ok(checkout)) => checkout,
-                Ok(Err(error)) => {
-                    // 建连失败或 Session 已关闭：只影响本任务，保留结构化错误。
+                Ok(Err(CheckoutError::Cancelled)) => {
+                    // 排队期间被取消：已移出 Session 队列，Pending → Cancelled 为合法迁移
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Cancelled,
+                        None,
+                    );
+                    return;
+                }
+                Ok(Err(CheckoutError::Closed)) => {
+                    // Session 已关闭：cleanup 已迁移任务并整体移除 registry，
+                    // 迟到 worker 静默终止，不重复发事件
+                    return;
+                }
+                Ok(Err(CheckoutError::Connect(error))) => {
+                    // 建连失败只影响本任务，保留结构化错误。
                     // 状态机只允许 Pending → Running → Failed：先进入 Running 再迁移到
-                    // Failed，保证每步都是合法迁移；Session 已关闭时任务已被 cleanup
-                    // 移除，两次迁移均被拒绝。
+                    // Failed，保证每步都是合法迁移。
                     service.transition_task(
                         &app,
                         &task_id,
@@ -934,10 +990,48 @@ impl SftpService {
                 }
             };
 
-            // ② 再竞争全局并发 permit（跨 Session 上限）
-            let _permit = semaphore.acquire().await.unwrap();
+            // ② 再竞争全局并发 permit（跨 Session 上限，tokio 信号量 FIFO 公平）；
+            //    等待期间被取消则立即归还 Session 名额并迁移 Cancelled，不占住名额
+            let _permit = tokio::select! {
+                permit = semaphore.acquire() => match permit {
+                    // 信号量从不关闭；异常关闭时按结构化失败迁移，不 panic
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        service.release_transfer_connection(&session_id, checkout, true);
+                        service.transition_task(
+                            &app,
+                            &task_id,
+                            &session_id,
+                            SftpTaskStatus::Running,
+                            None,
+                        );
+                        service.transition_task(
+                            &app,
+                            &task_id,
+                            &session_id,
+                            SftpTaskStatus::Failed,
+                            Some(AppErrorInfo::from(AppError::SftpTransferError(
+                                "全局传输信号量已关闭".to_string(),
+                            ))),
+                        );
+                        return;
+                    }
+                },
+                _ = cancel_token.cancelled() => {
+                    service.release_transfer_connection(&session_id, checkout, true);
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Cancelled,
+                        None,
+                    );
+                    return;
+                }
+            };
 
-            // ③ 等待期间被取消：归还连接并进入 Cancelled；若已由 cleanup 迁移则被拒绝
+            // ③ select 随机分支可能已错过并发取消：迁移 Running 前再确认一次；
+            //    若已由 cleanup 迁移则被拒绝
             if cancel_token.is_cancelled() {
                 service.release_transfer_connection(&session_id, checkout, true);
                 service.transition_task(
@@ -2924,6 +3018,748 @@ mod tests {
         }
     }
 
+    // ─── 跨 Session 公平调度 contract ───────────────────────────────────────
+
+    /// 构造 host 字段可区分的测试主机：connector 按 host 名把传输门分桶到各 Session，
+    /// 供多 Session contract 测试按 Session 精确控制完成时序。
+    fn make_named_host(name: &str) -> HostConfig {
+        let mut host = make_host();
+        host.host = name.to_string();
+        host
+    }
+
+    /// 全局 20 条边界 contract：5 个 Session 各 5 路（合计 25 个任务），
+    /// 跨 Session 最多 20 个 Running，其余 5 个保持 Pending 等待全局名额；
+    /// 25 个任务各持一条 Session 连接（等待全局名额不提前占用 permit）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_cap_limits_twenty_running_transfers_across_sessions() {
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gates: Arc<std::sync::Mutex<Vec<Arc<Gate>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let live_for_connector = live.clone();
+        let gates_for_connector = gates.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => Ok(empty_sftp()),
+            SftpRole::Transfer => {
+                let gate = Gate::new();
+                gates_for_connector.lock().unwrap().push(gate.clone());
+                Ok(counted_sftp(
+                    gated_in_memory_sftp(&[], gate, false),
+                    live_for_connector.clone(),
+                ))
+            }
+        });
+
+        let mut tasks = Vec::new();
+        let mut local_paths = Vec::new();
+        for session_index in 0..5 {
+            let session_id = format!("session-{}", session_index);
+            service.register_session(session_id.clone(), make_host());
+            for file_index in 0..5 {
+                let path = std::env::temp_dir().join(format!(
+                    "titan-global-{}-{}-{}.bin",
+                    Uuid::new_v4(),
+                    session_index,
+                    file_index
+                ));
+                std::fs::write(&path, b"data").unwrap();
+                let task = service
+                    .enqueue_upload(
+                        session_id.clone(),
+                        path.to_string_lossy().to_string(),
+                        "/tmp".to_string(),
+                        ConflictStrategy::Reject,
+                        app.handle().clone(),
+                    )
+                    .expect("上传应正常入队");
+                tasks.push(task);
+                local_paths.push(path);
+            }
+        }
+
+        // 20 个 Running + 5 个 Pending：全局边界与 Session 内五路边界同时成立
+        wait_until(
+            || {
+                let snapshot: Vec<TransferTask> = (0..5)
+                    .flat_map(|index| service.task_snapshot(&format!("session-{}", index)))
+                    .collect();
+                let running = snapshot
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Running)
+                    .count();
+                let pending = snapshot
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Pending)
+                    .count();
+                (running == 20 && pending == 5).then_some(())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("全局上限下应恰好 20 个 Running 与 5 个 Pending");
+        wait_until(
+            || (live.load(Ordering::SeqCst) == 25).then_some(()),
+            Duration::from_secs(5),
+        )
+        .expect("25 个任务各持一条 Session 传输连接，等待全局名额不得提前占用 permit");
+
+        let gates_snapshot = gates.lock().unwrap().clone();
+        for gate in &gates_snapshot {
+            gate.open();
+        }
+        for task in &tasks {
+            assert_eq!(
+                wait_for_terminal(&service, &task.task_id),
+                SftpTaskStatus::Done
+            );
+        }
+        for path in &local_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// 取消 Session 队列中的 Pending 任务 contract：立即移出 FIFO 队列并迁移
+    /// Cancelled（不等待任何名额释放），后续等待任务保持原 FIFO 顺序启动。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_pending_task_removes_from_queue_and_preserves_fifo() {
+        use crate::core::ssh_transport::test_support::{
+            Gate, gated_in_memory_sftp, in_memory_sftp_transport,
+        };
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let gates: Arc<std::sync::Mutex<Vec<Arc<Gate>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let running_events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let running_events_for_listener = running_events.clone();
+        {
+            use tauri::Listener;
+            app.listen("sftp:task_status", move |event| {
+                let payload: SftpTaskStatusEvent =
+                    serde_json::from_str(event.payload()).expect("payload 应为结构化状态事件");
+                if payload.status == SftpTaskStatus::Running {
+                    running_events_for_listener
+                        .lock()
+                        .unwrap()
+                        .push(payload.task_id);
+                }
+            });
+        }
+        let gates_for_connector = gates.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => Ok(memory_sftp(Vec::new())),
+            SftpRole::Transfer => {
+                let gate = Gate::new();
+                gates_for_connector.lock().unwrap().push(gate.clone());
+                Ok(in_memory_sftp_transport(&gated_in_memory_sftp(
+                    &[],
+                    gate,
+                    false,
+                )))
+            }
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        // 八个任务：前五个阻塞占满五路，后三个按 Session 内 FIFO 等待
+        let mut local_paths = Vec::new();
+        for index in 0..8 {
+            let path = std::env::temp_dir().join(format!(
+                "titan-cancel-queue-{}-{}.bin",
+                Uuid::new_v4(),
+                index
+            ));
+            std::fs::write(&path, b"data").unwrap();
+            local_paths.push(path);
+        }
+        let tasks: Vec<TransferTask> = local_paths
+            .iter()
+            .map(|path| {
+                service
+                    .enqueue_upload(
+                        "session-1".to_string(),
+                        path.to_string_lossy().to_string(),
+                        "/tmp".to_string(),
+                        ConflictStrategy::Reject,
+                        app.handle().clone(),
+                    )
+                    .expect("上传应正常入队")
+            })
+            .collect();
+        let parked_ids = wait_until(
+            || {
+                let snapshot = service.task_snapshot("session-1");
+                let running = snapshot
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Running)
+                    .count();
+                let pending: Vec<String> = snapshot
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Pending)
+                    .map(|task| task.task_id.clone())
+                    .collect();
+                (running == 5 && pending.len() == 3).then_some(pending)
+            },
+            Duration::from_secs(5),
+        )
+        .expect("五路 Running、三路 Pending");
+        let mut pending_in_order = parked_ids.clone();
+        pending_in_order.sort_by_key(|task_id| {
+            tasks
+                .iter()
+                .position(|task| &task.task_id == task_id)
+                .expect("等待任务必须来自本测试的入队")
+        });
+
+        // 取消队首等待任务：不得释放任何运行中的名额，任务立即迁移 Cancelled
+        let cancelled_id = pending_in_order[0].clone();
+        service
+            .cancel_task(&cancelled_id)
+            .expect("取消 Pending 任务应成功");
+        assert_eq!(
+            wait_for_terminal(&service, &cancelled_id),
+            SftpTaskStatus::Cancelled,
+            "取消的 Pending 任务应立即迁移到 Cancelled，不等待名额释放"
+        );
+        let snapshot = service.task_snapshot("session-1");
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|task| task.status == SftpTaskStatus::Running)
+                .count(),
+            5,
+            "取消不得影响正在运行的五路传输"
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|task| task.status == SftpTaskStatus::Pending)
+                .count(),
+            2,
+            "队列只剩两个等待任务"
+        );
+
+        // 释放一条连接：剩余等待任务按原 FIFO（跳过已取消任务）依次启动并级联完成
+        let gates_snapshot = gates.lock().unwrap().clone();
+        gates_snapshot[0].open();
+        for task_id in &pending_in_order[1..] {
+            assert_eq!(
+                wait_for_terminal(&service, task_id),
+                SftpTaskStatus::Done,
+                "剩余等待任务应级联完成"
+            );
+        }
+        let observed_order: Vec<usize> = {
+            let events = running_events.lock().unwrap();
+            pending_in_order[1..]
+                .iter()
+                .map(|task_id| {
+                    events
+                        .iter()
+                        .position(|event_id| event_id == task_id)
+                        .expect("等待任务应有 Running 事件")
+                })
+                .collect()
+        };
+        assert!(
+            observed_order[0] < observed_order[1],
+            "取消不影响后续 FIFO 顺序，实际 Running 顺序: {:?}",
+            observed_order
+        );
+
+        for gate in gates_snapshot.iter().skip(1) {
+            gate.open();
+        }
+        for task in &tasks {
+            if task.task_id != cancelled_id {
+                assert_eq!(
+                    wait_for_terminal(&service, &task.task_id),
+                    SftpTaskStatus::Done
+                );
+            }
+        }
+        for path in &local_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// 取消正在等待全局 permit 的 Pending 任务 contract：立即迁移 Cancelled 并
+    /// 归还 Session 传输连接，无需等待任何 permit 释放；其他 Session 的传输不受影响。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_task_waiting_for_global_permit_releases_session_slot() {
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gates: Arc<std::sync::Mutex<Vec<Arc<Gate>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let live_for_connector = live.clone();
+        let connects_for_connector = connects.clone();
+        let gates_for_connector = gates.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => Ok(empty_sftp()),
+            SftpRole::Transfer => {
+                connects_for_connector.fetch_add(1, Ordering::SeqCst);
+                let gate = Gate::new();
+                gates_for_connector.lock().unwrap().push(gate.clone());
+                Ok(counted_sftp(
+                    gated_in_memory_sftp(&[], gate, false),
+                    live_for_connector.clone(),
+                ))
+            }
+        });
+
+        // 四个 Session 各五路，占满全局 20 个 permit
+        let mut tasks = Vec::new();
+        let mut local_paths = Vec::new();
+        for session_index in 0..4 {
+            let session_id = format!("session-{}", session_index);
+            service.register_session(session_id.clone(), make_host());
+            for file_index in 0..5 {
+                let path = std::env::temp_dir().join(format!(
+                    "titan-cancel-permit-{}-{}-{}.bin",
+                    Uuid::new_v4(),
+                    session_index,
+                    file_index
+                ));
+                std::fs::write(&path, b"data").unwrap();
+                let task = service
+                    .enqueue_upload(
+                        session_id.clone(),
+                        path.to_string_lossy().to_string(),
+                        "/tmp".to_string(),
+                        ConflictStrategy::Reject,
+                        app.handle().clone(),
+                    )
+                    .expect("上传应正常入队");
+                tasks.push(task);
+                local_paths.push(path);
+            }
+        }
+        wait_until(
+            || {
+                let snapshot: Vec<TransferTask> = (0..4)
+                    .flat_map(|index| service.task_snapshot(&format!("session-{}", index)))
+                    .collect();
+                let running = snapshot
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Running)
+                    .count();
+                (running == 20).then_some(())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("四个 Session 五路应占满全局 20 个名额");
+
+        // 第五个 Session 的任务取得 Session 名额后等待全局 permit，保持 Pending
+        service.register_session("session-4".to_string(), make_host());
+        let e_path =
+            std::env::temp_dir().join(format!("titan-cancel-permit-e-{}.bin", Uuid::new_v4()));
+        std::fs::write(&e_path, b"data").unwrap();
+        let e_task = service
+            .enqueue_upload(
+                "session-4".to_string(),
+                e_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("上传应正常入队");
+        wait_until(
+            || {
+                let snapshot = service.task_snapshot("session-4");
+                (snapshot.len() == 1 && snapshot[0].status == SftpTaskStatus::Pending).then_some(())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("等待全局 permit 的任务应保持 Pending");
+        wait_until(
+            || (live.load(Ordering::SeqCst) == 21).then_some(()),
+            Duration::from_secs(5),
+        )
+        .expect("等待全局 permit 的任务仍应持有一条 Session 传输连接");
+
+        // 取消：立即迁移 Cancelled 并归还连接，不得等待任何 permit 释放
+        service
+            .cancel_task(&e_task.task_id)
+            .expect("取消等待全局 permit 的任务应成功");
+        assert_eq!(
+            wait_for_terminal(&service, &e_task.task_id),
+            SftpTaskStatus::Cancelled
+        );
+        let snapshot: Vec<TransferTask> = (0..4)
+            .flat_map(|index| service.task_snapshot(&format!("session-{}", index)))
+            .collect();
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|task| task.status == SftpTaskStatus::Running)
+                .count(),
+            20,
+            "取消不得影响其他 Session 的传输"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            21,
+            "20 个 Running 与 E 各建一条传输连接"
+        );
+
+        // 放行一路运行传输释放一个 permit；session-4 的后续任务复用取消归还的
+        // 空闲连接完成，不得新建传输连接
+        let gates_snapshot = gates.lock().unwrap().clone();
+        gates_snapshot[0].open();
+        let e2_path =
+            std::env::temp_dir().join(format!("titan-cancel-permit-e2-{}.bin", Uuid::new_v4()));
+        std::fs::write(&e2_path, b"data").unwrap();
+        let e2_task = service
+            .enqueue_upload(
+                "session-4".to_string(),
+                e2_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                ConflictStrategy::Reject,
+                app.handle().clone(),
+            )
+            .expect("后续上传应正常入队");
+        gates_snapshot[20].open();
+        assert_eq!(
+            wait_for_terminal(&service, &e2_task.task_id),
+            SftpTaskStatus::Done,
+            "后续任务应复用取消归还的连接完成"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            21,
+            "后续任务不得新建传输连接"
+        );
+
+        for gate in gates_snapshot.iter().skip(1) {
+            gate.open();
+        }
+        for task in &tasks {
+            assert_eq!(
+                wait_for_terminal(&service, &task.task_id),
+                SftpTaskStatus::Done
+            );
+        }
+        for path in &local_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(&e_path);
+        let _ = std::fs::remove_file(&e2_path);
+    }
+
+    /// 无饥饿 contract：积压 Session 中等待 Session 名额的任务不得占用全局 permit；
+    /// 释放出的 permit 必须交给已持有 Session 名额的任务，而不是积压任务。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_backlog_does_not_grab_global_permit_ahead_of_ready_task() {
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
+        use std::collections::HashMap;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gates_by_session: Arc<std::sync::Mutex<HashMap<String, Vec<Arc<Gate>>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let live_for_connector = live.clone();
+        let gates_for_connector = gates_by_session.clone();
+        let service = SftpService::with_connector(move |host, role| match role {
+            SftpRole::Control => Ok(empty_sftp()),
+            SftpRole::Transfer => {
+                let gate = Gate::new();
+                gates_for_connector
+                    .lock()
+                    .unwrap()
+                    .entry(host.host.clone())
+                    .or_default()
+                    .push(gate.clone());
+                Ok(counted_sftp(
+                    gated_in_memory_sftp(&[], gate, false),
+                    live_for_connector.clone(),
+                ))
+            }
+        });
+
+        // A 六路（含一路积压），B/C/D 各五路：合计 20 个 Running 占满全局名额
+        let mut tasks = Vec::new();
+        let mut local_paths = Vec::new();
+        let mut enqueue = |session_id: &str, index: usize| {
+            let path = std::env::temp_dir().join(format!(
+                "titan-starve-{}-{}-{}.bin",
+                Uuid::new_v4(),
+                session_id,
+                index
+            ));
+            std::fs::write(&path, b"data").unwrap();
+            let task = service
+                .enqueue_upload(
+                    session_id.to_string(),
+                    path.to_string_lossy().to_string(),
+                    "/tmp".to_string(),
+                    ConflictStrategy::Reject,
+                    app.handle().clone(),
+                )
+                .expect("上传应正常入队");
+            local_paths.push(path);
+            tasks.push(task);
+        };
+        service.register_session("session-a".to_string(), make_named_host("session-a"));
+        for index in 0..6 {
+            enqueue("session-a", index);
+        }
+        for session_id in ["session-b", "session-c", "session-d"] {
+            service.register_session(session_id.to_string(), make_named_host(session_id));
+            for index in 0..5 {
+                enqueue(session_id, index);
+            }
+        }
+
+        // 第五个 Session 的任务持有 Session 名额，等待全局 permit
+        service.register_session("session-e".to_string(), make_named_host("session-e"));
+        enqueue("session-e", 0);
+
+        // A 的积压任务（第 6 路）保持 Pending；E 的任务持名额等 permit 也保持 Pending
+        let backlog_id = wait_until(
+            || {
+                let snapshot_a = service.task_snapshot("session-a");
+                let running_a = snapshot_a
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Running)
+                    .count();
+                let pending_a: Vec<String> = snapshot_a
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Pending)
+                    .map(|task| task.task_id.clone())
+                    .collect();
+                (running_a == 5 && pending_a.len() == 1).then_some(pending_a.into_iter().next())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("A 应有五路 Running、一路积压")
+        .expect("应存在积压任务");
+
+        // 放行 B 的一路传输：释放的 permit 必须交给 E（已持有 Session 名额），
+        // 而不是仍在等待 Session 名额的 A 积压任务
+        {
+            let gates = gates_by_session.lock().unwrap();
+            gates["session-b"][0].open();
+        }
+        let e_task_id = service.task_snapshot("session-e")[0].task_id.clone();
+        wait_until(
+            || {
+                let status = service
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(&e_task_id)
+                    .map(|task| task.status.clone());
+                (status == Some(SftpTaskStatus::Running)).then_some(())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("释放的 permit 应交给已持有 Session 名额的任务");
+        let backlog_status = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&backlog_id)
+            .map(|task| task.status.clone());
+        assert_eq!(
+            backlog_status,
+            Some(SftpTaskStatus::Pending),
+            "A 的积压任务不得抢占全局 permit"
+        );
+
+        // 放行全部：积压任务在 A 放行后依次取得名额并完成
+        let gates_snapshot: Vec<Arc<Gate>> = {
+            let gates = gates_by_session.lock().unwrap();
+            gates.values().flatten().cloned().collect()
+        };
+        for gate in &gates_snapshot {
+            gate.open();
+        }
+        for task in &tasks {
+            assert_eq!(
+                wait_for_terminal(&service, &task.task_id),
+                SftpTaskStatus::Done
+            );
+        }
+        for path in &local_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Session 关闭 contract（多 Session）：关闭释放 A 的全部 Session 与全局名额，
+    /// 积压任务随 registry 整体移除且迟到 worker 不得重新启动；
+    /// 释放的全局 permit 供其他 Session 已持有 Session 名额的任务继续运行。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_close_releases_global_permits_and_late_tasks_do_not_restart() {
+        use crate::core::ssh_transport::test_support::{Gate, counted_sftp, gated_in_memory_sftp};
+        use std::collections::HashMap;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gates_by_session: Arc<std::sync::Mutex<HashMap<String, Vec<Arc<Gate>>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let live_for_connector = live.clone();
+        let gates_for_connector = gates_by_session.clone();
+        let service = SftpService::with_connector(move |host, role| match role {
+            SftpRole::Control => Ok(empty_sftp()),
+            SftpRole::Transfer => {
+                let gate = Gate::new();
+                gates_for_connector
+                    .lock()
+                    .unwrap()
+                    .entry(host.host.clone())
+                    .or_default()
+                    .push(gate.clone());
+                Ok(counted_sftp(
+                    gated_in_memory_sftp(&[], gate, false),
+                    live_for_connector.clone(),
+                ))
+            }
+        });
+
+        // A 六路（含一路积压），B/C/D 各五路：20 个 Running 占满全局名额
+        let mut tasks = Vec::new();
+        let mut local_paths = Vec::new();
+        let mut enqueue = |session_id: &str, index: usize| {
+            let path = std::env::temp_dir().join(format!(
+                "titan-close-global-{}-{}-{}.bin",
+                Uuid::new_v4(),
+                session_id,
+                index
+            ));
+            std::fs::write(&path, b"data").unwrap();
+            let task = service
+                .enqueue_upload(
+                    session_id.to_string(),
+                    path.to_string_lossy().to_string(),
+                    "/tmp".to_string(),
+                    ConflictStrategy::Reject,
+                    app.handle().clone(),
+                )
+                .expect("上传应正常入队");
+            local_paths.push(path);
+            tasks.push(task);
+        };
+        service.register_session("session-a".to_string(), make_named_host("session-a"));
+        for index in 0..6 {
+            enqueue("session-a", index);
+        }
+        for session_id in ["session-b", "session-c", "session-d"] {
+            service.register_session(session_id.to_string(), make_named_host(session_id));
+            for index in 0..5 {
+                enqueue(session_id, index);
+            }
+        }
+        service.register_session("session-e".to_string(), make_named_host("session-e"));
+        enqueue("session-e", 0);
+
+        // 稳定状态：A 五路 Running 一路积压，E 持 Session 名额等待全局 permit
+        wait_until(
+            || {
+                let snapshot_a = service.task_snapshot("session-a");
+                let running_a = snapshot_a
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Running)
+                    .count();
+                let pending_a = snapshot_a
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Pending)
+                    .count();
+                let snapshot_e = service.task_snapshot("session-e");
+                let pending_e = snapshot_e
+                    .iter()
+                    .filter(|task| task.status == SftpTaskStatus::Pending)
+                    .count();
+                (running_a == 5 && pending_a == 1 && pending_e == 1).then_some(())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("关闭前应稳定在 A 五路运行一路积压、E 等待全局 permit");
+        wait_until(
+            || (live.load(Ordering::SeqCst) == 21).then_some(()),
+            Duration::from_secs(5),
+        )
+        .expect("20 个 Running 与持名额等待的 E 各持一条连接，A 积压任务无连接");
+
+        // 关闭 A：任务整体移除，迟到 worker 不得重新启动
+        service.cleanup_session("session-a", &app.handle().clone());
+        assert!(!service.has_session("session-a"));
+        assert!(
+            service.task_snapshot("session-a").is_empty(),
+            "关闭后 A 的任务应立即移除"
+        );
+
+        // 放行 A 的 busy 传输：归还连接（池已关闭直接释放）并释放全局 permit
+        {
+            let gates = gates_by_session.lock().unwrap();
+            for gate in &gates["session-a"] {
+                gate.open();
+            }
+        }
+        wait_until(
+            || (live.load(Ordering::SeqCst) == 16).then_some(()),
+            Duration::from_secs(5),
+        )
+        .expect("关闭后 A 的传输连接应全部释放");
+
+        // 释放出的全局 permit 交给 E；E 运行完成后其余传输继续完成
+        let e_task_id = service.task_snapshot("session-e")[0].task_id.clone();
+        wait_until(
+            || {
+                let status = service
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(&e_task_id)
+                    .map(|task| task.status.clone());
+                (status == Some(SftpTaskStatus::Running)).then_some(())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("A 释放的全局 permit 应交给等待中的 E");
+
+        let gates_snapshot: Vec<Arc<Gate>> = {
+            let gates = gates_by_session.lock().unwrap();
+            gates.values().flatten().cloned().collect()
+        };
+        for gate in &gates_snapshot {
+            gate.open();
+        }
+        for task in &tasks {
+            if task.session_id != "session-a" {
+                assert_eq!(
+                    wait_for_terminal(&service, &task.task_id),
+                    SftpTaskStatus::Done
+                );
+            }
+        }
+        assert!(
+            service.task_snapshot("session-a").is_empty(),
+            "迟到 worker 不得重新启动已关闭 Session 的任务"
+        );
+
+        // 关闭其余 Session：各池释放全部空闲连接
+        for session_id in ["session-b", "session-c", "session-d", "session-e"] {
+            service.cleanup_session(session_id, &app.handle().clone());
+        }
+        wait_until(
+            || (live.load(Ordering::SeqCst) == 0).then_some(()),
+            Duration::from_secs(5),
+        )
+        .expect("全部 Session 关闭后传输连接应全部释放");
+        for path in &local_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// 传输连接池不变量：每 Session 最多 5 条，空闲回收阈值 60 秒；
     /// “基础保留一条”由回收行为 contract（回收后恰好剩一条连接）覆盖。
     #[test]
@@ -3006,12 +3842,12 @@ mod tests {
 
     // ─── 并发控制测试 ────────────────────────────────────────────────────────
 
-    /// 验证全局 Semaphore 容量为 5（跨所有 session 的并发上限）
+    /// 验证全局 Semaphore 容量为 20（所有 session 合计的 Running 传输上限）
     /// 全局信号量会被并行测试抢占，故断言"可用 permits 不超过容量"这一不变量。
     #[test]
-    fn semaphore_has_five_permits() {
+    fn semaphore_has_twenty_permits() {
         let sem = get_semaphore();
-        assert_eq!(MAX_CONCURRENT_TRANSFERS, 5);
+        assert_eq!(MAX_CONCURRENT_TRANSFERS, 20);
         assert!(sem.available_permits() <= MAX_CONCURRENT_TRANSFERS);
     }
 
@@ -3105,7 +3941,13 @@ mod tests {
             .cancel_tokens
             .lock()
             .unwrap()
-            .insert(task_id.clone(), cancel_token);
+            .insert(
+                task_id.clone(),
+                CancelEntry {
+                    token: cancel_token,
+                    queue_seq: 0,
+                },
+            );
 
         service.tasks.lock().unwrap().insert(
             task_id.clone(),
@@ -3151,7 +3993,13 @@ mod tests {
             .cancel_tokens
             .lock()
             .unwrap()
-            .insert(task_id.clone(), cancel_token);
+            .insert(
+                task_id.clone(),
+                CancelEntry {
+                    token: cancel_token,
+                    queue_seq: 0,
+                },
+            );
 
         service.tasks.lock().unwrap().insert(
             task_id.clone(),
@@ -3195,7 +4043,13 @@ mod tests {
             .cancel_tokens
             .lock()
             .unwrap()
-            .insert(task_id.clone(), cancel_token);
+            .insert(
+                task_id.clone(),
+                CancelEntry {
+                    token: cancel_token,
+                    queue_seq: 0,
+                },
+            );
 
         assert!(
             service.cancel_task(&task_id).is_ok(),
@@ -3286,7 +4140,13 @@ mod tests {
             .cancel_tokens
             .lock()
             .unwrap()
-            .insert(task_id.to_string(), token.clone());
+            .insert(
+                task_id.to_string(),
+                CancelEntry {
+                    token: token.clone(),
+                    queue_seq: 0,
+                },
+            );
         service.tasks.lock().unwrap().insert(
             task_id.to_string(),
             make_task("session-1", task_id, status, 0),

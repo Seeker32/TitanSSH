@@ -1,5 +1,6 @@
 //! Session 传输连接池：基础一条按需建立，按需扩展到最多五路真实并发；
-//! 额外连接空闲超时回收，等待 checkout 的任务按 Session 内 FIFO 排队。
+//! 额外连接空闲超时回收，等待 checkout 的任务按 Session 内 FIFO 排队，
+//! 排队中的等待者可被 cancel_waiter 按入队序号移除并唤醒（返回 Cancelled）。
 //!
 //! 本模块只承载连接池的调度与回收逻辑：任务状态机、事件与安全发布仍属于
 //! sftp_service，池不接触任务 registry 与传输语义。
@@ -9,7 +10,7 @@ use crate::core::ssh_transport::SftpTransport;
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -115,7 +116,21 @@ struct Waiter {
 /// 单个等待者的唤醒标志与条件变量。
 struct WaiterWake {
     signaled: Mutex<bool>,
+    /// 被 cancel_waiter 从队列移除并唤醒后置位：checkout 据此返回 Cancelled
+    cancelled: AtomicBool,
     cond: Condvar,
+}
+
+/// checkout 失败原因：区分“Session 关闭 / 等待中被取消”（任务自行终态）
+/// 与具体连接错误，供上层按不同路径迁移任务状态。
+#[derive(Debug)]
+pub(crate) enum CheckoutError {
+    /// Session 已关闭：池不再交付任何连接，任务应静默终止
+    Closed,
+    /// 排队等待期间被取消：任务直接迁移到 Cancelled
+    Cancelled,
+    /// 建连失败等具体应用错误：任务保留结构化错误
+    Connect(AppError),
 }
 
 /// 从池中 checkout 出的传输连接；checkin 时归还或淘汰。
@@ -150,9 +165,11 @@ impl TransferPool {
 
     /// 获取一条传输连接：优先复用空闲连接（基础连接先取），名额未满时按需建连，
     /// 名额已满时按 Session 内 FIFO 排队等待释放。阻塞语义，只在 worker 阻塞线程调用。
-    pub(crate) fn checkout(&self, queue_seq: u64) -> Result<TransferCheckout, AppError> {
+    /// 排队期间被 cancel_waiter 取消时返回 CheckoutError::Cancelled，不再占用名额。
+    pub(crate) fn checkout(&self, queue_seq: u64) -> Result<TransferCheckout, CheckoutError> {
         let wake = Arc::new(WaiterWake {
             signaled: Mutex::new(false),
+            cancelled: AtomicBool::new(false),
             cond: Condvar::new(),
         });
         // 首次进入视为新到达：必须排在现有等待者之后；被唤醒重入时直接取名额
@@ -163,7 +180,7 @@ impl TransferPool {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.closed {
-                return Err(AppError::SftpChannelError("session 已关闭".to_string()));
+                return Err(CheckoutError::Closed);
             }
             // 每次进入先回收已空闲超时的额外连接
             let now = self.clock.now();
@@ -178,20 +195,22 @@ impl TransferPool {
                 });
                 drop(state);
                 wait_for_wakeup(&wake);
+                if wake.cancelled.load(Ordering::Relaxed) {
+                    // 排队期间被取消：已从队列移除，立即返回不再取名额
+                    return Err(CheckoutError::Cancelled);
+                }
                 first_attempt = false;
                 continue;
             }
 
             // 优先复用空闲连接：基础连接（最小序号）先被取出
             if let Some(seq) = idle_min_seq(&state) {
-                let slot = state
-                    .connections
-                    .get_mut(&seq)
-                    .ok_or_else(|| AppError::SftpChannelError("传输连接槽丢失".to_string()))?;
-                let transport = slot
-                    .transport
-                    .take()
-                    .ok_or_else(|| AppError::SftpChannelError("传输连接槽为空".to_string()))?;
+                let slot = state.connections.get_mut(&seq).ok_or_else(|| {
+                    CheckoutError::Connect(AppError::SftpChannelError("传输连接槽丢失".to_string()))
+                })?;
+                let transport = slot.transport.take().ok_or_else(|| {
+                    CheckoutError::Connect(AppError::SftpChannelError("传输连接槽为空".to_string()))
+                })?;
                 return Ok(TransferCheckout { seq, transport });
             }
 
@@ -216,12 +235,32 @@ impl TransferPool {
             });
             drop(state);
             wait_for_wakeup(&wake);
+            if wake.cancelled.load(Ordering::Relaxed) {
+                // 排队期间被取消：已从队列移除，立即返回不再取名额
+                return Err(CheckoutError::Cancelled);
+            }
             first_attempt = false;
         }
     }
 
+    /// 取消指定入队序号的等待者：从 FIFO 队列移除并唤醒，令其 checkout 返回
+    /// CheckoutError::Cancelled。任务已取得连接（不在队列中）时为 no-op，
+    /// 该任务经取消令牌在后续阶段自行终止。
+    pub(crate) fn cancel_waiter(&self, queue_seq: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(index) = state.waiters.iter().position(|w| w.queue_seq == queue_seq) else {
+            return;
+        };
+        let waiter = state.waiters.remove(index);
+        waiter.wake.cancelled.store(true, Ordering::Relaxed);
+        signal_waiter(&waiter.wake);
+    }
+
     /// 建连并交付 checkout；建连失败只影响本次 checkout，唤醒队首等待者重试。
-    fn create_connection(&self, seq: u64) -> Result<TransferCheckout, AppError> {
+    fn create_connection(&self, seq: u64) -> Result<TransferCheckout, CheckoutError> {
         let result = (self.connector)(&self.host, SftpRole::Transfer);
         let mut state = self
             .state
@@ -231,7 +270,7 @@ impl TransferPool {
             // 迟到建连结果：Session 已关闭，立即释放
             state.connections.remove(&seq);
             drop(state);
-            return Err(AppError::SftpChannelError("session 已关闭".to_string()));
+            return Err(CheckoutError::Closed);
         }
         match result {
             Ok(transport) => Ok(TransferCheckout {
@@ -242,7 +281,7 @@ impl TransferPool {
                 // 建连失败只影响本任务：释放预留名额并唤醒下一位等待者重试
                 state.connections.remove(&seq);
                 self.wake_next_waiter(&mut state);
-                Err(error)
+                Err(CheckoutError::Connect(error))
             }
         }
     }
