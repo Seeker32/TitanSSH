@@ -168,6 +168,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.HostKeyChallengeNotFound': 'Host identity challenge not found',
   'error.HostKeyVerificationCancelled': 'Host identity verification cancelled',
   'error.HostKeySaveFailed': 'Failed to save host trust',
+  'error.HostTrustCleanupFailed': 'Failed to clean up host trust record',
   'error.TrustStoreError': 'Trust store unavailable',
   'error.Unknown': 'Unknown error',
 };

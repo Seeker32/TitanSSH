@@ -1,8 +1,9 @@
+use crate::core::host_identity::HostIdentityService;
 use crate::errors::app_error::AppError;
 use crate::models::host::{AuthType, HostConfig, SaveHostRequest};
 use crate::storage::host_store::HostStore;
 use crate::storage::secure_store;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 /// 凭据存储 adapter seam:HostConfig 持久化 module 只依赖此 trait 访问 OS 安全存储
 ///
@@ -16,7 +17,7 @@ pub trait CredentialStore {
     fn delete(&self, key: &str) -> Result<(), AppError>;
 }
 
-/// 真实凭据存储:包装 OS secure storage
+/// 真实凭据存储：包装 OS secure storage
 pub struct SecureCredentialStore;
 
 impl CredentialStore for SecureCredentialStore {
@@ -29,37 +30,75 @@ impl CredentialStore for SecureCredentialStore {
     }
 }
 
+/// 信任记录清理 adapter seam：HostConfig 生命周期管理只依赖此 trait 移除
+/// endpoint 的持久化信任记录。
+///
+/// 真实实现包装 HostIdentityService（持久化信任的单一权威，与其共享同一
+/// TrustStore 实例，避免第二个实例的独立缓存破坏读写一致性）；
+/// 内存实现仅用于测试，可观察调用并注入失败。
+pub trait TrustRecordCleanup {
+    /// 移除精确 endpoint 的信任记录；endpoint 无记录时幂等成功。
+    /// 失败时上层以 HostTrustCleanupFailed 显式上报管理动作未完成。
+    fn forget_endpoint(&self, host: &str, port: u16) -> Result<(), AppError>;
+}
+
+/// 真实信任记录清理：委托 HostIdentityService 移除 endpoint 的持久化信任记录。
+pub struct IdentityTrustCleanup {
+    identity_service: HostIdentityService,
+}
+
+impl TrustRecordCleanup for IdentityTrustCleanup {
+    /// 委托 HostIdentityService 移除精确 endpoint 的持久化信任记录；
+    /// 无记录时幂等成功，写入失败时透传结构化错误。
+    fn forget_endpoint(&self, host: &str, port: u16) -> Result<(), AppError> {
+        self.identity_service.forget_endpoint(host, port)
+    }
+}
+
 /// HostConfig 持久化 deep module
 ///
-/// 拥有主机配置保存/删除的完整业务流程:请求校验、凭据写入与引用解析、
-/// auth type 切换的陈旧凭据清理,以及失败补偿。hosts.json(HostStore)与
-/// OS 安全存储(CredentialStore)是内部 adapter,不向 command 层泄漏。
+/// 拥有主机配置保存/删除的完整业务流程：请求校验、凭据写入与引用解析、
+/// auth type 切换的陈旧凭据清理、endpoint 变更后的信任记录生命周期清理，
+/// 以及失败补偿。hosts.json（HostStore）、OS 安全存储（CredentialStore）与
+/// 信任记录清理（TrustRecordCleanup）是内部 adapter，不向 command 层泄漏。
 pub struct HostConfigService {
     host_store: HostStore,
     credential_store: Box<dyn CredentialStore>,
+    trust_cleanup: Box<dyn TrustRecordCleanup>,
 }
 
 impl HostConfigService {
-    /// 生产构造:从 AppHandle 内建文件存储与真实凭据存储
+    /// 生产构造：从 AppHandle 内建文件存储、真实凭据存储与信任记录清理
+    ///
+    /// 信任清理复用应用级 HostIdentityService（与连接校验共享同一 TrustStore
+    /// 实例），保证清理读写的缓存一致性。
     ///
     /// # 参数
-    /// - `app`: Tauri 应用句柄,用于解析 hosts.json 所在的应用数据目录
+    /// - `app`: Tauri 应用句柄，用于解析 hosts.json 所在的应用数据目录与
+    ///   获取受管 HostIdentityService 状态
     ///
     /// # 副作用
-    /// 解析并创建应用数据目录;失败返回 StorageError
+    /// 解析并创建应用数据目录；失败返回 StorageError
     pub fn new(app: &AppHandle) -> Result<Self, AppError> {
+        let identity_service = app.state::<HostIdentityService>().inner().clone();
         Ok(Self {
             host_store: HostStore::new(app)?,
             credential_store: Box::new(SecureCredentialStore),
+            trust_cleanup: Box::new(IdentityTrustCleanup { identity_service }),
         })
     }
 
-    /// 测试构造:注入文件存储与凭据存储,覆盖成功与失败路径
+    /// 测试构造：注入文件存储、凭据存储与信任清理，覆盖成功与失败路径
     #[cfg(test)]
-    fn with_stores(host_store: HostStore, credential_store: Box<dyn CredentialStore>) -> Self {
+    fn with_stores(
+        host_store: HostStore,
+        credential_store: Box<dyn CredentialStore>,
+        trust_cleanup: Box<dyn TrustRecordCleanup>,
+    ) -> Self {
         Self {
             host_store,
             credential_store,
+            trust_cleanup,
         }
     }
 
@@ -77,32 +116,40 @@ impl HostConfigService {
         Ok(hosts.into_iter().find(|host| host.id == host_id))
     }
 
-    /// 保存主机配置,返回更新后的完整列表
+    /// 保存主机配置，返回更新后的完整列表
     ///
-    /// 流程:校验 → 加载现有列表 → 写入新凭据并解析引用(留空/缺省且 auth type
-    /// 未变时保留旧引用)→ 构造 HostConfig → upsert → 落盘(commit 点)→
-    /// auth type 切换时尽力删除陈旧凭据。
+    /// 流程：校验 → 加载现有列表 → 写入新凭据并解析引用（留空/缺省且 auth type
+    /// 未变时保留旧引用）→ 构造 HostConfig → upsert → 落盘（commit 点）→
+    /// auth type 切换时尽力删除陈旧凭据 → endpoint 变化时清理旧信任记录。
     ///
     /// # 一致性保证
-    /// 任一失败(凭据写入或落盘)时,补偿删除本次调用已写入的凭据,保持
-    /// 安全存储与 hosts.json 一致;陈旧凭据清理只发生在 commit 之后,
-    /// 失败时旧凭据保持可用。
+    /// 任一失败（凭据写入或落盘）时，补偿删除本次调用已写入的凭据，保持
+    /// 安全存储与 hosts.json 一致；陈旧凭据清理只发生在 commit 之后，
+    /// 失败时旧凭据保持可用。信任记录清理同样只发生在 commit 之后：
+    /// 仅当更新后的配置集合不再引用旧 endpoint 时才删除其记录；清理失败
+    /// 以 HostTrustCleanupFailed 显式返回（commit 已生效，不补偿已写入凭据）。
     ///
     /// # 参数
-    /// - `request`: 含明文凭据的保存请求,处理完毕后明文不持久化
+    /// - `request`: 含明文凭据的保存请求，处理完毕后明文不持久化
     pub fn save(&self, request: &SaveHostRequest) -> Result<Vec<HostConfig>, AppError> {
         validate_save_request(request)?;
 
-        // 本次调用已写入的凭据 key;任一失败时用于补偿删除,保持安全存储与文件一致
+        // 本次调用已写入的凭据 key；任一失败时用于补偿删除，保持安全存储与文件一致
         let mut written_keys: Vec<String> = Vec::new();
 
-        let result = (|| -> Result<Vec<HostConfig>, AppError> {
+        let result = (|| -> Result<SaveResult, AppError> {
             let existing_hosts = self.host_store.load()?;
             let existing = existing_hosts.iter().find(|host| host.id == request.id);
-            // 认证方式切换时,旧凭据不再适用,不得保留其引用
+            // 认证方式切换时，旧凭据不再适用，不得保留其引用
             let auth_type_changed = existing
                 .map(|host| host.auth_type != request.auth_type)
                 .unwrap_or(false);
+
+            // endpoint 发生变化的旧值；commit 成功后若不再被引用则清理其信任记录
+            // 精确 host 字符串 + port 比较，不做任何归一化
+            let old_endpoint = existing
+                .filter(|host| host.host != request.host || host.port != request.port)
+                .map(|host| (host.host.clone(), host.port));
 
             let password_ref = self.resolve_credential_ref(
                 &request.id,
@@ -137,7 +184,7 @@ impl HostConfigService {
                 group: request.group.clone(),
             };
 
-            // 复用已加载的主机列表,避免重复读取文件
+            // 复用已加载的主机列表，避免重复读取文件
             let mut hosts = existing_hosts;
             if let Some(index) = hosts.iter().position(|item| item.id == host_config.id) {
                 hosts[index] = host_config;
@@ -145,11 +192,11 @@ impl HostConfigService {
                 hosts.push(host_config);
             }
 
-            // 落盘是 commit 点:文件更新成功后,才清理切换遗留的陈旧凭据
+            // 落盘是 commit 点：文件更新成功后，才清理切换遗留的陈旧凭据
             self.host_store.save(&hosts)?;
             if auth_type_changed {
                 if request.auth_type == AuthType::PrivateKey {
-                    // 旧密码不再适用,尽力删除(失败只留孤儿条目,不阻断保存)
+                    // 旧密码不再适用，尽力删除（失败只留孤儿条目，不阻断保存）
                     let _ = self
                         .credential_store
                         .delete(&secure_store::password_key(&request.id));
@@ -160,13 +207,17 @@ impl HostConfigService {
                         .delete(&secure_store::passphrase_key(&request.id));
                 }
             }
-            Ok(hosts)
+            Ok((hosts, old_endpoint))
         })();
 
         match result {
-            Ok(hosts) => Ok(hosts),
+            Ok((hosts, old_endpoint)) => {
+                // commit 已生效：信任记录清理失败必须显式上报，不做凭据补偿
+                self.cleanup_unreferenced_endpoint(&hosts, old_endpoint)?;
+                Ok(hosts)
+            }
             Err(error) => {
-                // 失败补偿:删除本次调用写入的凭据,避免孤儿条目与悬空引用
+                // 失败补偿：删除本次调用写入的凭据，避免孤儿条目与悬空引用
                 for key in &written_keys {
                     let _ = self.credential_store.delete(key);
                 }
@@ -175,28 +226,69 @@ impl HostConfigService {
         }
     }
 
-    /// 删除主机配置,返回更新后的完整列表
+    /// 删除主机配置，返回更新后的完整列表
     ///
-    /// 先落盘移除条目(commit 点),成功后再尽力删除密码与口令两个凭据 key;
-    /// 凭据删除失败不阻断主机删除(最多留下孤儿 keychain 条目)。
+    /// 先落盘移除条目（commit 点），成功后再尽力删除密码与口令两个凭据 key，
+    /// 最后在被删 endpoint 不再被剩余配置引用时清理其信任记录。
+    /// 凭据删除失败不阻断主机删除（最多留下孤儿 keychain 条目）；
+    /// 信任清理失败以 HostTrustCleanupFailed 显式返回（删除已生效）。
     ///
     /// # 参数
     /// - `host_id`: 要删除的主机 ID
     pub fn delete(&self, host_id: &str) -> Result<Vec<HostConfig>, AppError> {
         let mut hosts = self.host_store.load()?;
+        // 被删主机的精确 endpoint（host 字符串 + port）；不存在时无清理目标
+        let removed_endpoint = hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .map(|host| (host.host.clone(), host.port));
         hosts.retain(|host| host.id != host_id);
 
-        // 落盘是 commit 点:失败时凭据保持原样
+        // 落盘是 commit 点：失败时凭据保持原样
         self.host_store.save(&hosts)?;
 
-        // 无条件清理两个凭据 key(幂等,兼容切换清理上线前的遗留数据)
+        // 无条件清理两个凭据 key（幂等，兼容切换清理上线前的遗留数据）
         let _ = self
             .credential_store
             .delete(&secure_store::password_key(host_id));
         let _ = self
             .credential_store
             .delete(&secure_store::passphrase_key(host_id));
+
+        // commit 已生效：信任记录清理失败必须显式上报
+        self.cleanup_unreferenced_endpoint(&hosts, removed_endpoint)?;
         Ok(hosts)
+    }
+
+    /// commit 成功后清理不再被引用的旧 endpoint 信任记录。
+    ///
+    /// 仅当新配置集合中不存在精确 host 字符串 + port 引用时执行；共享 endpoint
+    /// 或未变化的 endpoint 不清理。清理失败包装为 HostTrustCleanupFailed
+    /// 显式返回：管理动作未完成时不得静默报告为成功。
+    ///
+    /// # 参数
+    /// - `hosts`: commit 后的配置集合（引用判断依据）
+    /// - `old_endpoint`: 变更前的 endpoint（None 表示本次无 endpoint 变化）
+    fn cleanup_unreferenced_endpoint(
+        &self,
+        hosts: &[HostConfig],
+        old_endpoint: Option<(String, u16)>,
+    ) -> Result<(), AppError> {
+        if let Some((host, port)) = old_endpoint {
+            let still_referenced = hosts
+                .iter()
+                .any(|item| item.host == host && item.port == port);
+            if !still_referenced {
+                self.trust_cleanup
+                    .forget_endpoint(&host, port)
+                    .map_err(|error| {
+                        AppError::HostTrustCleanupFailed(format!(
+                            "endpoint {host}:{port} 的信任记录清理失败: {error}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// 解析单个凭据引用:非空明文写入安全存储并返回新引用 key;
@@ -235,7 +327,10 @@ impl HostConfigService {
     }
 }
 
-/// 验证保存主机请求的必填字段,name/host/username 不得为空白
+/// save 内部流程结果：commit 后的配置列表 + 本次发生变化的旧 endpoint。
+type SaveResult = (Vec<HostConfig>, Option<(String, u16)>);
+
+/// 验证保存主机请求的必填字段，name/host/username 不得为空白
 fn validate_save_request(request: &SaveHostRequest) -> Result<(), AppError> {
     if request.name.trim().is_empty() {
         return Err(AppError::InvalidHostConfig("主机名称为必填项".to_string()));
@@ -252,11 +347,16 @@ fn validate_save_request(request: &SaveHostRequest) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::host_identity::PresentedHostKey;
+    use crate::models::session::HostIdentityChallenge;
+    use crate::storage::trust_store::{TrustRecord, TrustStore};
     use proptest::prelude::*;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     // --- 测试基础设施 ---
@@ -276,12 +376,41 @@ mod tests {
         dir.join("nested").join("hosts.json")
     }
 
-    /// 内存凭据存储:记录写入/删除结果,可针对特定 key 注入失败
+    /// 内存凭据存储：记录写入/删除结果，可针对特定 key 注入失败
     #[derive(Default)]
     struct MemoryCredentialStore {
         entries: Mutex<HashMap<String, String>>,
         fail_set_key: Mutex<Option<String>>,
         fail_delete_key: Mutex<Option<String>>,
+    }
+
+    /// 内存信任清理：记录调用并支持注入失败
+    #[derive(Default)]
+    struct MemoryTrustCleanup {
+        calls: Mutex<Vec<(String, u16)>>,
+        fail: Mutex<bool>,
+    }
+
+    impl MemoryTrustCleanup {
+        /// 快照全部清理调用（host, port），供断言
+        fn calls(&self) -> Vec<(String, u16)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// 注入下一次清理失败
+        fn fail_next(&self) {
+            *self.fail.lock().unwrap() = true;
+        }
+    }
+
+    impl TrustRecordCleanup for Arc<MemoryTrustCleanup> {
+        fn forget_endpoint(&self, host: &str, port: u16) -> Result<(), AppError> {
+            if *self.fail.lock().unwrap() {
+                return Err(AppError::TrustStoreError("注入的清理失败".to_string()));
+            }
+            self.calls.lock().unwrap().push((host.to_string(), port));
+            Ok(())
+        }
     }
 
     impl MemoryCredentialStore {
@@ -334,21 +463,62 @@ mod tests {
         (credentials, service)
     }
 
-    /// 构造测试服务,并返回 hosts.json 路径供原始内容断言
+    /// 构造测试服务，并返回 hosts.json 路径供原始内容断言
     fn test_service_with_path() -> (Arc<MemoryCredentialStore>, HostConfigService, PathBuf) {
+        let (credentials, service, file_path, _) = test_service_with_path_and_cleanup();
+        (credentials, service, file_path)
+    }
+
+    /// 构造带可观察信任清理的测试服务
+    fn test_service_with_cleanup() -> (
+        Arc<MemoryCredentialStore>,
+        HostConfigService,
+        Arc<MemoryTrustCleanup>,
+    ) {
+        let (credentials, service, _, cleanup) = test_service_with_path_and_cleanup();
+        (credentials, service, cleanup)
+    }
+
+    /// 构造测试服务，并返回 hosts.json 路径与信任清理供断言
+    fn test_service_with_path_and_cleanup() -> (
+        Arc<MemoryCredentialStore>,
+        HostConfigService,
+        PathBuf,
+        Arc<MemoryTrustCleanup>,
+    ) {
         let credentials = Arc::new(MemoryCredentialStore::new());
+        let cleanup = Arc::new(MemoryTrustCleanup::default());
         let file_path = temp_hosts_file();
         let store = HostStore::from_file_path(file_path.clone());
-        let service = HostConfigService::with_stores(store, Box::new(credentials.clone()));
-        (credentials, service, file_path)
+        let service = HostConfigService::with_stores(
+            store,
+            Box::new(credentials.clone()),
+            Box::new(cleanup.clone()),
+        );
+        (credentials, service, file_path, cleanup)
     }
 
     /// 构造指向不可写目录的测试服务
     fn unwritable_service() -> (Arc<MemoryCredentialStore>, HostConfigService) {
-        let credentials = Arc::new(MemoryCredentialStore::new());
-        let store = HostStore::from_file_path(unwritable_hosts_file());
-        let service = HostConfigService::with_stores(store, Box::new(credentials.clone()));
+        let (credentials, service, _) = unwritable_service_with_cleanup();
         (credentials, service)
+    }
+
+    /// 构造指向不可写目录的测试服务，并返回信任清理供断言
+    fn unwritable_service_with_cleanup() -> (
+        Arc<MemoryCredentialStore>,
+        HostConfigService,
+        Arc<MemoryTrustCleanup>,
+    ) {
+        let credentials = Arc::new(MemoryCredentialStore::new());
+        let cleanup = Arc::new(MemoryTrustCleanup::default());
+        let store = HostStore::from_file_path(unwritable_hosts_file());
+        let service = HostConfigService::with_stores(
+            store,
+            Box::new(credentials.clone()),
+            Box::new(cleanup.clone()),
+        );
+        (credentials, service, cleanup)
     }
 
     /// 生成基础保存请求(Password 认证,无凭据)
@@ -730,6 +900,487 @@ mod tests {
             creds.entries().contains_key("titanssh-host-1-password"),
             "删除失败保留孤儿条目(可接受)"
         );
+    }
+
+    // --- endpoint 信任记录生命周期清理 ---
+
+    #[test]
+    fn save_new_host_does_not_cleanup_trust() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        assert!(
+            cleanup.calls().is_empty(),
+            "新建主机没有旧 endpoint，不得清理信任记录"
+        );
+    }
+
+    #[test]
+    fn endpoint_unchanged_field_edits_do_not_cleanup_trust() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&request_with_password("id1", "s1")).unwrap();
+        // 凭据变化：endpoint 不变
+        service.save(&request_with_password("id1", "s2")).unwrap();
+        // 名称、用户名、认证方式、分组、备注变化：endpoint 不变
+        let req = SaveHostRequest {
+            name: "renamed".to_string(),
+            username: "admin".to_string(),
+            auth_type: AuthType::PrivateKey,
+            private_key_path: Some("~/.ssh/id".to_string()),
+            passphrase: Some("pp-1".to_string()),
+            remark: Some("note".to_string()),
+            group: "grp".to_string(),
+            ..sample_request("id1", "prod")
+        };
+        service.save(&req).unwrap();
+        assert!(
+            cleanup.calls().is_empty(),
+            "endpoint 未变时不得清理信任记录"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_edit_forgets_old_endpoint_when_last_reference() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        let req = SaveHostRequest {
+            host: "10.0.0.2".to_string(),
+            ..sample_request("id1", "prod")
+        };
+        service.save(&req).unwrap();
+        assert_eq!(
+            cleanup.calls(),
+            vec![("10.0.0.1".to_string(), 22)],
+            "旧 endpoint 不再被引用时必须清理"
+        );
+    }
+
+    #[test]
+    fn endpoint_port_edit_forgets_old_port_endpoint() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        let req = SaveHostRequest {
+            port: 2222,
+            ..sample_request("id1", "prod")
+        };
+        service.save(&req).unwrap();
+        assert_eq!(
+            cleanup.calls(),
+            vec![("10.0.0.1".to_string(), 22)],
+            "host 相同但端口不同就是不同 endpoint"
+        );
+    }
+
+    #[test]
+    fn endpoint_spelling_change_is_treated_as_endpoint_change() {
+        // 精确 host 字符串语义：大小写变化视为不同 endpoint，不做归一化
+        let (_, service, cleanup) = test_service_with_cleanup();
+        let req = SaveHostRequest {
+            host: "Prod.Example.COM".to_string(),
+            ..sample_request("id1", "prod")
+        };
+        service.save(&req).unwrap();
+        let req2 = SaveHostRequest {
+            host: "prod.example.com".to_string(),
+            ..req
+        };
+        service.save(&req2).unwrap();
+        assert_eq!(cleanup.calls(), vec![("Prod.Example.COM".to_string(), 22)]);
+    }
+
+    #[test]
+    fn endpoint_edit_keeps_record_when_other_host_still_references() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service.save(&sample_request("id2", "prod2")).unwrap();
+        let req = SaveHostRequest {
+            host: "10.0.0.2".to_string(),
+            ..sample_request("id1", "prod")
+        };
+        service.save(&req).unwrap();
+        assert!(
+            cleanup.calls().is_empty(),
+            "其他 HostConfig 仍引用旧 endpoint，不得清理共享记录"
+        );
+    }
+
+    #[test]
+    fn delete_forgets_endpoint_when_last_reference() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service.delete("id1").unwrap();
+        assert_eq!(
+            cleanup.calls(),
+            vec![("10.0.0.1".to_string(), 22)],
+            "删除最后一个引用后必须清理信任记录"
+        );
+    }
+
+    #[test]
+    fn delete_keeps_shared_endpoint_record_until_last_reference_gone() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service.save(&sample_request("id2", "prod2")).unwrap();
+        service.delete("id1").unwrap();
+        assert!(
+            cleanup.calls().is_empty(),
+            "删除共享 endpoint 的其中一个 HostConfig 不得清理"
+        );
+        service.delete("id2").unwrap();
+        assert_eq!(
+            cleanup.calls(),
+            vec![("10.0.0.1".to_string(), 22)],
+            "删除最后一个引用后才清理"
+        );
+    }
+
+    #[test]
+    fn delete_missing_host_does_not_cleanup() {
+        let (_, service, cleanup) = test_service_with_cleanup();
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service.delete("missing").unwrap();
+        assert!(
+            cleanup.calls().is_empty(),
+            "不存在的 host 没有可清理的 endpoint"
+        );
+    }
+
+    #[test]
+    fn save_cleanup_failure_surfaces_structured_error_after_commit() {
+        let (creds, service, cleanup) = test_service_with_cleanup();
+        service.save(&request_with_password("id1", "s1")).unwrap();
+        cleanup.fail_next();
+        let req = SaveHostRequest {
+            host: "10.0.0.2".to_string(),
+            ..request_with_password("id1", "s2")
+        };
+        let error = service.save(&req).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "HostTrustCleanupFailed",
+            "清理失败必须作为结构化错误显式返回"
+        );
+        assert!(error.to_string().contains("10.0.0.1:22"));
+        // commit 已生效：配置已更新，已写入凭据不做补偿删除
+        let hosts = service.list_hosts().unwrap();
+        assert_eq!(hosts[0].host, "10.0.0.2");
+        assert_eq!(
+            creds
+                .entries()
+                .get("titanssh-id1-password")
+                .map(String::as_str),
+            Some("s2"),
+            "commit 后的清理失败不得补偿删除凭据"
+        );
+    }
+
+    #[test]
+    fn delete_cleanup_failure_surfaces_structured_error_after_commit() {
+        let (creds, service, cleanup) = test_service_with_cleanup();
+        service.save(&request_with_password("id1", "s1")).unwrap();
+        cleanup.fail_next();
+        let error = service.delete("id1").unwrap_err();
+        assert_eq!(error.code(), "HostTrustCleanupFailed");
+        // 删除已生效，凭据按流程清理；但管理动作未完成必须显式报错
+        assert!(service.list_hosts().unwrap().is_empty());
+        assert!(
+            !creds.entries().contains_key("titanssh-id1-password"),
+            "删除后的凭据清理不受信任清理失败影响"
+        );
+    }
+
+    /// commit 失败不触发清理：目录置为只读后 load 成功而落盘必然失败，
+    /// 旧配置仍在（旧 endpoint 仍被引用），信任记录不得被动刀。
+    #[cfg(unix)]
+    #[test]
+    fn save_commit_failure_does_not_attempt_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let (creds, service, file_path, cleanup) = test_service_with_path_and_cleanup();
+        service.save(&request_with_password("id1", "s1")).unwrap();
+        // 文件置为只读：load 成功而 commit 写入必然失败
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let result = service.save(&SaveHostRequest {
+            host: "10.0.0.2".to_string(),
+            ..request_with_password("id1", "s2")
+        });
+        // 恢复权限，避免影响临时目录清理
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(result.is_err(), "落盘失败必须返回错误");
+        assert!(
+            cleanup.calls().is_empty(),
+            "commit 未成功不得尝试清理信任记录"
+        );
+        assert!(creds.entries().is_empty(), "落盘失败时补偿删除写入的凭据");
+    }
+
+    // --- 集成：HostConfig 生命周期 × 真实信任存储与身份服务 ---
+
+    /// 构造真实 TrustStore + HostIdentityService 并预置一条信任记录
+    fn identity_with_record(record: TrustRecord) -> (HostIdentityService, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("titan-host-trust-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let path = dir.join("known_hosts");
+        let store = TrustStore::from_file_path(path.clone());
+        store.upsert(record).expect("预置记录应写入成功");
+        (HostIdentityService::with_trust_store(store), path)
+    }
+
+    /// 构造注入真实身份服务（共享同一 TrustStore 实例）的 HostConfigService
+    fn service_with_identity(
+        identity: &HostIdentityService,
+    ) -> (Arc<MemoryCredentialStore>, HostConfigService) {
+        let credentials = Arc::new(MemoryCredentialStore::new());
+        let store = HostStore::from_file_path(temp_hosts_file());
+        let cleanup = IdentityTrustCleanup {
+            identity_service: identity.clone(),
+        };
+        let service =
+            HostConfigService::with_stores(store, Box::new(credentials.clone()), Box::new(cleanup));
+        (credentials, service)
+    }
+
+    /// 构造校验呈现信息（指纹由 blob 派生）
+    fn presented(host: &str, port: u16, blob: &[u8]) -> PresentedHostKey {
+        PresentedHostKey {
+            host: host.to_string(),
+            port,
+            algorithm: "ssh-ed25519".to_string(),
+            fingerprint: crate::core::host_identity::fingerprint_sha256(blob),
+            blob: blob.to_vec(),
+        }
+    }
+
+    /// 等待指定 Session 出现 pending challenge（超时则 panic）
+    fn wait_pending(service: &HostIdentityService, session_id: &str) -> HostIdentityChallenge {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.pending_challenge(session_id).is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        service
+            .pending_challenge(session_id)
+            .expect("challenge 已创建")
+    }
+
+    /// endpoint 编辑（最后引用）：旧记录从磁盘删除，新 Session 将旧 endpoint
+    /// 视为未知并重新触发确认。
+    #[test]
+    fn integration_endpoint_edit_removes_trust_record_and_new_sessions_prompt() {
+        let app = tauri::test::mock_app();
+        let (identity, path) = identity_with_record(TrustRecord {
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let (_, service) = service_with_identity(&identity);
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service
+            .save(&SaveHostRequest {
+                host: "10.0.0.2".to_string(),
+                ..sample_request("id1", "prod")
+            })
+            .unwrap();
+
+        // 磁盘真相：旧 endpoint 记录已删除
+        assert_eq!(
+            TrustStore::from_file_path(path)
+                .lookup("10.0.0.1", 22)
+                .unwrap(),
+            None
+        );
+        // 新 Session 将旧 endpoint 视为未知并重新确认
+        let verifier = identity.verifier(app.handle().clone(), "session-1".to_string());
+        let presented_key = presented("10.0.0.1", 22, b"blob");
+        let waiter = thread::spawn(move || verifier(&presented_key));
+        let challenge = wait_pending(&identity, "session-1");
+        identity.reject(&challenge.challenge_id).unwrap();
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 重复引用：删除其中一个 HostConfig 保留共享记录，删除最后一个引用才清理。
+    #[test]
+    fn integration_duplicate_endpoint_keeps_shared_record_until_last_delete() {
+        let (identity, path) = identity_with_record(TrustRecord {
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let (_, service) = service_with_identity(&identity);
+        service.save(&sample_request("id1", "prod-a")).unwrap();
+        service.save(&sample_request("id2", "prod-b")).unwrap();
+
+        service.delete("id1").unwrap();
+        assert!(
+            TrustStore::from_file_path(path.clone())
+                .lookup("10.0.0.1", 22)
+                .unwrap()
+                .is_some(),
+            "删除共享 endpoint 的其中一个 HostConfig 不得清理记录"
+        );
+        service.delete("id2").unwrap();
+        assert_eq!(
+            TrustStore::from_file_path(path)
+                .lookup("10.0.0.1", 22)
+                .unwrap(),
+            None,
+            "删除最后一个引用后才清理"
+        );
+    }
+
+    /// endpoint 未变的编辑（用户名等字段）保留信任记录。
+    #[test]
+    fn integration_unchanged_endpoint_edit_keeps_trust_record() {
+        let (identity, path) = identity_with_record(TrustRecord {
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let (_, service) = service_with_identity(&identity);
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service
+            .save(&SaveHostRequest {
+                name: "renamed".to_string(),
+                username: "admin".to_string(),
+                ..sample_request("id1", "prod")
+            })
+            .unwrap();
+        assert!(
+            TrustStore::from_file_path(path)
+                .lookup("10.0.0.1", 22)
+                .unwrap()
+                .is_some(),
+            "endpoint 未变不得清理信任记录"
+        );
+    }
+
+    /// 已通过持久化匹配静默验证的活动 Session：清理后同 Session 重连仍静默放行，
+    /// 新 Session 重新确认旧 endpoint。
+    #[test]
+    fn integration_cleanup_preserves_silently_verified_session_decision() {
+        let app = tauri::test::mock_app();
+        let (identity, path) = identity_with_record(TrustRecord {
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"persisted".to_vec(),
+        });
+        // 活动 Session 经持久化匹配静默验证
+        let presented_key = presented("10.0.0.1", 22, b"persisted");
+        let verifier = identity.verifier(app.handle().clone(), "session-1".to_string());
+        verifier(&presented_key).expect("持久化匹配静默放行");
+
+        // 编辑 endpoint 触发信任清理
+        let (_, service) = service_with_identity(&identity);
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service
+            .save(&SaveHostRequest {
+                host: "10.0.0.2".to_string(),
+                ..sample_request("id1", "prod")
+            })
+            .unwrap();
+        assert_eq!(
+            TrustStore::from_file_path(path)
+                .lookup("10.0.0.1", 22)
+                .unwrap(),
+            None
+        );
+
+        // 已验证决定持续到 Session 关闭：同 Session 重连仍静默放行
+        verifier(&presented_key).expect("已验证决定持续到 Session 关闭");
+        assert!(identity.pending_challenge("session-1").is_none());
+        // 新 Session 将旧 endpoint 视为未知并重新确认
+        let verifier_b = identity.verifier(app.handle().clone(), "session-b".to_string());
+        let waiter_b = thread::spawn(move || verifier_b(&presented_key));
+        let challenge_b = wait_pending(&identity, "session-b");
+        identity.reject(&challenge_b.challenge_id).unwrap();
+        assert_eq!(
+            waiter_b.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 清理不干扰运行中的 Runtime Session：临时信任持续到 Session 关闭，
+    /// 新 Session 重新确认旧 endpoint。
+    #[test]
+    fn integration_cleanup_does_not_disturb_active_session() {
+        let app = tauri::test::mock_app();
+        let (identity, path) = identity_with_record(TrustRecord {
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"persisted".to_vec(),
+        });
+        // 活动 Session 呈现不同 key：challenge → 仅本次接受（临时信任）
+        let presented_key = presented("10.0.0.1", 22, b"rotated");
+        let verifier = identity.verifier(app.handle().clone(), "session-1".to_string());
+        let waiter = thread::spawn({
+            let verifier = verifier.clone();
+            let presented_key = presented_key.clone();
+            move || verifier(&presented_key)
+        });
+        let challenge = wait_pending(&identity, "session-1");
+        identity.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().unwrap();
+
+        // 编辑 endpoint 触发信任清理
+        let (_, service) = service_with_identity(&identity);
+        service.save(&sample_request("id1", "prod")).unwrap();
+        service
+            .save(&SaveHostRequest {
+                host: "10.0.0.2".to_string(),
+                ..sample_request("id1", "prod")
+            })
+            .unwrap();
+        assert_eq!(
+            TrustStore::from_file_path(path)
+                .lookup("10.0.0.1", 22)
+                .unwrap(),
+            None
+        );
+
+        // 清理不关闭也不影响运行中的 Session：重连仍放行
+        verifier(&presented_key).expect("活动 Session 的临时信任持续到关闭");
+        // 新 Session 将旧 endpoint 视为未知并重新确认
+        let verifier_b = identity.verifier(app.handle().clone(), "session-b".to_string());
+        let waiter_b = thread::spawn(move || verifier_b(&presented_key));
+        let challenge_b = wait_pending(&identity, "session-b");
+        identity.reject(&challenge_b.challenge_id).unwrap();
+        assert_eq!(
+            waiter_b.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 真实信任存储写盘失败：清理错误经真实 seam 以结构化代码返回，
+    /// 配置变更本身已生效。
+    #[test]
+    fn integration_cleanup_failure_propagates_structured_error() {
+        let (identity, path) = identity_with_record(TrustRecord {
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let (_, service) = service_with_identity(&identity);
+        service.save(&sample_request("id1", "prod")).unwrap();
+        // 破坏发布目标：known_hosts 路径替换为目录（缓存已加载，写入必然失败）
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+
+        let error = service
+            .save(&SaveHostRequest {
+                host: "10.0.0.2".to_string(),
+                ..sample_request("id1", "prod")
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "HostTrustCleanupFailed");
+        // 配置变更已生效
+        assert_eq!(service.list_hosts().unwrap()[0].host, "10.0.0.2");
     }
 
     // --- 查询 ---

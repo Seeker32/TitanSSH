@@ -166,6 +166,7 @@ export const zhCN = {
   'error.HostKeyChallengeNotFound': '主机身份确认请求不存在',
   'error.HostKeyVerificationCancelled': '主机身份验证已取消',
   'error.HostKeySaveFailed': '主机信任保存失败',
+  'error.HostTrustCleanupFailed': '主机信任记录清理失败',
   'error.TrustStoreError': '信任存储不可用',
   'error.Unknown': '未知错误',
 } as const;

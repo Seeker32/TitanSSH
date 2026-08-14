@@ -176,9 +176,11 @@ impl HostIdentityService {
         Arc::new(move |presented| service.verify(&app, &session_id, presented))
     }
 
-    /// 统一校验：持久化信任精确匹配直接放行；已信任直接放行；未知主机派发
-    /// challenge 事件并阻塞等待用户决定。信任存储不可读/不可解析时 fail-closed。
+    /// 统一校验：持久化信任精确匹配直接放行并记为 Session 已验证决定；
+    /// 已信任直接放行；未知主机派发 challenge 事件并阻塞等待用户决定。
+    /// 信任存储不可读/不可解析时 fail-closed。
     /// 同一 Session、endpoint 与指纹的并发连接合并到同一 challenge。
+    /// 已验证决定在信任记录被生命周期清理移除后仍持续到 Session 关闭；
     /// 已关闭 Session 的迟到校验器（含已保存 key 精确匹配）仍必须立即失败，
     /// 不得借持久化信任继续认证。
     pub fn verify<R: Runtime>(
@@ -210,7 +212,7 @@ impl HostIdentityService {
             }
         }
         // 持久化信任：精确 host+port+算法+完整公钥匹配即静默放行；存储错误 fail-closed；
-        // 已保存记录与呈现 key 不一致仍产生 challenge（变更警告在 #33 细化）
+        // 已保存记录与呈现 key 不一致仍产生 challenge（前端展示变更警告）
         if let Some(store) = self
             .trust_store
             .lock()
@@ -226,6 +228,18 @@ impl HostIdentityService {
                         &presented.blob,
                     ) =>
                 {
+                    // 已验证决定按 Session 记录：信任记录被生命周期清理移除后，
+                    // 同 Session 的重连仍静默放行，直到 Session 关闭
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if state.cancelled.contains(session_id) {
+                        return Err(AppError::HostKeyVerificationCancelled(
+                            session_id.to_string(),
+                        ));
+                    }
+                    state.trusted.insert(key);
                     return Ok(());
                 }
                 _ => {}
@@ -415,6 +429,24 @@ impl HostIdentityService {
             Self::decide(&other, Decision::Accepted);
         }
         Ok(())
+    }
+
+    /// 移除 endpoint 的持久化信任记录（HostConfig 保存/删除的生命周期清理）。
+    ///
+    /// 只影响长期信任：运行中 Runtime Session 的临时信任、已验证决定与 pending
+    /// challenge 不受影响，已建立的连接继续运行；新 Session 连接该 endpoint 时
+    /// 将重新视为未知并触发确认。endpoint 无记录时幂等成功；存储未初始化或
+    /// 写入失败返回结构化错误，调用方必须显式上报，不得静默吞掉未完成的清理。
+    pub fn forget_endpoint(&self, host: &str, port: u16) -> Result<(), AppError> {
+        let store = self
+            .trust_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                AppError::TrustStoreError("信任存储未初始化，无法清理信任记录".to_string())
+            })?;
+        store.remove(host, port)
     }
 
     /// 拒绝：唤醒全部等待者（其连接以 HostKeyRejected 失败），返回 challenge 供上层关闭 Session。
@@ -1268,5 +1300,134 @@ mod tests {
         assert_eq!(algorithm_name(HostKeyType::Rsa), "ssh-rsa");
         assert_eq!(algorithm_name(HostKeyType::Ecdsa256), "ecdsa-sha2-nistp256");
         assert_eq!(algorithm_name(HostKeyType::Unknown), "unknown");
+    }
+
+    /// 生命周期清理移除持久化记录后，新 Session 将 endpoint 视为未知并重新确认。
+    #[test]
+    fn forget_endpoint_removes_persisted_record_and_new_sessions_prompt() {
+        let app = mock_app();
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+
+        service.forget_endpoint("10.0.0.8", 22).unwrap();
+        // 持久化记录已删除（重新构造 TrustStore 绕过内存缓存观察磁盘真相）
+        assert_eq!(
+            TrustStore::from_file_path(path)
+                .lookup("10.0.0.8", 22)
+                .unwrap(),
+            None
+        );
+        // 新 Session 重新视为未知：产生 challenge 等待确认
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:again");
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+        service.reject(&challenge.challenge_id).unwrap();
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 清理不干扰运行中的 Runtime Session：已持有的临时信任持续到 Session 关闭，
+    /// 持久化记录移除后同 Session 重连仍放行。
+    #[test]
+    fn forget_endpoint_keeps_active_session_temporary_trust() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"persisted".to_vec(),
+        });
+        // session-1 呈现与持久化不同的 key：challenge → 仅本次接受（临时信任）
+        let presented = PresentedHostKey {
+            blob: b"rotated".to_vec(),
+            ..make_presented("SHA256:rotated")
+        };
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let waiter = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().unwrap();
+
+        // 生命周期清理移除持久化记录：不影响运行中的 Session
+        service.forget_endpoint("10.0.0.8", 22).unwrap();
+
+        // 同 Session 重连仍放行（临时信任持续到关闭）
+        verifier(&presented).expect("活动 Session 的临时信任不受清理影响");
+        // 新 Session 视为未知：重新触发确认
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let waiter_b = thread::spawn({
+            let verifier = verifier_b.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge_b = wait_pending(&service, "session-b");
+        service.reject(&challenge_b.challenge_id).unwrap();
+        assert_eq!(
+            waiter_b.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 已通过持久化匹配静默验证的 Session：清理后同 Session 重连仍静默放行
+    /// （已验证决定持续到 Session 关闭），新 Session 重新确认。
+    #[test]
+    fn forget_endpoint_keeps_silently_verified_session_decision() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:match");
+        verifier(&presented).expect("持久化匹配静默放行");
+
+        // 生命周期清理移除持久化记录
+        service.forget_endpoint("10.0.0.8", 22).unwrap();
+        // 同 Session 重连：已验证决定持续到 Session 关闭，不产生新 challenge
+        verifier(&presented).expect("已验证决定持续到 Session 关闭");
+        assert!(service.pending_challenge("session-1").is_none());
+        // 新 Session 视为未知并重新确认
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let waiter_b = thread::spawn(move || verifier_b(&presented));
+        let challenge_b = wait_pending(&service, "session-b");
+        service.reject(&challenge_b.challenge_id).unwrap();
+        assert_eq!(
+            waiter_b.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected"
+        );
+    }
+
+    /// 移除不存在的 endpoint 幂等成功（HostConfig 从未受信任的 endpoint 编辑路径）。
+    #[test]
+    fn forget_endpoint_missing_endpoint_is_idempotent() {
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        service.forget_endpoint("10.0.0.9", 2222).unwrap();
+        service.forget_endpoint("10.0.0.8", 22).unwrap();
+    }
+
+    /// 信任存储未初始化时清理 fail-closed：显式报错，不得静默吞掉未完成的清理。
+    #[test]
+    fn forget_endpoint_without_store_fails_closed() {
+        let service = HostIdentityService::new();
+        let error = service.forget_endpoint("10.0.0.8", 22).unwrap_err();
+        assert_eq!(error.code(), "TrustStoreError");
     }
 }

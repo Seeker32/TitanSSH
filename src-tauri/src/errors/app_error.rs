@@ -118,6 +118,11 @@ pub enum AppError {
     /// "接受并保存"持久化失败；challenge 保持未决，不自动降级为临时信任
     #[error("主机信任保存失败: {0}")]
     HostKeySaveFailed(String),
+
+    /// HostConfig 保存/删除后的 endpoint 信任记录自动清理失败；
+    /// 配置变更已生效，但清理未完成的管理动作必须显式报错，不得静默报告为成功
+    #[error("主机信任记录清理失败: {0}")]
+    HostTrustCleanupFailed(String),
 }
 
 impl AppError {
@@ -150,6 +155,7 @@ impl AppError {
             Self::HostKeyVerificationCancelled(_) => "HostKeyVerificationCancelled",
             Self::TrustStoreError(_) => "TrustStoreError",
             Self::HostKeySaveFailed(_) => "HostKeySaveFailed",
+            Self::HostTrustCleanupFailed(_) => "HostTrustCleanupFailed",
         }
     }
 
@@ -186,6 +192,7 @@ impl AppError {
             Self::HostKeyVerificationCancelled(_) => Self::HostKeyVerificationCancelled(merged),
             Self::TrustStoreError(_) => Self::TrustStoreError(merged),
             Self::HostKeySaveFailed(_) => Self::HostKeySaveFailed(merged),
+            Self::HostTrustCleanupFailed(_) => Self::HostTrustCleanupFailed(merged),
         }
     }
 }
@@ -219,7 +226,8 @@ impl From<AppError> for AppErrorInfo {
             | AppError::HostKeyChallengeNotFound(detail)
             | AppError::HostKeyVerificationCancelled(detail)
             | AppError::TrustStoreError(detail)
-            | AppError::HostKeySaveFailed(detail) => detail,
+            | AppError::HostKeySaveFailed(detail)
+            | AppError::HostTrustCleanupFailed(detail) => detail,
             AppError::IoError(detail) => detail.to_string(),
         };
         Self {
@@ -307,6 +315,21 @@ mod tests {
         assert_eq!(
             AppError::HostKeySaveFailed("write denied".to_string()).code(),
             "HostKeySaveFailed"
+        );
+    }
+
+    /// HostConfig 生命周期清理失败使用稳定英文代码，IPC payload 结构化且
+    /// 携带 endpoint 诊断：管理动作不得被静默报告为成功。
+    #[test]
+    fn host_trust_cleanup_error_has_stable_code_and_payload() {
+        let error = AppError::HostTrustCleanupFailed(
+            "endpoint 10.0.0.8:22 的信任记录清理失败: write denied".to_string(),
+        );
+        assert_eq!(error.code(), "HostTrustCleanupFailed");
+        let value = serde_json::to_value(AppErrorInfo::from(error)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "code": "HostTrustCleanupFailed", "detail": "endpoint 10.0.0.8:22 的信任记录清理失败: write denied" })
         );
     }
 

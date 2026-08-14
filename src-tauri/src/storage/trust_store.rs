@@ -111,6 +111,27 @@ impl TrustStore {
         Ok(())
     }
 
+    /// 移除精确 endpoint 的信任记录；endpoint 不存在时静默成功（幂等）。
+    ///
+    /// 与 upsert 一样在锁内完成 加载 → 修改 → 安全发布 → 更新缓存；
+    /// 磁盘写入失败时缓存保持原状并返回错误（不得让调用方误以为已删除）。
+    pub fn remove(&self, host: &str, port: u16) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut records = ensure_loaded(&mut state)?.to_vec();
+        let before = records.len();
+        records.retain(|record| !(record.host == host && record.port == port));
+        if records.len() == before {
+            // endpoint 本无记录：无需发布，保持幂等
+            return Ok(());
+        }
+        write_records(&state.file_path, &records)?;
+        state.records = Some(records);
+        Ok(())
+    }
+
     /// 重新读取磁盘内容（测试用：观察真实文件状态，绕开内存缓存）。
     #[cfg(test)]
     pub(crate) fn reload(&self) -> Result<Vec<TrustRecord>, AppError> {
@@ -572,6 +593,70 @@ mod tests {
             .expect("生产路径写入应成功");
         let found = store.lookup(&unique_host, 22).unwrap().unwrap();
         assert_eq!(found.blob, b"blob");
+    }
+
+    /// 移除精确 endpoint 的记录并安全发布：磁盘不再包含该记录，其他 endpoint 不受影响。
+    #[test]
+    fn remove_deletes_record_and_persists() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        store
+            .upsert(record("10.0.0.8", 22, "ssh-ed25519", b"blob-a"))
+            .unwrap();
+        store
+            .upsert(record("10.0.0.9", 22, "ssh-ed25519", b"blob-b"))
+            .unwrap();
+
+        store.remove("10.0.0.8", 22).unwrap();
+        assert_eq!(store.lookup("10.0.0.8", 22).unwrap(), None);
+        assert_eq!(
+            store.lookup("10.0.0.9", 22).unwrap().unwrap().blob,
+            b"blob-b",
+            "移除不得影响其他 endpoint 的记录"
+        );
+        // 磁盘真实内容同步更新（绕过内存缓存重读）
+        let records = store.reload().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].host, "10.0.0.9");
+    }
+
+    /// 移除不存在的 endpoint 幂等成功：不报错，也不产生磁盘写入。
+    #[test]
+    fn remove_missing_endpoint_is_idempotent() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        store
+            .upsert(record("10.0.0.8", 22, "ssh-ed25519", b"blob-a"))
+            .unwrap();
+
+        store.remove("10.0.0.7", 22).unwrap();
+        assert_eq!(
+            store.lookup("10.0.0.8", 22).unwrap().unwrap().blob,
+            b"blob-a"
+        );
+        assert_eq!(store.reload().unwrap().len(), 1);
+    }
+
+    /// 移除失败（目标为目录）返回错误，缓存与磁盘保持原状：失败的清理不得
+    /// 让调用方误以为记录已删除。
+    #[test]
+    fn remove_write_failure_reports_error_and_keeps_record() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        store
+            .upsert(record("10.0.0.8", 22, "ssh-ed25519", b"blob-a"))
+            .unwrap();
+        // 缓存已加载后破坏发布目标：路径替换为目录，发布必然失败
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+
+        let error = store.remove("10.0.0.8", 22).unwrap_err();
+        assert_eq!(error.code(), "TrustStoreError");
+        assert_eq!(
+            store.lookup("10.0.0.8", 22).unwrap().unwrap().blob,
+            b"blob-a",
+            "失败的移除不得污染缓存"
+        );
     }
 
     /// 主机段格式序列化遵循 OpenSSH 规则（单元级向量）。

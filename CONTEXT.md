@@ -48,6 +48,10 @@ _Avoid_: 指纹缓存、白名单、host key 列表
 TitanSSH 在应用数据目录维护的标准 OpenSSH `known_hosts` 格式文件及其读写逻辑。不读取系统 `~/.ssh/known_hosts`，不使用 keyring；读写串行化并经同目录临时文件安全发布。文件缺失视为空信任存储，不可读/不可解析时 fail-closed。
 _Avoid_: known_hosts 数据库、系统信任库、密钥库
 
+**信任记录清理 (trust-record cleanup)**:
+HostConfig 保存或删除后自动移除不再被任何配置引用的 endpoint 信任记录：endpoint 精确比较 host 字符串 + port，不做归一化；仅当更新后的配置集合不再引用旧 endpoint 时删除。不终止运行中的 Runtime Session（其临时信任持续到 Session 关闭），新 Session 将旧 endpoint 视为未知并重新确认；清理失败以结构化错误显式返回。
+_Avoid_: 信任吊销、手动删除信任记录、known_hosts 编辑
+
 **仅本次接受 (accept once)**:
 只把当前 Runtime Session 的 endpoint + 呈现 key 写入临时信任的决策；覆盖该 Session 的 Terminal、SFTP、Monitoring 及重连，Session 关闭即清除，不落盘。
 _Avoid_: 临时信任（单独使用时）、跳过验证、记住本次

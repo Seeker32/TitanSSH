@@ -48,6 +48,19 @@ describe('Zustand stores', () => {
     expect(useHostStore.getState()).toMatchObject({ loading: false, error: 'Error: offline' });
   });
 
+  it('保存时信任清理失败：结构化错误显式抛出，不静默报告为成功', async () => {
+    const host = makeHost();
+    mockInvoke.mockRejectedValueOnce({
+      code: 'HostTrustCleanupFailed',
+      detail: 'endpoint 10.0.0.1:22 的信任记录清理失败: write denied',
+    });
+    await expect(
+      useHostStore.getState().saveHost({ ...host, authType: host.authType, password: 'secret' }),
+    ).rejects.toMatchObject({ code: 'HostTrustCleanupFailed' });
+    expect(useHostStore.getState().loading).toBe(false);
+    expect(useHostStore.getState().error).toBeTruthy();
+  });
+
   it('主机搜索跨名称、地址与分组名过滤且不区分大小写', () => {
     const hosts = [
       makeHost({ group: '' }),
