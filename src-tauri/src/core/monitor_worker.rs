@@ -691,6 +691,7 @@ mod loop_tests {
                 port: 22,
                 algorithm: "ssh-ed25519".to_string(),
                 fingerprint: "SHA256:monitor".to_string(),
+                blob: b"blob".to_vec(),
             })?;
             unreachable!("主机身份被拒绝时不得建立监控连接");
         };

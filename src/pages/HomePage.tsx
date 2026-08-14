@@ -31,6 +31,7 @@ export default function HomePage() {
   const activeView = useSessionStore((state) => state.activeView);
   const connections = useSessionStore((state) => state.connections);
   const hostKeyChallenges = useSessionStore((state) => state.hostKeyChallenges);
+  const hostKeySaveErrors = useSessionStore((state) => state.hostKeySaveErrors);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
   const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
   const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
@@ -212,11 +213,12 @@ export default function HomePage() {
         onClose={closeSession} /></div>}
       <div className="content-area">
         <TerminalPane sessions={sessions} activeView={activeView} connections={connections}
-          challenges={hostKeyChallenges}
+          challenges={hostKeyChallenges} saveErrors={hostKeySaveErrors}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
           onCreateHost={createHost}
           onCloseTab={closeSession}
+          onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
           onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
           onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />
         {activeView !== null && <SftpPanel sessionId={activeView} state={sftpState}

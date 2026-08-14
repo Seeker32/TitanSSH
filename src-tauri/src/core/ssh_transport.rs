@@ -425,6 +425,7 @@ where
         port: host.port,
         algorithm: algorithm_name(key_type).to_string(),
         fingerprint: fingerprint_sha256(blob),
+        blob: blob.to_vec(),
     };
     verifier(&presented)?;
 

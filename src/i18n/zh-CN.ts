@@ -125,8 +125,10 @@ export const zhCN = {
   'hostIdentity.endpoint': '主机地址',
   'hostIdentity.algorithm': '密钥算法',
   'hostIdentity.fingerprint': 'SHA-256 指纹',
+  'hostIdentity.acceptAndSave': '接受并保存',
   'hostIdentity.accept': '仅本次接受',
   'hostIdentity.reject': '拒绝',
+  'hostIdentity.saveFailed': '保存信任记录失败，请重试保存、改选仅本次接受或拒绝。',
   'session.unknown': '连接异常',
   'phase.LoadingCredentials': '正在读取凭据...',
   'phase.ConnectingTcp': '正在建立 TCP 连接...',
@@ -163,6 +165,8 @@ export const zhCN = {
   'error.HostKeyRejected': '已拒绝未知主机身份',
   'error.HostKeyChallengeNotFound': '主机身份确认请求不存在',
   'error.HostKeyVerificationCancelled': '主机身份验证已取消',
+  'error.HostKeySaveFailed': '主机信任保存失败',
+  'error.TrustStoreError': '信任存储不可用',
   'error.Unknown': '未知错误',
 } as const;
 

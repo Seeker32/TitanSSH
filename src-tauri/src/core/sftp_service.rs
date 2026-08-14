@@ -1731,6 +1731,7 @@ mod tests {
                     port: host.port,
                     algorithm: "ssh-ed25519".to_string(),
                     fingerprint: "SHA256:sftp-identity".to_string(),
+                    blob: b"blob".to_vec(),
                 })?;
                 assert_eq!(role, SftpRole::Control, "Session 打开先建控制连接");
                 Ok(empty_sftp())
@@ -1782,6 +1783,7 @@ mod tests {
                     port: host.port,
                     algorithm: "ssh-ed25519".to_string(),
                     fingerprint: "SHA256:sftp-deny".to_string(),
+                    blob: b"blob".to_vec(),
                 })?;
                 Ok(empty_sftp())
             },

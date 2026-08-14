@@ -110,6 +110,14 @@ pub enum AppError {
     /// 等待主机身份确认期间会话被关闭，验证已取消
     #[error("主机身份验证已取消: {0}")]
     HostKeyVerificationCancelled(String),
+
+    /// TitanSSH 独立信任存储不可读、不可解析或写入失败；fail-closed，绝不静默视为空
+    #[error("信任存储错误: {0}")]
+    TrustStoreError(String),
+
+    /// "接受并保存"持久化失败；challenge 保持未决，不自动降级为临时信任
+    #[error("主机信任保存失败: {0}")]
+    HostKeySaveFailed(String),
 }
 
 impl AppError {
@@ -140,6 +148,8 @@ impl AppError {
             Self::HostKeyRejected(_) => "HostKeyRejected",
             Self::HostKeyChallengeNotFound(_) => "HostKeyChallengeNotFound",
             Self::HostKeyVerificationCancelled(_) => "HostKeyVerificationCancelled",
+            Self::TrustStoreError(_) => "TrustStoreError",
+            Self::HostKeySaveFailed(_) => "HostKeySaveFailed",
         }
     }
 
@@ -174,6 +184,8 @@ impl AppError {
             Self::HostKeyRejected(_) => Self::HostKeyRejected(merged),
             Self::HostKeyChallengeNotFound(_) => Self::HostKeyChallengeNotFound(merged),
             Self::HostKeyVerificationCancelled(_) => Self::HostKeyVerificationCancelled(merged),
+            Self::TrustStoreError(_) => Self::TrustStoreError(merged),
+            Self::HostKeySaveFailed(_) => Self::HostKeySaveFailed(merged),
         }
     }
 }
@@ -205,7 +217,9 @@ impl From<AppError> for AppErrorInfo {
             | AppError::SftpPublishError(detail) => detail,
             AppError::HostKeyRejected(detail)
             | AppError::HostKeyChallengeNotFound(detail)
-            | AppError::HostKeyVerificationCancelled(detail) => detail,
+            | AppError::HostKeyVerificationCancelled(detail)
+            | AppError::TrustStoreError(detail)
+            | AppError::HostKeySaveFailed(detail) => detail,
             AppError::IoError(detail) => detail.to_string(),
         };
         Self {
@@ -280,6 +294,19 @@ mod tests {
         assert_eq!(
             AppError::HostKeyVerificationCancelled("session-1".to_string()).code(),
             "HostKeyVerificationCancelled"
+        );
+    }
+
+    /// 信任存储与保存失败使用稳定英文代码，供前端区分 fail-closed 与保存失败。
+    #[test]
+    fn trust_store_errors_have_stable_codes() {
+        assert_eq!(
+            AppError::TrustStoreError("known_hosts 解析失败".to_string()).code(),
+            "TrustStoreError"
+        );
+        assert_eq!(
+            AppError::HostKeySaveFailed("write denied".to_string()).code(),
+            "HostKeySaveFailed"
         );
     }
 

@@ -8,6 +8,7 @@
 
 use crate::errors::app_error::AppError;
 use crate::models::session::HostIdentityChallenge;
+use crate::storage::trust_store::{TrustRecord, TrustStore};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use sha2::{Digest, Sha256};
@@ -27,6 +28,9 @@ pub struct PresentedHostKey {
     pub algorithm: String,
     /// OpenSSH 风格 SHA-256 指纹（SHA256:base64 无填充）
     pub fingerprint: String,
+    /// ssh2 提供的原始主机公钥 blob（OpenSSH wire 格式）；"接受并保存"持久化用，
+    /// 绝不进入 challenge 事件 payload（前端只看到指纹）
+    pub blob: Vec<u8>,
 }
 
 /// 统一校验入口：由 HostIdentityService 按 session 构建，注入 transport。
@@ -63,6 +67,8 @@ enum Decision {
 /// decision 单独加锁，等待者不持有服务级状态锁。
 struct ChallengeWait {
     challenge: HostIdentityChallenge,
+    /// challenge 创建时快照的完整公钥 blob："接受并保存"持久化使用，不发送给前端
+    presented_blob: Vec<u8>,
     decision: Mutex<Option<Decision>>,
     signal: Condvar,
     /// 当前等待该 challenge 的连接数（诊断与测试观察合并进度）
@@ -102,10 +108,13 @@ impl IdentityKey {
     }
 }
 
-/// 主机身份确认服务：临时信任、pending challenge 与等待者的后端权威。
+/// 主机身份确认服务：临时信任、pending challenge 与等待者的后端权威，
+/// 并持有 TitanSSH 独立信任存储（应用数据目录下的 known_hosts）。
 #[derive(Clone)]
 pub struct HostIdentityService {
     state: Arc<Mutex<IdentityState>>,
+    /// 持久化信任存储；None 表示未初始化（等价空信任存储，仅测试路径使用）
+    trust_store: Arc<Mutex<Option<TrustStore>>>,
 }
 
 impl Default for HostIdentityService {
@@ -124,6 +133,40 @@ impl HostIdentityService {
                 pending_index: HashMap::new(),
                 cancelled: HashSet::new(),
             })),
+            trust_store: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 初始化 TitanSSH 独立信任存储（应用数据目录下的 known_hosts）。
+    ///
+    /// 应用启动 setup 阶段调用一次；目录创建失败返回 TrustStoreError。
+    /// 不读取或写入系统 `~/.ssh/known_hosts`，也不使用 keyring。
+    pub fn init_trust_store<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), AppError> {
+        let store = TrustStore::new(app)?;
+        *self
+            .trust_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+        Ok(())
+    }
+
+    /// 测试构造：注入指定路径的信任存储。
+    #[cfg(test)]
+    pub(crate) fn with_trust_store_path(path: std::path::PathBuf) -> Self {
+        Self::with_trust_store(TrustStore::from_file_path(path))
+    }
+
+    /// 测试构造：注入现成的信任存储实例。
+    #[cfg(test)]
+    pub(crate) fn with_trust_store(store: TrustStore) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(IdentityState {
+                trusted: HashSet::new(),
+                pending: HashMap::new(),
+                pending_index: HashMap::new(),
+                cancelled: HashSet::new(),
+            })),
+            trust_store: Arc::new(Mutex::new(Some(store))),
         }
     }
 
@@ -133,8 +176,11 @@ impl HostIdentityService {
         Arc::new(move |presented| service.verify(&app, &session_id, presented))
     }
 
-    /// 统一校验：已信任直接放行；未知主机派发 challenge 事件并阻塞等待用户决定。
+    /// 统一校验：持久化信任精确匹配直接放行；已信任直接放行；未知主机派发
+    /// challenge 事件并阻塞等待用户决定。信任存储不可读/不可解析时 fail-closed。
     /// 同一 Session、endpoint 与指纹的并发连接合并到同一 challenge。
+    /// 已关闭 Session 的迟到校验器（含已保存 key 精确匹配）仍必须立即失败，
+    /// 不得借持久化信任继续认证。
     pub fn verify<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -147,13 +193,50 @@ impl HostIdentityService {
             port: presented.port,
             fingerprint: presented.fingerprint.clone(),
         };
-        let (wait, created) = {
-            let mut state = self
+        {
+            let state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // 会话已关闭：迟到校验器（如已发放给 Monitoring worker）立即失败，
             // 不再创建无人取消的 challenge
+            if state.cancelled.contains(session_id) {
+                return Err(AppError::HostKeyVerificationCancelled(
+                    session_id.to_string(),
+                ));
+            }
+            if state.trusted.contains(&key) {
+                return Ok(());
+            }
+        }
+        // 持久化信任：精确 host+port+算法+完整公钥匹配即静默放行；存储错误 fail-closed；
+        // 已保存记录与呈现 key 不一致仍产生 challenge（变更警告在 #33 细化）
+        if let Some(store) = self
+            .trust_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            match store.lookup(&presented.host, presented.port)? {
+                Some(record)
+                    if record.matches(
+                        &presented.host,
+                        presented.port,
+                        &presented.algorithm,
+                        &presented.blob,
+                    ) =>
+                {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        let (wait, created) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // 两次状态锁之间会话可能被关闭：再次校验，不得为已关闭会话创建 challenge
             if state.cancelled.contains(session_id) {
                 return Err(AppError::HostKeyVerificationCancelled(
                     session_id.to_string(),
@@ -186,6 +269,7 @@ impl HostIdentityService {
                         signal: Condvar::new(),
                         waiting: AtomicUsize::new(0),
                         challenge,
+                        presented_blob: presented.blob.clone(),
                     });
                     state
                         .pending
@@ -251,6 +335,85 @@ impl HostIdentityService {
             wait
         };
         Self::decide(&wait, Decision::Accepted);
+        Ok(())
+    }
+
+    /// 接受并保存：把 challenge 快照的算法 + 完整公钥持久化到信任存储，
+    /// 然后像 accept 一样记录临时信任并唤醒全部等待者。
+    ///
+    /// 保存失败时 challenge 保持未决（不授予任何信任，不自动降级为临时信任），
+    /// 以 HostKeySaveFailed 结构化返回，用户可重试保存、改选仅本次接受或拒绝。
+    /// 保存成功后，其他 Session 中同 endpoint + 同 key 的 pending challenge 一并放行。
+    pub fn accept_and_save(&self, challenge_id: &str) -> Result<(), AppError> {
+        // 快照 challenge 的 endpoint 与完整公钥（不取出 pending，失败时保持未决）
+        let record = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let wait = state
+                .pending
+                .get(challenge_id)
+                .cloned()
+                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
+            TrustRecord {
+                host: wait.challenge.host.clone(),
+                port: wait.challenge.port,
+                algorithm: wait.challenge.key_algorithm.clone(),
+                blob: wait.presented_blob.clone(),
+            }
+        };
+
+        // 持久化：trust store 内部串行化读写并安全发布，失败不改动旧记录
+        let store = self
+            .trust_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                AppError::HostKeySaveFailed("信任存储未初始化，无法持久化信任记录".to_string())
+            })?;
+        store
+            .upsert(record)
+            .map_err(|error| AppError::HostKeySaveFailed(error.to_string()))?;
+
+        // 状态锁内：移除本 challenge + 写入临时信任；同 endpoint + 同 key 的
+        // 其他 Session pending challenge 一并移除（其等待者由持久化信任覆盖）
+        let (wait, released_others) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(wait) = state.pending.remove(challenge_id) else {
+                // 保存已生效但 challenge 已被其他路径解决（并发决定）：仍视为成功
+                return Ok(());
+            };
+            let key = IdentityKey::from_challenge(&wait.challenge);
+            state.pending_index.remove(&key);
+            state.trusted.insert(key);
+            let others: Vec<Arc<ChallengeWait>> = state
+                .pending
+                .values()
+                .filter(|other| {
+                    other.challenge.host == wait.challenge.host
+                        && other.challenge.port == wait.challenge.port
+                        && other.challenge.key_algorithm == wait.challenge.key_algorithm
+                        && other.presented_blob == wait.presented_blob
+                })
+                .cloned()
+                .collect();
+            for other in &others {
+                state.pending.remove(&other.challenge.challenge_id);
+                state
+                    .pending_index
+                    .remove(&IdentityKey::from_challenge(&other.challenge));
+            }
+            (wait, others)
+        };
+        Self::decide(&wait, Decision::Accepted);
+        for other in released_others {
+            Self::decide(&other, Decision::Accepted);
+        }
         Ok(())
     }
 
@@ -391,12 +554,16 @@ impl HostIdentityService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::trust_store::{TrustRecord, TrustStore};
     use serde_json::Value;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
     use tauri::Listener;
     use tauri::test::mock_app;
+    use uuid::Uuid;
 
     fn make_presented(fingerprint: &str) -> PresentedHostKey {
         PresentedHostKey {
@@ -404,7 +571,382 @@ mod tests {
             port: 22,
             algorithm: "ssh-ed25519".to_string(),
             fingerprint: fingerprint.to_string(),
+            blob: b"blob".to_vec(),
         }
+    }
+
+    /// 隔离的临时信任存储路径（默认不存在，等价空信任存储）。
+    fn temp_trust_path() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("titan-identity-trust-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir.join("known_hosts")
+    }
+
+    /// 构造带信任存储的服务并预置指定记录。
+    fn service_with_record(record: TrustRecord) -> (HostIdentityService, PathBuf) {
+        let path = temp_trust_path();
+        let store = TrustStore::from_file_path(path.clone());
+        store.upsert(record).expect("预置记录应写入成功");
+        (HostIdentityService::with_trust_store(store), path)
+    }
+
+    /// 等待指定 Session 出现 pending challenge（超时则 panic）。
+    fn wait_pending(service: &HostIdentityService, session_id: &str) -> HostIdentityChallenge {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.pending_challenge(session_id).is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        service
+            .pending_challenge(session_id)
+            .expect("challenge 已创建")
+    }
+
+    /// 已保存 key 精确匹配：verify 在认证前直接放行，不产生 challenge。
+    #[test]
+    fn saved_key_exact_match_skips_challenge() {
+        let app = mock_app();
+        let events = Arc::new(AtomicUsize::new(0));
+        let counter = events.clone();
+        app.listen("host-identity:challenge", move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+
+        verifier(&make_presented("SHA256:match")).expect("匹配记录应静默放行");
+        assert!(service.pending_challenge("session-1").is_none());
+        assert_eq!(events.load(Ordering::Relaxed), 0, "匹配时不产生 challenge");
+    }
+
+    /// 已关闭 Session 的迟到校验器不得借持久化信任继续认证：取消检查先于匹配放行。
+    #[test]
+    fn cancelled_session_fails_even_when_key_is_saved() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-gone".to_string());
+
+        service.cancel_session("session-gone");
+        let error = verifier(&make_presented("SHA256:match")).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "HostKeyVerificationCancelled",
+            "关闭后的 Session 即使 key 已保存也不得进入认证"
+        );
+        assert!(service.pending_challenge("session-gone").is_none());
+    }
+
+    /// 已保存 key 的匹配是精确的：host 拼写、端口、算法或公钥任一不同都产生 challenge。
+    #[test]
+    fn saved_key_match_is_exact_on_all_fields() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"blob".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+
+        let variants = [
+            PresentedHostKey {
+                host: "10.0.0.9".to_string(),
+                ..make_presented("SHA256:a")
+            },
+            PresentedHostKey {
+                port: 2222,
+                ..make_presented("SHA256:b")
+            },
+            PresentedHostKey {
+                algorithm: "ssh-rsa".to_string(),
+                ..make_presented("SHA256:c")
+            },
+            PresentedHostKey {
+                blob: b"other".to_vec(),
+                ..make_presented("SHA256:d")
+            },
+        ];
+        for presented in variants {
+            let verifier = verifier.clone();
+            let waiter = thread::spawn(move || verifier(&presented));
+            let challenge = wait_pending(&service, "session-1");
+            service.reject(&challenge.challenge_id).unwrap();
+            assert_eq!(
+                waiter.join().unwrap().unwrap_err().code(),
+                "HostKeyRejected",
+                "任一字段不匹配都必须重新确认"
+            );
+        }
+    }
+
+    /// 信任文件缺失：等价空信任存储，未知主机仍走 challenge。
+    #[test]
+    fn missing_trust_file_means_empty_store() {
+        let app = mock_app();
+        let service = HostIdentityService::with_trust_store_path(temp_trust_path());
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:empty");
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("空信任存储下接受后放行");
+    }
+
+    /// 信任文件损坏：fail-closed，verify 以 TrustStoreError 失败，不产生 challenge。
+    #[test]
+    fn corrupt_trust_store_fails_closed_without_challenge() {
+        let app = mock_app();
+        let path = temp_trust_path();
+        fs::write(&path, "10.0.0.8 ssh-ed25519\n").unwrap();
+        let service = HostIdentityService::with_trust_store_path(path);
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+
+        let error = verifier(&make_presented("SHA256:corrupt")).unwrap_err();
+        assert_eq!(error.code(), "TrustStoreError");
+        assert!(
+            service.pending_challenge("session-1").is_none(),
+            "fail-closed 不得产生 challenge"
+        );
+    }
+
+    /// 接受并保存：等待连接继续认证，记录持久化，后续 Session 静默复用。
+    #[test]
+    fn accept_and_save_persists_and_releases_waiters() {
+        let app = mock_app();
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"unrelated".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:save");
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+
+        service.accept_and_save(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("保存成功后放行认证");
+        // 磁盘真实内容：endpoint 记录已写入（含原无关记录，不丢其他 endpoint）
+        let records = TrustStore::from_file_path(path).reload().unwrap();
+        assert_eq!(records.len(), 2);
+        let saved = records
+            .iter()
+            .find(|record| record.host == "10.0.0.8" && record.port == 22)
+            .expect("endpoint 记录已保存");
+        assert_eq!(saved.algorithm, "ssh-ed25519");
+        assert_eq!(saved.blob, b"blob");
+
+        // 后续 Runtime Session：匹配记录静默放行，不再提示
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        verifier_b(&make_presented("SHA256:save")).expect("保存后新 Session 不再提示");
+    }
+
+    /// 同一 endpoint 已保存不同 key：仍产生 challenge；接受并保存覆盖为当前记录。
+    #[test]
+    fn accept_and_save_overwrites_previous_record_for_endpoint() {
+        let app = mock_app();
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            algorithm: "ssh-rsa".to_string(),
+            blob: b"old-key".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:rotate");
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+
+        service.accept_and_save(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().unwrap();
+        let records = TrustStore::from_file_path(path).reload().unwrap();
+        assert_eq!(records.len(), 1, "同一 endpoint 只保留一条记录");
+        assert_eq!(records[0].algorithm, "ssh-ed25519");
+        assert_eq!(records[0].blob, b"blob");
+    }
+
+    /// 保存失败：challenge 保持未决，不降级为临时信任，错误结构化返回。
+    #[test]
+    fn save_failure_keeps_challenge_unresolved_without_temporary_trust() {
+        let app = mock_app();
+        let events = Arc::new(AtomicUsize::new(0));
+        let counter = events.clone();
+        app.listen("host-identity:challenge", move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let (service, path) = service_with_record(TrustRecord {
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"unrelated".to_vec(),
+        });
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:fail");
+        let waiter = thread::spawn({
+            let presented = presented.clone();
+            let verifier = verifier.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+
+        // 破坏发布目标：文件路径替换为目录，写盘必然失败（读取缓存不受影响）
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let error = service
+            .accept_and_save(&challenge.challenge_id)
+            .unwrap_err();
+        assert_eq!(error.code(), "HostKeySaveFailed");
+        // challenge 保持未决：等待者仍在等待，pending 未清除
+        assert_eq!(
+            service.pending_challenge("session-1").unwrap().challenge_id,
+            challenge.challenge_id
+        );
+        // 不降级为临时信任：同一 Session 的并发连接合并到同一 challenge，而非放行
+        let verifier2 = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented2 = presented.clone();
+        let waiter2 = thread::spawn(move || verifier2(&presented2));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.waiting_connections(&challenge.challenge_id) < 2 && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            service.waiting_connections(&challenge.challenge_id),
+            2,
+            "保存失败不得授予临时信任"
+        );
+        assert_eq!(
+            events.load(Ordering::Relaxed),
+            1,
+            "合并到同一 challenge 不重复派发"
+        );
+        // 用户可改选仅本次接受：challenge 正常解决，全部等待者放行
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("改选仅本次接受后放行");
+        waiter2.join().unwrap().expect("改选仅本次接受后放行");
+    }
+
+    /// 应用 setup 路径：init_trust_store 后保存记录可读，未初始化则保存失败（fail-closed）。
+    #[test]
+    fn init_trust_store_populates_managed_store() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        service
+            .init_trust_store(&app.handle())
+            .expect("初始化应成功");
+        // mock app 的应用数据目录在测试间共享：使用唯一 host 避免测试间写入互相干扰
+        let unique_host = format!("10.0.0.{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let presented = PresentedHostKey {
+            host: unique_host.clone(),
+            ..make_presented("SHA256:init")
+        };
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+        service.accept_and_save(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().unwrap();
+        // 初始化后的持久化信任生效：新 Session 同 endpoint 静默放行
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        verifier_b(&PresentedHostKey {
+            host: unique_host,
+            ..make_presented("SHA256:init")
+        })
+        .expect("初始化后的信任存储应命中");
+    }
+
+    /// 未初始化信任存储时保存失败且 challenge 保持未决（fail-closed，不吞错）。
+    #[test]
+    fn accept_and_save_without_store_keeps_challenge_pending() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:nostore");
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-1");
+
+        let error = service
+            .accept_and_save(&challenge.challenge_id)
+            .unwrap_err();
+        assert_eq!(error.code(), "HostKeySaveFailed");
+        assert_eq!(
+            service.pending_challenge("session-1").unwrap().challenge_id,
+            challenge.challenge_id
+        );
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().unwrap();
+    }
+
+    /// 跨 Session：保存成功后，其他 Session 中同 endpoint + 同 key 的 pending challenge 一并放行。
+    #[test]
+    fn save_releases_identical_pending_challenges_in_other_sessions() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"unrelated".to_vec(),
+        });
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let presented = make_presented("SHA256:shared");
+        let waiter_a = thread::spawn({
+            let presented = presented.clone();
+            let verifier_a = verifier_a.clone();
+            move || verifier_a(&presented)
+        });
+        let waiter_b = thread::spawn(move || verifier_b(&presented));
+        let challenge_a = wait_pending(&service, "session-a");
+        let challenge_b = wait_pending(&service, "session-b");
+        assert_ne!(challenge_a.challenge_id, challenge_b.challenge_id);
+
+        service.accept_and_save(&challenge_a.challenge_id).unwrap();
+        waiter_a.join().unwrap().expect("发起保存的 Session 放行");
+        waiter_b
+            .join()
+            .unwrap()
+            .expect("相同 endpoint+key 的其他 Session 一并放行");
+        assert!(service.pending_challenge("session-b").is_none());
+    }
+
+    /// 跨 Session 保存不放行不同 key 的 pending challenge；其等待者仍按需解决。
+    #[test]
+    fn save_does_not_release_pending_challenge_with_different_key() {
+        let app = mock_app();
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"unrelated".to_vec(),
+        });
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_c = service.verifier(app.handle().clone(), "session-c".to_string());
+        let presented_a = make_presented("SHA256:saved-key");
+        let presented_c = PresentedHostKey {
+            blob: b"different".to_vec(),
+            ..make_presented("SHA256:other-key")
+        };
+        let waiter_a = thread::spawn(move || verifier_a(&presented_a));
+        let waiter_c = thread::spawn(move || verifier_c(&presented_c));
+        let challenge_a = wait_pending(&service, "session-a");
+        let challenge_c = wait_pending(&service, "session-c");
+
+        service.accept_and_save(&challenge_a.challenge_id).unwrap();
+        waiter_a.join().unwrap().unwrap();
+        // session-c 的 key 不同：保存不自动放行，challenge 仍待用户决定
+        assert_eq!(
+            service.pending_challenge("session-c").unwrap().challenge_id,
+            challenge_c.challenge_id
+        );
+        service.accept(&challenge_c.challenge_id).unwrap();
+        waiter_c.join().unwrap().unwrap();
     }
 
     /// 首次未知主机产生 challenge 事件；接受后同一 Session 的后续连接（含重连）直接放行。

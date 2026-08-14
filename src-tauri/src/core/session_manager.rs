@@ -401,6 +401,7 @@ mod tests {
                 port: 22,
                 algorithm: "ssh-ed25519".to_string(),
                 fingerprint: "SHA256:manager-close".to_string(),
+                blob: b"blob".to_vec(),
             })
         });
         let deadline = Instant::now() + Duration::from_secs(2);

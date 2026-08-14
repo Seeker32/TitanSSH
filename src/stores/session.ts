@@ -16,6 +16,8 @@ interface SessionState {
   connections: Map<string, SessionConnection>;
   /** 按 sessionId 存储的主机身份确认投影；接受/拒绝后清除。 */
   hostKeyChallenges: Map<string, HostIdentityChallenge>;
+  /** 按 sessionId 存储的"接受并保存"结构化失败；challenge 保持未决，改选或新 challenge 后清除。 */
+  hostKeySaveErrors: Map<string, AppErrorInfo>;
   openSession: (hostId: string) => Promise<SessionInfo>;
   closeSession: (sessionId: string) => Promise<void>;
   writeTerminal: (sessionId: string, data: string) => Promise<void>;
@@ -24,6 +26,7 @@ interface SessionState {
   applySessionStatus: (payload: SessionStatusEvent) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
   applyHostIdentityChallenge: (payload: HostIdentityChallenge) => void;
+  acceptAndSaveHostIdentity: (sessionId: string) => Promise<void>;
   acceptHostIdentity: (sessionId: string) => Promise<void>;
   rejectHostIdentity: (sessionId: string) => Promise<void>;
   removeSessionProjection: (sessionId: string) => void;
@@ -70,12 +73,26 @@ export function overlayStatus(status: SessionStatus): boolean {
     || status === SessionStatus.Error;
 }
 
+/** 从不可变投影副本中移除指定 Session 的主机身份确认卡与保存错误。 */
+function withoutHostKeyProjection(
+  hostKeyChallenges: Map<string, HostIdentityChallenge>,
+  hostKeySaveErrors: Map<string, AppErrorInfo>,
+  sessionId: string,
+): { hostKeyChallenges: Map<string, HostIdentityChallenge>; hostKeySaveErrors: Map<string, AppErrorInfo> } {
+  const challenges = new Map(hostKeyChallenges);
+  challenges.delete(sessionId);
+  const saveErrors = new Map(hostKeySaveErrors);
+  saveErrors.delete(sessionId);
+  return { hostKeyChallenges: challenges, hostKeySaveErrors: saveErrors };
+}
+
 export const useSessionStore = create<SessionState>((set, get) => {
   return {
     sessions: new Map(),
     activeView: null,
     connections: new Map(),
     hostKeyChallenges: new Map(),
+    hostKeySaveErrors: new Map(),
 
     /** 从前端投影移除会话及其关联状态；后端 teardown 由调用方保证。 */
     removeSessionProjection(sessionId: string) {
@@ -84,9 +101,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
         sessions.delete(sessionId);
         const connections = new Map(state.connections);
         connections.delete(sessionId);
-        const hostKeyChallenges = new Map(state.hostKeyChallenges);
-        hostKeyChallenges.delete(sessionId);
-        return { sessions, connections, hostKeyChallenges, activeView: state.activeView === sessionId ? null : state.activeView };
+        const projection = withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId);
+        return { sessions, connections, ...projection, activeView: state.activeView === sessionId ? null : state.activeView };
       });
       useMonitorStore.getState().clearSession(sessionId);
       useSftpStore.getState().clearSession(sessionId);
@@ -142,9 +158,17 @@ export const useSessionStore = create<SessionState>((set, get) => {
       } else {
         connections.delete(payload.sessionId);
       }
+      // 仅 Connected 证明认证已越过验证门：清理确认卡与保存错误投影，覆盖跨
+      // Session 保存自动放行其他标签的路径。其余状态（Error/Timeout/AuthFailed）
+      // 可能携带错误覆盖层，未决 challenge 必须保持可见可决，不做隐式清理。
+      let projection = { hostKeyChallenges: get().hostKeyChallenges, hostKeySaveErrors: get().hostKeySaveErrors };
+      if (payload.status === SessionStatus.Connected) {
+        projection = withoutHostKeyProjection(projection.hostKeyChallenges, projection.hostKeySaveErrors, payload.sessionId);
+      }
       set((state) => ({
         sessions: new Map(state.sessions).set(payload.sessionId, { ...current, status: payload.status }),
         connections,
+        ...projection,
       }));
     },
 
@@ -157,10 +181,38 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }));
     },
 
-    /** 应用主机身份确认事件：按 sessionId 存储确认卡投影。 */
+    /** 应用主机身份确认事件：按 sessionId 存储确认卡投影；新 challenge 清除此前的保存错误。 */
     applyHostIdentityChallenge(payload) {
+      set((state) => {
+        const hostKeySaveErrors = new Map(state.hostKeySaveErrors);
+        hostKeySaveErrors.delete(payload.sessionId);
+        return {
+          hostKeyChallenges: new Map(state.hostKeyChallenges).set(payload.sessionId, payload),
+          hostKeySaveErrors,
+        };
+      });
+    },
+
+    /** 接受并保存：把 challenge 快照的公钥持久化为长期信任并放行当前 Session。
+     *  保存失败（HostKeySaveFailed）时 challenge 保持未决，结构化错误显示在所属标签，
+     *  绝不自动降级为临时信任；用户可重试保存、改选仅本次接受或拒绝。 */
+    async acceptAndSaveHostIdentity(sessionId) {
+      const challenge = get().hostKeyChallenges.get(sessionId);
+      if (!challenge) return;
+      try {
+        await invoke('accept_and_save_host_identity', { challengeId: challenge.challengeId });
+      } catch (error) {
+        const appError = toAppError(error);
+        if (appError.code !== 'HostKeyChallengeNotFound') {
+          set((state) => ({
+            hostKeySaveErrors: new Map(state.hostKeySaveErrors).set(sessionId, appError),
+          }));
+          return;
+        }
+        // challenge 已不存在（并发解决）：仅撤下过期确认卡
+      }
       set((state) => ({
-        hostKeyChallenges: new Map(state.hostKeyChallenges).set(payload.sessionId, payload),
+        ...withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId),
       }));
     },
 
@@ -175,11 +227,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
         // 后端权威：challenge 已解决时确认卡投影已过期；其他错误保留确认卡，避免掩盖未决决定
         if (toAppError(error).code !== 'HostKeyChallengeNotFound') return;
       }
-      set((state) => {
-        const hostKeyChallenges = new Map(state.hostKeyChallenges);
-        hostKeyChallenges.delete(sessionId);
-        return { hostKeyChallenges };
-      });
+      set((state) => ({
+        ...withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId),
+      }));
     },
 
     /** 拒绝未知主机身份并关闭整个 Session：Terminal、SFTP 与 Monitoring 服从同一决定。
@@ -193,11 +243,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
       } catch (error) {
         if (toAppError(error).code !== 'HostKeyChallengeNotFound') return;
         // 决定已生效（重复操作/并发）：仅撤下确认卡，会话可能仍存活
-        set((state) => {
-          const hostKeyChallenges = new Map(state.hostKeyChallenges);
-          hostKeyChallenges.delete(sessionId);
-          return { hostKeyChallenges };
-        });
+        set((state) => ({
+          ...withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId),
+        }));
         return;
       }
       get().removeSessionProjection(sessionId);

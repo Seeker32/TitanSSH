@@ -1113,6 +1113,7 @@ mod integration_tests {
                 port: 22,
                 algorithm: "ssh-ed25519".to_string(),
                 fingerprint: "SHA256:terminal-wait".to_string(),
+                blob: b"blob".to_vec(),
             }),
             // 预算远小于下方等待时长：验证等待期间不设独立自动超时
             Duration::from_millis(300),
@@ -1167,6 +1168,7 @@ mod integration_tests {
                     port: 22,
                     algorithm: "ssh-ed25519".to_string(),
                     fingerprint: "SHA256:terminal-deadline".to_string(),
+                    blob: b"blob".to_vec(),
                 };
                 verifier(&presented)?;
                 on_phase(ConnectPhase::Authenticating);
@@ -1245,6 +1247,7 @@ mod integration_tests {
                 port: 22,
                 algorithm: "ssh-ed25519".to_string(),
                 fingerprint: "SHA256:terminal-deny".to_string(),
+                blob: b"blob".to_vec(),
             }),
             Duration::from_secs(15),
         );
@@ -1292,6 +1295,7 @@ mod integration_tests {
                 port: 22,
                 algorithm: "ssh-ed25519".to_string(),
                 fingerprint: "SHA256:terminal-cancel".to_string(),
+                blob: b"blob".to_vec(),
             }),
             Duration::from_secs(15),
         );

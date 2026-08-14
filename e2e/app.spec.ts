@@ -29,6 +29,10 @@ test.beforeEach(async ({ page }) => {
     const identityWaiterResults: Array<{ command: string; code: string | null }> = [];
     // 测试开启后，open_session 立即派发未知主机 challenge（模拟后端连接到达校验门）
     let autoHostIdentity = false;
+    // 持久化信任记录（issue #32）：保存成功后同 endpoint 的新 Session 静默放行不再提示
+    const savedTrust = new Map<string, { algorithm: string; fingerprint: string }>();
+    /** 精确 endpoint 键：host + port（与后端信任记录归属一致）。 */
+    const endpointKey = (host: string, port: number) => `${host}:${port}`;
     /** 向所有已注册监听器派发结构化 Tauri 事件。 */
     const emitEvent = (name: string, payload: unknown) => {
       if (name === 'host-identity:challenge' && payload && typeof payload === 'object' && 'sessionId' in payload) {
@@ -99,8 +103,9 @@ test.beforeEach(async ({ page }) => {
           return undefined;
         }
         if (command === 'open_session') {
-          // 未知主机：连接到达统一校验门，mock 后端派发 challenge；认证前不返回 capability 数据
-          if (autoHostIdentity) {
+          // 未知主机：连接到达统一校验门，mock 后端派发 challenge；认证前不返回 capability 数据。
+          // 已保存信任记录的 endpoint：静默放行，不派发 challenge，直接进入 Connected
+          if (autoHostIdentity && !savedTrust.has(endpointKey('10.0.0.8', 22))) {
             emitEvent('host-identity:challenge', {
               challengeId: 'challenge-auto',
               sessionId: 'session-1',
@@ -114,8 +119,26 @@ test.beforeEach(async ({ page }) => {
             setTimeout(() => {
               emitEvent('session:progress', { sessionId: 'session-1', phase: 'VerifyingHostKey', timestamp: Date.now() });
             }, 0);
+          } else if (autoHostIdentity) {
+            setTimeout(() => {
+              emitEvent('session:status', { sessionId: 'session-1', status: 'Connected', message: null });
+            }, 0);
           }
           return session;
+        }
+        if (command === 'accept_and_save_host_identity') {
+          const entry = pendingByChallengeId(args.challengeId);
+          if (!entry) throw { code: 'HostKeyChallengeNotFound', detail: String(args.challengeId) };
+          pendingChallenges.delete(entry.challenge.sessionId);
+          entry.waiters.forEach((waiter) => {
+            identityWaiterResults.push({ command: waiter.command, code: null });
+            waiter.resolve();
+          });
+          // 持久化信任记录：后续新 Session 同 endpoint 不再产生 challenge
+          savedTrust.set(endpointKey('10.0.0.8', 22), { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:aGVscG1l' });
+          // 后端放行认证：终端会话进入 Connected
+          emitEvent('session:status', { sessionId: entry.challenge.sessionId, status: 'Connected', message: null });
+          return undefined;
         }
         if (command === 'accept_host_identity') {
           const entry = pendingByChallengeId(args.challengeId);
@@ -171,6 +194,10 @@ test.beforeEach(async ({ page }) => {
         /** 每个 gated capability 的决定终局，证明三 capability 服从同一决定。 */
         identityWaiterResults() {
           return [...identityWaiterResults];
+        },
+        /** 已保存的持久化信任记录数（验收：保存后新 Session 不再提示）。 */
+        savedTrustCount() {
+          return savedTrust.size;
         },
         /** 让下一次匹配 command 的 invoke 以结构化错误拒绝（与后端 AppErrorInfo 契约一致）。 */
         failNext(command: string, error: { code: string; detail?: string }) {
@@ -590,4 +617,73 @@ test('等待确认期间关闭标签取消验证：不发起认证并取消全�
     __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
   }).__TAURI_TEST__.calls.filter((call) => call.command === 'close_session'));
   expect(closeCalls).toEqual([{ command: 'close_session', args: { sessionId: 'session-1' } }]);
+});
+
+test('接受并保存：保存信任记录后新 Session 静默放行，不再提示', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableHostIdentity: () => void };
+  }).__TAURI_TEST__.enableHostIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const card = page.locator('.terminal-pane').getByTestId('host-identity-card');
+  await expect(card).toBeVisible();
+
+  // 接受并保存：同一决定放行全部等待者，信任记录持久化
+  await page.getByTestId('host-identity-save').click();
+  const saveCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_and_save_host_identity'));
+  expect(saveCalls).toEqual([{ command: 'accept_and_save_host_identity', args: { challengeId: 'challenge-auto' } }]);
+  await expect(card).toHaveCount(0);
+  await expect(page.getByText('syslog')).toBeVisible();
+  await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { savedTrustCount: () => number };
+  }).__TAURI_TEST__.savedTrustCount())).toBe(1);
+
+  // 关闭后重开：同 endpoint 已保存，静默放行进入 Connected，不产生 challenge
+  await page.locator('.tab .close-btn').click();
+  await expect(page.locator('.empty-state')).toBeVisible();
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(page.locator('.terminal-pane').getByTestId('host-identity-card')).toHaveCount(0);
+  await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
+  const identityCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command.startsWith('accept_') || call.command === 'reject_host_identity'));
+  expect(identityCalls).toEqual([
+    { command: 'accept_and_save_host_identity', args: { challengeId: 'challenge-auto' } },
+  ]);
+});
+
+test('保存失败：challenge 保持未决并显示结构化错误，可改选仅本次接受', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate((setup) => {
+    const bridge = (window as unknown as {
+      __TAURI_TEST__: { enableHostIdentity: () => void; failNext: (command: string, error: { code: string; detail?: string }) => void };
+    }).__TAURI_TEST__;
+    bridge.enableHostIdentity();
+    bridge.failNext('accept_and_save_host_identity', { code: 'HostKeySaveFailed', detail: 'write denied' });
+  }, undefined);
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const card = page.locator('.terminal-pane').getByTestId('host-identity-card');
+  await expect(card).toBeVisible();
+
+  await page.getByTestId('host-identity-save').click();
+  // 保存失败：确认卡保持未决，结构化错误显示在所属标签；等待者仍阻塞在校验门后
+  await expect(card).toBeVisible();
+  await expect(card.getByTestId('host-identity-save-error')).toContainText('write denied');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(2);
+  // 失败绝不自动降级为临时信任：没有 accept_host_identity 调用
+  const acceptCallsAfterFail = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
+  expect(acceptCallsAfterFail).toHaveLength(0);
+
+  // 用户明确改选仅本次接受：正常解决并放行全部等待者
+  await page.getByTestId('host-identity-accept').click();
+  await expect(card).toHaveCount(0);
+  await expect(page.getByText('syslog')).toBeVisible();
+  await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
 });

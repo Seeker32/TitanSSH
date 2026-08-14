@@ -31,6 +31,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // 初始化 TitanSSH 独立信任存储（应用数据目录下的 known_hosts）；
+            // 不读取系统 ~/.ssh/known_hosts，也不使用 keyring
+            app.state::<HostIdentityService>()
+                .init_trust_store(app.handle())?;
+            Ok(())
+        })
         .manage(SessionManager::new(
             monitor_service.clone(),
             sftp_service.clone(),
@@ -50,6 +57,7 @@ pub fn run() {
             commands::session::resize_terminal,
             commands::session::list_sessions,
             commands::host_identity::accept_host_identity,
+            commands::host_identity::accept_and_save_host_identity,
             commands::host_identity::reject_host_identity,
             commands::monitor::start_monitoring,
             commands::monitor::stop_monitoring,

@@ -148,7 +148,7 @@ describe('React components', () => {
 
   it('终端面板保留每个会话实例，仅展示当前视图', () => {
     render(<TerminalPane sessions={[makeSession(), makeSession({ sessionId: 'session-2' })]} activeView="session-2"
-      connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     const terminals = screen.getAllByTestId('xterm');
     expect(terminals).toHaveLength(2);
     expect(terminals[0]).not.toBeVisible();
@@ -157,7 +157,7 @@ describe('React components', () => {
 
   it('无会话时终端面板显示空态页并可新建主机', () => {
     const onCreateHost = vi.fn();
-    render(<TerminalPane sessions={[]} activeView={null} connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    render(<TerminalPane sessions={[]} activeView={null} connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByText(/选择左侧主机/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '新建主机' }));
     expect(onCreateHost).toHaveBeenCalledOnce();
@@ -166,7 +166,7 @@ describe('React components', () => {
   it('连接中的会话在终端区域显示加载动画与当前阶段', () => {
     render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     const overlay = screen.getByRole('status');
     expect(overlay).toBeVisible();
     expect(overlay).toHaveTextContent('正在进行 SSH 握手...');
@@ -181,7 +181,8 @@ describe('React components', () => {
     const onCloseTab = vi.fn();
     render(<TerminalPane sessions={[makeSession({ status: SessionStatus.Error })]} activeView="session-1"
       connections={new Map([['session-1', { phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' } }]])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={onCloseTab} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={onCloseTab}
+      onSaveIdentity={vi.fn()} saveErrors={new Map()} />);
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('SSH 连接失败: connection refused');
     await user.click(screen.getByRole('button', { name: '关闭标签' }));
@@ -199,7 +200,7 @@ describe('React components', () => {
         ['session-1', { phase: ConnectionPhase.ConnectingTcp, error: null }],
         ['session-2', { phase: null, error: null }],
       ])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     const overlays = screen.getAllByRole('status').length + screen.getAllByRole('alert', { hidden: true }).length;
     expect(overlays).toBe(2);
     expect(screen.getByRole('status')).toHaveTextContent('正在建立 TCP 连接...');
@@ -210,19 +211,20 @@ describe('React components', () => {
   it('连接中切换语言后覆盖层文案即时更新', () => {
     const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('status')).toHaveTextContent('正在进行 SSH 握手...');
     act(() => useLocaleStore.setState({ locale: 'en-US' }));
     rerender(<TerminalPane sessions={[makeSession()]} activeView="session-1"
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
     act(() => useLocaleStore.setState({ locale: 'zh-CN' }));
   });
 
-  it('主机身份确认卡在终端区域内联呈现 endpoint、算法与指纹，并提供接受与拒绝', async () => {
+  it('主机身份确认卡在终端区域内联呈现 endpoint、算法与指纹，并提供接受并保存/仅本次接受/拒绝', async () => {
     const user = userEvent.setup();
     const accept = vi.fn();
+    const save = vi.fn();
     const reject = vi.fn();
     const challenge: HostIdentityChallenge = {
       challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 2222,
@@ -232,7 +234,7 @@ describe('React components', () => {
       connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
       challenges={new Map([['session-1', challenge]])}
       onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
-      onAcceptIdentity={accept} onRejectIdentity={reject} />);
+      onSaveIdentity={save} saveErrors={new Map()} onAcceptIdentity={accept} onRejectIdentity={reject} />);
     const card = screen.getByTestId('host-identity-card');
     expect(card).toHaveTextContent('10.0.0.8:2222');
     expect(card).toHaveTextContent('ssh-ed25519');
@@ -241,6 +243,35 @@ describe('React components', () => {
     expect(card).toHaveTextContent('正在验证主机身份...');
     expect(screen.queryByRole('status')).toBeNull();
     expect(screen.getByTestId('xterm')).toHaveAttribute('data-interactive', 'false');
+    await user.click(screen.getByRole('button', { name: '接受并保存' }));
+    expect(save).toHaveBeenCalledWith('session-1');
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    expect(accept).toHaveBeenCalledWith('session-1');
+    await user.click(screen.getByRole('button', { name: '拒绝' }));
+    expect(reject).toHaveBeenCalledWith('session-1');
+  });
+
+  it('保存失败时确认卡保持未决并展示结构化错误，用户仍可改选仅本次接受或拒绝', async () => {
+    const user = userEvent.setup();
+    const accept = vi.fn();
+    const reject = vi.fn();
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
+      challenges={new Map([['session-1', challenge]])}
+      saveErrors={new Map([['session-1', { code: 'HostKeySaveFailed', detail: 'write denied' }]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
+      onSaveIdentity={vi.fn()} onAcceptIdentity={accept} onRejectIdentity={reject} />);
+    const card = screen.getByTestId('host-identity-card');
+    const error = screen.getByTestId('host-identity-save-error');
+    expect(card).toContainElement(error);
+    expect(error).toHaveTextContent('保存信任记录失败');
+    expect(error).toHaveTextContent('write denied');
+    // 三个操作仍可用：重试保存、改选仅本次接受或拒绝
+    expect(screen.getByRole('button', { name: '接受并保存' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '仅本次接受' }));
     expect(accept).toHaveBeenCalledWith('session-1');
     await user.click(screen.getByRole('button', { name: '拒绝' }));
@@ -256,7 +287,7 @@ describe('React components', () => {
       connections={new Map([['session-1', { phase: ConnectionPhase.Authenticating, error: null }]])}
       challenges={new Map([['session-1', challenge]])}
       onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
-      onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByTestId('host-identity-card')).not.toHaveTextContent('正在验证主机身份...');
   });
 
@@ -267,10 +298,11 @@ describe('React components', () => {
       challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
       keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
     };
-    render(<HostIdentityCard challenge={challenge} onAccept={vi.fn()} onReject={vi.fn()} />);
+    render(<HostIdentityCard challenge={challenge} onAcceptAndSave={vi.fn()} saveError={null} onAccept={vi.fn()} onReject={vi.fn()} />);
     expect(screen.getByText('Cannot verify host identity')).toBeInTheDocument();
     expect(screen.getByText('Host address')).toBeInTheDocument();
     expect(screen.getByText('SHA-256 fingerprint')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Accept & Save' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Accept Once' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Accept Once' }));
@@ -282,11 +314,11 @@ describe('React components', () => {
     act(() => useLocaleStore.setState({ locale: 'en-US' }));
     const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
     rerender(<TerminalPane sessions={[makeSession({ status: SessionStatus.Timeout })]} activeView="session-1"
       connections={new Map([['session-1', { phase: null, error: null }]])}
-      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+      challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('alert')).toHaveTextContent('Connection timed out');
     await user.click(screen.getByRole('button', { name: 'Close Tab' }));
     act(() => useLocaleStore.setState({ locale: 'zh-CN' }));

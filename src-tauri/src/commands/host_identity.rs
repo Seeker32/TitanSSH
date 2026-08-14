@@ -18,6 +18,23 @@ pub fn accept_host_identity(
         .map_err(AppErrorInfo::from)
 }
 
+/// 接受并保存未知主机身份
+///
+/// 把 challenge 快照的算法与完整公钥持久化到 TitanSSH 独立 known_hosts 文件，
+/// 随后与 accept 一致：为该 Runtime Session 记录临时信任并唤醒全部等待连接。
+/// 保存失败时 challenge 保持未决并以 HostKeySaveFailed 结构化返回，
+/// 前端保持确认卡并展示错误，可重试保存、改选仅本次接受或拒绝。
+#[tauri::command]
+pub fn accept_and_save_host_identity(
+    challenge_id: String,
+    session_manager: State<'_, SessionManager>,
+) -> Result<(), AppErrorInfo> {
+    session_manager
+        .identity_service()
+        .accept_and_save(&challenge_id)
+        .map_err(AppErrorInfo::from)
+}
+
 /// 拒绝未知主机身份并关闭整个 Session
 ///
 /// 同一 challenge 上的全部等待连接以 HostKeyRejected 失败（不进入认证），

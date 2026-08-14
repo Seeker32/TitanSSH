@@ -223,6 +223,64 @@ describe('HomePage integration', () => {
     expect(screen.queryByTestId('host-identity-card')).toBeNull();
   });
 
+  it('接受并保存：调用后端命令；保存失败保持确认卡并展示结构化错误，可改选仅本次接受', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => {
+      emitMockEvent('host-identity:challenge', {
+        challengeId: 'challenge-save', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+        keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_000_000,
+      });
+    });
+
+    // 保存失败：结构化错误显示在所属标签的确认卡内，challenge 保持未决
+    mockInvoke.mockRejectedValueOnce({ code: 'HostKeySaveFailed', detail: 'write denied' });
+    await user.click(screen.getByRole('button', { name: '接受并保存' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('accept_and_save_host_identity', { challengeId: 'challenge-save' }));
+    const card = screen.getByTestId('host-identity-card');
+    expect(within(card).getByTestId('host-identity-save-error')).toHaveTextContent('主机信任保存失败: write denied');
+    expect(within(card).getByRole('button', { name: '接受并保存' })).toBeInTheDocument();
+    // 失败绝不自动降级为临时信任
+    expect(mockInvoke).not.toHaveBeenCalledWith('accept_host_identity', expect.anything());
+
+    // 改选仅本次接受：确认卡与错误一并清除
+    mockInvoke.mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: '仅本次接受' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('accept_host_identity', { challengeId: 'challenge-save' }));
+    expect(screen.queryByTestId('host-identity-card')).toBeNull();
+    expect(useSessionStore.getState().hostKeySaveErrors.has('session-1')).toBe(false);
+  });
+
+  it('保存成功后新 Session 不再提示：连接进入 Connected 时清理确认卡投影', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => {
+      emitMockEvent('host-identity:challenge', {
+        challengeId: 'challenge-save', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+        keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_000_000,
+      });
+    });
+    mockInvoke.mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: '接受并保存' }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('accept_and_save_host_identity', { challengeId: 'challenge-save' }));
+    expect(screen.queryByTestId('host-identity-card')).toBeNull();
+
+    // 其他 Session 的同 key pending challenge 被后端保存自动放行：进入 Connected 后清理确认卡
+    await act(async () => {
+      emitMockEvent('host-identity:challenge', {
+        challengeId: 'challenge-cross', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+        keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_001_000,
+      });
+    });
+    expect(screen.getByTestId('host-identity-card')).toBeVisible();
+    await act(async () => {
+      emitMockEvent('session:status', { sessionId: 'session-1', status: SessionStatus.Connected, error: null });
+    });
+    expect(screen.queryByTestId('host-identity-card')).toBeNull();
+  });
+
   it('无会话时主区显示空态页，新建按钮打开编辑器', async () => {
     const user = userEvent.setup();
     const { container } = render(<HomePage />);

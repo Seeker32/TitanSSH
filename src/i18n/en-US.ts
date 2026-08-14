@@ -127,8 +127,10 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'hostIdentity.endpoint': 'Host address',
   'hostIdentity.algorithm': 'Key algorithm',
   'hostIdentity.fingerprint': 'SHA-256 fingerprint',
+  'hostIdentity.acceptAndSave': 'Accept & Save',
   'hostIdentity.accept': 'Accept Once',
   'hostIdentity.reject': 'Reject',
+  'hostIdentity.saveFailed': 'Failed to save the trust record. Retry saving, accept once, or reject.',
   'session.unknown': 'Connection failed',
   'phase.LoadingCredentials': 'Loading credentials...',
   'phase.ConnectingTcp': 'Establishing TCP connection...',
@@ -165,6 +167,8 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.HostKeyRejected': 'Unknown host identity rejected',
   'error.HostKeyChallengeNotFound': 'Host identity challenge not found',
   'error.HostKeyVerificationCancelled': 'Host identity verification cancelled',
+  'error.HostKeySaveFailed': 'Failed to save host trust',
+  'error.TrustStoreError': 'Trust store unavailable',
   'error.Unknown': 'Unknown error',
 };
 
