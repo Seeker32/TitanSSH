@@ -297,7 +297,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let sftp_service = SftpService::with_connector(|_| {
+        let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
                 "expected test failure".to_string(),
             ))
@@ -320,7 +320,7 @@ mod tests {
 
         let app = mock_app();
         let monitor_service = MonitorService::new();
-        let sftp_service = SftpService::with_connector(|_| {
+        let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
                 "expected test failure".to_string(),
             ))

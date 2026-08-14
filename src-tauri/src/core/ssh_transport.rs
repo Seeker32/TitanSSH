@@ -545,6 +545,112 @@ pub(crate) mod test_support {
         }
     }
 
+    /// 远端读取在两段 barrier 之间阻塞的传输 adapter；list_dir/file_size 保持
+    /// 轻量成功实现，仅供“传输占用传输连接时控制连接仍响应” contract 测试。
+    struct BlockingReadSftp {
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    /// 首读在 barrier 之间阻塞、其后立即 EOF 的远端读句柄；阻塞状态由所属
+    /// adapter 共享，同一传输连接上的后续读取不重复阻塞。
+    struct BlockingReadFile {
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl std::io::Read for BlockingReadFile {
+        /// 第一次读取在 barrier 之间阻塞，释放后返回 EOF 完成传输。
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                self.started.wait();
+                self.release.wait();
+            }
+            Ok(0)
+        }
+    }
+
+    impl std::io::Write for BlockingReadFile {
+        /// 本句柄不写入。
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        /// 本句柄不刷新。
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SftpOps for BlockingReadSftp {
+        /// 返回空目录。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Ok(Vec::new())
+        }
+
+        /// 本 adapter 不查询文件大小（元数据走控制连接）。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Ok(0)
+        }
+
+        /// 返回在 barrier 之间阻塞的远端读句柄。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(BlockingReadFile {
+                    started: self.started.clone(),
+                    release: self.release.clone(),
+                    blocked: self.blocked.clone(),
+                }),
+            })
+        }
+
+        /// 本 adapter 不创建远端文件。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 本 adapter 无需删除远端文件。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 传输打开/创建持续返回通道错误的 SFTP adapter，模拟已失效的传输连接。
+    struct ChannelFailingTransferSftp;
+
+    impl SftpOps for ChannelFailingTransferSftp {
+        /// 返回空目录。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Ok(Vec::new())
+        }
+
+        /// 返回非零大小。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Ok(1)
+        }
+
+        /// 打开远端文件时返回通道错误。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpChannelError(
+                "transfer channel lost".to_string(),
+            ))
+        }
+
+        /// 创建远端文件时返回通道错误。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpChannelError(
+                "transfer channel lost".to_string(),
+            ))
+        }
+
+        /// 本 adapter 无需删除远端文件。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
     struct OneShotExec {
         output: String,
         shutdown: Arc<AtomicBool>,
@@ -834,6 +940,23 @@ pub(crate) mod test_support {
     /// 创建可控制阻塞时序的 SFTP 测试 capability。
     pub(crate) fn blocking_sftp(started: Arc<Barrier>, release: Arc<Barrier>) -> SftpTransport {
         SftpTransport::from_backend(BlockingSftp { started, release })
+    }
+
+    /// 创建读取在 barrier 之间阻塞的 SFTP 传输测试 capability，供传输/控制连接分离测试。
+    pub(crate) fn blocking_read_sftp(
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+    ) -> SftpTransport {
+        SftpTransport::from_backend(BlockingReadSftp {
+            started,
+            release,
+            blocked: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// 创建传输打开/创建持续返回通道错误的 SFTP 测试 capability，模拟失效传输连接。
+    pub(crate) fn channel_failing_transfer_sftp() -> SftpTransport {
+        SftpTransport::from_backend(ChannelFailingTransferSftp)
     }
 
     /// 创建只返回一轮 stdout 的 Exec 测试 capability。

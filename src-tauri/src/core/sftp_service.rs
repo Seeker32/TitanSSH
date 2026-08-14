@@ -50,7 +50,18 @@ impl CancelToken {
     }
 }
 
-type SftpConnector = Arc<dyn Fn(&HostConfig) -> Result<SftpTransport, AppError> + Send + Sync>;
+/// 连接用途：控制连接处理目录/元数据操作，传输连接搬运文件数据。
+/// 生产 adapter 对两种用途行为一致；测试 adapter 借此返回不同 capability。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SftpRole {
+    /// 控制连接：目录列举、元数据、冲突检查专用
+    Control,
+    /// 传输连接：上传/下载数据搬运专用
+    Transfer,
+}
+
+type SftpConnector =
+    Arc<dyn Fn(&HostConfig, SftpRole) -> Result<SftpTransport, AppError> + Send + Sync>;
 
 enum ConnectionState {
     Idle,
@@ -60,20 +71,23 @@ enum ConnectionState {
     Closed,
 }
 
-/// 单个 Session 的 SFTP 连接状态；Condvar 让首个请求等待并行 eager 建连。
+/// 单个 Session 的一条 SFTP 连接状态；Condvar 让首个请求等待并行 eager 建连。
+/// 同一 Session 的控制连接与传输连接各占一个状态槽，互不持锁。
 struct SftpConnection {
     host: HostConfig,
     connector: SftpConnector,
+    role: SftpRole,
     state: Mutex<ConnectionState>,
     ready: Condvar,
 }
 
 impl SftpConnection {
     /// 创建尚未开始连接的状态槽。
-    fn new(host: HostConfig, connector: SftpConnector) -> Self {
+    fn new(host: HostConfig, connector: SftpConnector, role: SftpRole) -> Self {
         Self {
             host,
             connector,
+            role,
             state: Mutex::new(ConnectionState::Idle),
             ready: Condvar::new(),
         }
@@ -99,7 +113,7 @@ impl SftpConnection {
 
         let connection = self.clone();
         std::thread::spawn(move || {
-            let result = (connection.connector)(&connection.host);
+            let result = (connection.connector)(&connection.host, connection.role);
             let mut state = connection
                 .state
                 .lock()
@@ -141,7 +155,7 @@ impl SftpConnection {
                 ConnectionState::Idle => {
                     *state = ConnectionState::Connecting;
                     drop(state);
-                    let result = (self.connector)(&self.host);
+                    let result = (self.connector)(&self.host, self.role);
                     let mut state = self
                         .state
                         .lock()
@@ -193,9 +207,16 @@ impl SftpConnection {
     }
 }
 
-/// 单个 Session 的 SFTP 句柄，连接与取消令牌均局部串行化。
+/// 单个 Session 的 SFTP 句柄；控制与传输 capability 分离，取消令牌局部串行化。
+///
+/// 控制连接保证目录列举、元数据与冲突检查不被长传输阻塞；
+/// 传输连接按需建立，本轮基础一条，后续按 Session 扩展为连接池。
 struct SftpHandle {
-    connection: Arc<SftpConnection>,
+    /// 专用控制连接：目录列举、元数据、冲突检查；传输期间绝不被持锁
+    control: Arc<SftpConnection>,
+    /// 独立传输连接：上传/下载专用，首次传输时按需建立
+    transfer: Arc<SftpConnection>,
+    /// 传输任务取消令牌表
     cancel_tokens: Mutex<HashMap<String, CancelToken>>,
 }
 
@@ -210,12 +231,15 @@ pub struct SftpService {
 impl SftpService {
     /// 创建使用真实 SSH transport adapter 的 File Transfer module。
     pub fn new() -> Self {
-        Self::with_connector(connect_sftp_for_host)
+        Self::with_connector(|host, _role| connect_sftp_for_host(host))
     }
 
     /// 注入内部连接 adapter，供 transport contract 测试使用。
     pub(crate) fn with_connector(
-        connector: impl Fn(&HostConfig) -> Result<SftpTransport, AppError> + Send + Sync + 'static,
+        connector: impl Fn(&HostConfig, SftpRole) -> Result<SftpTransport, AppError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             handles: Arc::new(Mutex::new(HashMap::new())),
@@ -224,20 +248,30 @@ impl SftpService {
         }
     }
 
-    /// 注册 Session 并并行启动独立 SFTP 连接。
+    /// 注册 Session：并行启动独立控制连接；传输连接按需建立，空闲 Session 不预建。
     pub fn register_session(&self, session_id: String, host: HostConfig) {
-        let connection = Arc::new(SftpConnection::new(host, self.connector.clone()));
+        let control = Arc::new(SftpConnection::new(
+            host.clone(),
+            self.connector.clone(),
+            SftpRole::Control,
+        ));
+        let transfer = Arc::new(SftpConnection::new(
+            host,
+            self.connector.clone(),
+            SftpRole::Transfer,
+        ));
         self.handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
                 session_id,
                 Arc::new(SftpHandle {
-                    connection: connection.clone(),
+                    control: control.clone(),
+                    transfer,
                     cancel_tokens: Mutex::new(HashMap::new()),
                 }),
             );
-        connection.connect_eager();
+        control.connect_eager();
     }
 
     /// 判断指定 Session 是否仍注册在 File Transfer module。
@@ -270,7 +304,7 @@ impl SftpService {
     /// # 返回
     /// 成功返回 RemoteEntry 列表，失败返回 AppError
     pub fn list_dir(&self, session_id: &str, path: &str) -> Result<Vec<RemoteEntry>, AppError> {
-        let (entries, _transport) = self.run_control_op(session_id, |sftp| sftp.list_dir(path))?;
+        let entries = self.run_control_op(session_id, |sftp| sftp.list_dir(path))?;
         let mut entries: Vec<RemoteEntry> = entries
             .into_iter()
             .map(|entry| {
@@ -298,31 +332,31 @@ impl SftpService {
         Ok(entries)
     }
 
-    /// 持锁执行一次目录/元数据操作；操作错误为失效连接信号时淘汰旧连接并自动重连一次。
+    /// 在专用控制连接上持锁执行一次目录/元数据操作；发现失效连接时淘汰并自动重连一次。
     ///
     /// # 参数
     /// - `session_id`: 关联会话 ID
     /// - `op`: 在控制连接上执行的操作（目录列举、远端文件大小查询等只读操作）
     ///
     /// # 返回
-    /// 成功返回 (操作结果, 本次操作实际使用的 transport)；失败返回结构化错误。
+    /// 成功返回操作结果，失败返回结构化错误。
     /// 域错误（路径不存在、权限拒绝）不触发重连；连接类错误只重试一次，
     /// 第二次失败（含重连失败）原样返回，不无限重试。
     fn run_control_op<T>(
         &self,
         session_id: &str,
         op: impl Fn(&mut SftpTransport) -> Result<T, AppError>,
-    ) -> Result<(T, Arc<Mutex<SftpTransport>>), AppError> {
+    ) -> Result<T, AppError> {
         let handle = self.handle(session_id)?;
-        let transport = handle.connection.get()?;
+        let transport = handle.control.get()?;
         match run_op_locked(&transport, &op) {
-            Ok(value) => Ok((value, transport)),
-            Err(error) if is_control_connection_failure(&error) => {
+            Ok(value) => Ok(value),
+            Err(error) if is_connection_failure(&error) => {
                 // 淘汰本次操作实际使用的失效连接并自动重连一次；第二次失败原样返回。
                 // 只淘汰该连接本身：并发操作可能已重建新连接，不得误淘汰健康连接。
-                handle.connection.invalidate_if_ready(&transport);
-                let transport = handle.connection.get()?;
-                run_op_locked(&transport, &op).map(|value| (value, transport))
+                handle.control.invalidate_if_ready(&transport);
+                let transport = handle.control.get()?;
+                run_op_locked(&transport, &op)
             }
             Err(error) => Err(error),
         }
@@ -361,8 +395,7 @@ impl SftpService {
             .unwrap_or_else(|| remote_path.clone());
 
         // 元数据操作复用控制连接：失效时淘汰并自动重连一次，第二次失败原样返回
-        let (total_bytes, transport) =
-            self.run_control_op(&session_id, |sftp| sftp.file_size(&remote_path))?;
+        let total_bytes = self.run_control_op(&session_id, |sftp| sftp.file_size(&remote_path))?;
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -398,7 +431,6 @@ impl SftpService {
             local_path,
             total_bytes,
             TransferType::Download,
-            transport,
             cancel_token,
             app,
         );
@@ -442,8 +474,8 @@ impl SftpService {
 
         let total_bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
 
+        // 传输连接由 worker 按需建立：命令线程不被远端建连阻塞
         let handle = self.handle(&session_id)?;
-        let transport = handle.connection.get()?;
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -478,7 +510,6 @@ impl SftpService {
             local_path,
             total_bytes,
             TransferType::Upload,
-            transport,
             cancel_token,
             app,
         );
@@ -612,7 +643,9 @@ impl SftpService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id);
         if let Some(handle) = handle {
-            handle.connection.close();
+            // 同时关闭控制与传输 capability，丢弃任何迟到连接结果
+            handle.control.close();
+            handle.transfer.close();
             // 收集该 session 尚未终态的任务（短暂持锁，不跨远程 IO）
             let active: Vec<(String, CancelToken)> = {
                 let cancel_tokens = handle
@@ -677,7 +710,11 @@ impl SftpService {
             .retain(|_, task| task.session_id != session_id || !is_terminal(&task.status));
     }
 
-    /// 在独立 tokio task 中执行传输，等待信号量 permit，通过 transition 更新 registry 并推送状态事件
+    /// 在独立 tokio task 中执行传输：等待信号量 permit，按需建立传输连接，
+    /// 通过 transition 更新 registry 并推送状态事件。
+    ///
+    /// 传输连接在阻塞线程内按需建立：命令线程与 Session 打开不被远端 IO 阻塞；
+    /// 控制连接不参与传输，目录/元数据操作在传输期间保持响应。
     ///
     /// # 参数
     /// - `task_id`: 任务唯一 ID
@@ -686,7 +723,6 @@ impl SftpService {
     /// - `local_path`: 本地文件路径
     /// - `total_bytes`: 文件总大小
     /// - `transfer_type`: 传输方向
-    /// - `transport`: Session 专属 SFTP capability
     /// - `cancel_token`: 取消令牌
     /// - `app`: Tauri 应用句柄
     fn spawn_transfer_task<R: Runtime + 'static>(
@@ -697,7 +733,6 @@ impl SftpService {
         local_path: String,
         total_bytes: u64,
         transfer_type: TransferType,
-        transport: Arc<Mutex<SftpTransport>>,
         cancel_token: CancelToken,
         app: AppHandle<R>,
     ) {
@@ -728,9 +763,19 @@ impl SftpService {
             let session_id_clone = session_id.clone();
             let app_clone = app.clone();
             let cancel_token_clone = cancel_token.clone();
+            let service_for_blocking = service.clone();
 
             let result = tokio::task::spawn_blocking(move || {
-                run_transfer_blocking(
+                // 传输连接按需建立：远端建连只在阻塞线程内发生，不阻塞命令线程
+                let handle = match service_for_blocking.handle(&session_id_clone) {
+                    Ok(handle) => handle,
+                    Err(error) => return (None, TransferOutcome::Failed(error)),
+                };
+                let transport = match handle.transfer.get() {
+                    Ok(transport) => transport,
+                    Err(error) => return (None, TransferOutcome::Failed(error)),
+                };
+                let outcome = run_transfer_blocking(
                     &task_id_clone,
                     &session_id_clone,
                     &remote_path,
@@ -740,12 +785,13 @@ impl SftpService {
                     &transport,
                     &cancel_token_clone,
                     &app_clone,
-                )
+                );
+                (Some(transport), outcome)
             })
             .await;
 
             match result {
-                Ok(TransferOutcome::Done) => {
+                Ok((_, TransferOutcome::Done)) => {
                     service.transition_task(
                         &app,
                         &task_id,
@@ -754,7 +800,7 @@ impl SftpService {
                         None,
                     );
                 }
-                Ok(TransferOutcome::Cancelled) => {
+                Ok((_, TransferOutcome::Cancelled)) => {
                     service.transition_task(
                         &app,
                         &task_id,
@@ -763,13 +809,21 @@ impl SftpService {
                         None,
                     );
                 }
-                Ok(TransferOutcome::Failed(error)) => {
+                Ok((transport, TransferOutcome::Failed(error))) => {
+                    // 失效传输连接信号：只淘汰本次任务使用的传输连接，下一次传输自动重建；
+                    // 本次任务保留结构化错误，不自动重跑（传输开始后不重试）
+                    if let Some(transport) = transport
+                        && is_connection_failure(&error)
+                        && let Ok(handle) = service.handle(&session_id)
+                    {
+                        handle.transfer.invalidate_if_ready(&transport);
+                    }
                     service.transition_task(
                         &app,
                         &task_id,
                         &session_id,
                         SftpTaskStatus::Failed,
-                        Some(error),
+                        Some(AppErrorInfo::from(error)),
                     );
                 }
                 Err(e) => {
@@ -817,11 +871,11 @@ fn evict_old_terminal_tasks(tasks: &mut HashMap<String, TransferTask>, session_i
     }
 }
 
-/// 判断目录/元数据操作错误是否为失效控制连接信号，值得淘汰并自动重连一次。
+/// 判断操作错误是否为失效连接信号（控制与传输连接共用分类），值得淘汰并重建一次。
 ///
 /// 通道错误来自底层 ssh2 会话级失败（如连接已被服务端断开），连接错误为适配器
-/// 上报的连接类失败；域错误（路径不存在、权限拒绝等）说明连接本身健康，不触发重连。
-fn is_control_connection_failure(error: &AppError) -> bool {
+/// 上报的连接类失败；域错误（路径不存在、权限拒绝等）说明连接本身健康，不触发重建。
+fn is_connection_failure(error: &AppError) -> bool {
     matches!(
         error,
         AppError::SftpChannelError(_) | AppError::SshConnectionError(_)
@@ -861,11 +915,11 @@ fn connect_sftp_for_host(host: &HostConfig) -> Result<SftpTransport, AppError> {
     ssh_transport::connect_sftp(host, password.as_deref(), passphrase.as_deref())
 }
 
-/// 传输 worker 的终态结果；失败携带结构化应用错误，不再用布尔折叠失败原因。
+/// 传输 worker 的终态结果；失败携带具体 AppError，供淘汰失效传输连接与事件序列化。
 enum TransferOutcome {
     Done,
     Cancelled,
-    Failed(AppErrorInfo),
+    Failed(AppError),
 }
 
 /// 阻塞执行实际传输，每 500ms 推送进度；各阶段失败保留具体结构化错误。
@@ -891,9 +945,7 @@ fn run_transfer_blocking<R: Runtime>(
     let mut sftp = match transport.lock() {
         Ok(sftp) => sftp,
         Err(error) => {
-            return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpChannelError(
-                error.to_string(),
-            )));
+            return TransferOutcome::Failed(AppError::SftpChannelError(error.to_string()));
         }
     };
 
@@ -929,15 +981,13 @@ fn run_transfer_blocking<R: Runtime>(
         TransferType::Download => {
             let mut remote_file = match sftp.open_read(remote_path) {
                 Ok(file) => file,
-                Err(error) => return TransferOutcome::Failed(AppErrorInfo::from(error)),
+                Err(error) => return TransferOutcome::Failed(error),
             };
             // 创建本地文件；失败或取消时通过 cleanup_local 删除残留
             let mut local_file = match std::fs::File::create(local_path) {
                 Ok(file) => file,
                 Err(error) => {
-                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpCreateError(
-                        error.to_string(),
-                    )));
+                    return TransferOutcome::Failed(AppError::SftpCreateError(error.to_string()));
                 }
             };
 
@@ -960,9 +1010,7 @@ fn run_transfer_blocking<R: Runtime>(
                     Err(error) => {
                         // 运行时读取失败：同样删除本地残留文件，保留结构化读取错误
                         cleanup_local!();
-                        return TransferOutcome::Failed(AppErrorInfo::from(
-                            AppError::SftpReadError(error.to_string()),
-                        ));
+                        return TransferOutcome::Failed(AppError::SftpReadError(error.to_string()));
                     }
                 };
                 if n == 0 {
@@ -970,9 +1018,7 @@ fn run_transfer_blocking<R: Runtime>(
                 }
                 if let Err(error) = local_file.write_all(&buf[..n]) {
                     cleanup_local!();
-                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpWriteError(
-                        error.to_string(),
-                    )));
+                    return TransferOutcome::Failed(AppError::SftpWriteError(error.to_string()));
                 }
                 transferred += n as u64;
                 emit_progress!();
@@ -982,15 +1028,13 @@ fn run_transfer_blocking<R: Runtime>(
             let mut local_file = match std::fs::File::open(local_path) {
                 Ok(file) => file,
                 Err(error) => {
-                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpOpenError(
-                        error.to_string(),
-                    )));
+                    return TransferOutcome::Failed(AppError::SftpOpenError(error.to_string()));
                 }
             };
             // 创建远端文件；失败或取消时通过 cleanup_remote 删除残留
             let mut remote_file = match sftp.create(remote_path) {
                 Ok(file) => file,
-                Err(error) => return TransferOutcome::Failed(AppErrorInfo::from(error)),
+                Err(error) => return TransferOutcome::Failed(error),
             };
 
             /// 关闭远端文件句柄并删除残留文件（取消或 IO 失败时调用）
@@ -1011,9 +1055,7 @@ fn run_transfer_blocking<R: Runtime>(
                     Ok(n) => n,
                     Err(error) => {
                         cleanup_remote!();
-                        return TransferOutcome::Failed(AppErrorInfo::from(
-                            AppError::SftpReadError(error.to_string()),
-                        ));
+                        return TransferOutcome::Failed(AppError::SftpReadError(error.to_string()));
                     }
                 };
                 if n == 0 {
@@ -1021,9 +1063,7 @@ fn run_transfer_blocking<R: Runtime>(
                 }
                 if let Err(error) = remote_file.write_all(&buf[..n]) {
                     cleanup_remote!();
-                    return TransferOutcome::Failed(AppErrorInfo::from(AppError::SftpWriteError(
-                        error.to_string(),
-                    )));
+                    return TransferOutcome::Failed(AppError::SftpWriteError(error.to_string()));
                 }
                 transferred += n as u64;
                 emit_progress!();
@@ -1053,8 +1093,9 @@ fn format_permissions(perm: u32) -> String {
 mod tests {
     use super::*;
     use crate::core::ssh_transport::test_support::{
-        blocking_sftp, drop_signal_sftp, empty_sftp, failing_channel_sftp, failing_read_sftp,
-        failing_write_sftp, memory_sftp, path_not_found_sftp,
+        blocking_read_sftp, blocking_sftp, channel_failing_transfer_sftp, drop_signal_sftp,
+        empty_sftp, failing_channel_sftp, failing_read_sftp, failing_write_sftp, memory_sftp,
+        path_not_found_sftp,
     };
     use crate::models::host::{AuthType, HostConfig};
     use std::sync::atomic::Ordering;
@@ -1083,7 +1124,7 @@ mod tests {
     fn eager_failure_is_reported_once_then_next_operation_retries() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_connector = attempts.clone();
-        let service = SftpService::with_connector(move |_| {
+        let service = SftpService::with_connector(move |_, _| {
             if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 Err(AppError::SshConnectionError("first failure".to_string()))
             } else {
@@ -1107,7 +1148,7 @@ mod tests {
     fn list_dir_evicts_stale_ready_connection_and_reconnects_once() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_connector = attempts.clone();
-        let service = SftpService::with_connector(move |_| {
+        let service = SftpService::with_connector(move |_, _| {
             if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 Ok(failing_channel_sftp())
             } else {
@@ -1132,7 +1173,7 @@ mod tests {
     fn list_dir_second_failure_returns_structured_error_without_retry_loop() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_connector = attempts.clone();
-        let service = SftpService::with_connector(move |_| {
+        let service = SftpService::with_connector(move |_, _| {
             attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(failing_channel_sftp())
         });
@@ -1156,7 +1197,7 @@ mod tests {
     fn list_dir_domain_error_does_not_evict_connection() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_connector = attempts.clone();
-        let service = SftpService::with_connector(move |_| {
+        let service = SftpService::with_connector(move |_, _| {
             attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(path_not_found_sftp())
         });
@@ -1178,8 +1219,12 @@ mod tests {
     /// 健康新连接不得被迟到旧操作的淘汰请求误杀（同一失效连接只允许一次重建）。
     #[test]
     fn invalidate_if_ready_only_evicts_the_given_transport() {
-        let connector: SftpConnector = Arc::new(|_| Ok(empty_sftp()));
-        let connection = Arc::new(SftpConnection::new(make_host(), connector));
+        let connector: SftpConnector = Arc::new(|_, _| Ok(empty_sftp()));
+        let connection = Arc::new(SftpConnection::new(
+            make_host(),
+            connector,
+            SftpRole::Control,
+        ));
         connection.connect_eager();
 
         let first = connection.get().unwrap();
@@ -1197,18 +1242,28 @@ mod tests {
         );
     }
 
-    /// 元数据操作（file_size）发现失效连接时同样淘汰并重连一次，传输随后正常完成。
+    /// 元数据操作（file_size）发现失效控制连接时淘汰并重连一次；
+    /// 传输随后通过独立传输连接正常完成，不得复用或重建控制连接。
     #[tokio::test(flavor = "multi_thread")]
     async fn enqueue_download_evicts_stale_connection_for_file_size() {
+        use std::sync::atomic::AtomicUsize;
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_for_connector = attempts.clone();
-        let service = SftpService::with_connector(move |_| {
-            if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Ok(failing_channel_sftp())
-            } else {
+        let control_attempts = Arc::new(AtomicUsize::new(0));
+        let transfer_attempts = Arc::new(AtomicUsize::new(0));
+        let control_attempts_for_connector = control_attempts.clone();
+        let transfer_attempts_for_connector = transfer_attempts.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => {
+                if control_attempts_for_connector.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(failing_channel_sftp())
+                } else {
+                    Ok(memory_sftp(vec![1u8, 2, 3]))
+                }
+            }
+            SftpRole::Transfer => {
+                transfer_attempts_for_connector.fetch_add(1, Ordering::SeqCst);
                 Ok(memory_sftp(vec![1u8, 2, 3]))
             }
         });
@@ -1226,14 +1281,19 @@ mod tests {
             .expect("重连后的元数据操作应成功入队");
 
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            control_attempts.load(Ordering::SeqCst),
             2,
-            "file_size 失效连接应恰好淘汰并重连一次"
+            "file_size 失效控制连接应恰好淘汰并重连一次"
         );
         assert_eq!(
             wait_for_terminal(&service, &task.task_id),
             SftpTaskStatus::Done,
             "重连后的传输应正常完成"
+        );
+        assert_eq!(
+            transfer_attempts.load(Ordering::SeqCst),
+            1,
+            "传输应通过独立传输连接完成，不得复用控制连接"
         );
         let _ = std::fs::remove_file(&local_path);
     }
@@ -1246,7 +1306,7 @@ mod tests {
         let app = mock_app();
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_connector = attempts.clone();
-        let service = SftpService::with_connector(move |_| {
+        let service = SftpService::with_connector(move |_, _| {
             attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(failing_channel_sftp())
         });
@@ -1281,7 +1341,7 @@ mod tests {
         let release = Arc::new(Barrier::new(2));
         let connector_started = started.clone();
         let connector_release = release.clone();
-        let service = SftpService::with_connector(move |host| {
+        let service = SftpService::with_connector(move |host, _| {
             if host.id == "slow" {
                 Ok(blocking_sftp(
                     connector_started.clone(),
@@ -1326,7 +1386,7 @@ mod tests {
         let started_for_connector = started.clone();
         let release_for_connector = release.clone();
         let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
-        let service = SftpService::with_connector(move |_| {
+        let service = SftpService::with_connector(move |_, _| {
             started_for_connector.wait();
             release_for_connector.wait();
             Ok(drop_signal_sftp(dropped_tx.clone()))
@@ -1344,9 +1404,270 @@ mod tests {
         assert!(!service.has_session("session-1"));
     }
 
+    // ─── 控制/传输连接分离 contract ──────────────────────────────────────
+
+    /// 传输连接按需建立：Session 注册只建立控制连接，首次传输才建立独立传输连接。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transfer_connection_is_lazy_and_independent_from_control() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let control_connects = Arc::new(AtomicUsize::new(0));
+        let transfer_connects = Arc::new(AtomicUsize::new(0));
+        let control_connects_for_connector = control_connects.clone();
+        let transfer_connects_for_connector = transfer_connects.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => {
+                control_connects_for_connector.fetch_add(1, Ordering::SeqCst);
+                Ok(empty_sftp())
+            }
+            SftpRole::Transfer => {
+                transfer_connects_for_connector.fetch_add(1, Ordering::SeqCst);
+                Ok(memory_sftp(vec![1u8, 2, 3]))
+            }
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        // 控制连接 eager 建连后即可目录操作
+        assert!(service.list_dir("session-1", "/").is_ok());
+        assert_eq!(
+            control_connects.load(Ordering::SeqCst),
+            1,
+            "注册后只建立控制连接"
+        );
+        assert_eq!(
+            transfer_connects.load(Ordering::SeqCst),
+            0,
+            "无传输时不得预建传输连接"
+        );
+
+        // 首次传输才按需建立传输连接
+        let local_path = std::env::temp_dir().join(format!("titan-lazy-tx-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let task = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            transfer_connects.load(Ordering::SeqCst),
+            1,
+            "首次传输应建立一条独立传输连接"
+        );
+        assert_eq!(
+            control_connects.load(Ordering::SeqCst),
+            1,
+            "传输不得重建控制连接"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 传输连接失效（通道错误）后淘汰传输连接，下一次传输自动重建；
+    /// 本次任务保留结构化错误，不自动重跑。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_transfer_invalidates_transfer_connection_for_next_task() {
+        use std::sync::atomic::AtomicUsize;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let transfer_attempts = Arc::new(AtomicUsize::new(0));
+        let transfer_attempts_for_connector = transfer_attempts.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => Ok(empty_sftp()),
+            SftpRole::Transfer => {
+                if transfer_attempts_for_connector.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(channel_failing_transfer_sftp())
+                } else {
+                    Ok(memory_sftp(vec![1u8, 2, 3]))
+                }
+            }
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        // 第一次上传：传输连接建立即失败，任务保留结构化通道错误
+        let local_path =
+            std::env::temp_dir().join(format!("titan-tx-reconnect-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        let first = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&service, &first.task_id),
+            SftpTaskStatus::Failed,
+            "失效传输连接上的任务应失败"
+        );
+        let first_task = service
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&first.task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            first_task.error.as_ref().map(|e| e.code.as_str()),
+            Some("SftpChannelError"),
+            "失效传输连接应保留结构化通道错误"
+        );
+
+        // 第二次上传：失效传输连接已淘汰，重建后正常完成
+        let second = service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&service, &second.task_id),
+            SftpTaskStatus::Done,
+            "淘汰后重建的传输连接应完成任务"
+        );
+        assert_eq!(
+            transfer_attempts.load(Ordering::SeqCst),
+            2,
+            "失效传输连接应恰好淘汰并重建一次"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
+    /// 传输在独立传输连接上阻塞时，控制连接上的目录列举与元数据操作仍能完成。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_operations_complete_while_transfer_is_blocked() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let transfer_started = Arc::new(Barrier::new(2));
+        let transfer_release = Arc::new(Barrier::new(2));
+        let started_for_connector = transfer_started.clone();
+        let release_for_connector = transfer_release.clone();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => Ok(memory_sftp(vec![7u8; 4096])),
+            SftpRole::Transfer => Ok(blocking_read_sftp(
+                started_for_connector.clone(),
+                release_for_connector.clone(),
+            )),
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let local_path = std::env::temp_dir().join(format!("titan-blocked-{}.bin", Uuid::new_v4()));
+        let task = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_path.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+        transfer_started.wait(); // 传输已进入阻塞读取
+
+        // 传输阻塞期间目录列举必须完成，不等传输结束
+        let list_service = service.clone();
+        let (list_tx, list_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = list_tx.send(list_service.list_dir("session-1", "/"));
+        });
+        let list_result = list_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("传输阻塞期间目录列举应完成");
+        assert!(
+            list_result.is_ok(),
+            "控制连接上的目录列举应成功，实际: {:?}",
+            list_result
+        );
+
+        // enqueue_download 同步完成控制连接上的 file_size 后才返回：
+        // 入队成功即证明元数据操作在传输阻塞期间即时完成
+        let local_second =
+            std::env::temp_dir().join(format!("titan-blocked-2-{}.bin", Uuid::new_v4()));
+        let second = service
+            .enqueue_download(
+                "session-1".to_string(),
+                "/remote/file.bin".to_string(),
+                local_second.to_string_lossy().to_string(),
+                app.handle().clone(),
+            )
+            .expect("传输运行期间 file_size 元数据操作应在控制连接上完成入队");
+
+        transfer_release.wait();
+        assert_eq!(
+            wait_for_terminal(&service, &task.task_id),
+            SftpTaskStatus::Done
+        );
+        assert_eq!(
+            wait_for_terminal(&service, &second.task_id),
+            SftpTaskStatus::Done
+        );
+        let _ = std::fs::remove_file(&local_path);
+        let _ = std::fs::remove_file(&local_second);
+    }
+
+    /// Session 关闭同时关闭控制与传输 capability；阻塞建连的迟到传输结果被丢弃，
+    /// 迟到 worker 的终态迁移被拒绝，不残留任务。
+    #[test]
+    fn closed_session_discards_late_transfer_connection() {
+        use tauri::test::mock_app;
+
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let started_for_connector = started.clone();
+        let release_for_connector = release.clone();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let service = SftpService::with_connector(move |_, role| match role {
+            SftpRole::Control => Ok(empty_sftp()),
+            SftpRole::Transfer => {
+                started_for_connector.wait();
+                release_for_connector.wait();
+                Ok(drop_signal_sftp(dropped_tx.clone()))
+            }
+        });
+        service.register_session("session-1".to_string(), make_host());
+
+        let app = mock_app();
+        // 启动一次上传：worker 开始按需建立传输连接（阻塞在建连中）
+        let local_path =
+            std::env::temp_dir().join(format!("titan-late-transfer-{}.bin", Uuid::new_v4()));
+        std::fs::write(&local_path, b"hello").unwrap();
+        service
+            .enqueue_upload(
+                "session-1".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "/tmp".to_string(),
+                app.handle().clone(),
+            )
+            .unwrap();
+        started.wait(); // 传输建连进行中
+
+        service.cleanup_session("session-1", &app.handle().clone());
+        release.wait();
+
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("迟到传输连接应立即释放");
+        assert!(!service.has_session("session-1"));
+        assert!(
+            service.tasks.lock().unwrap().is_empty(),
+            "关闭后迟到 worker 不得残留任务"
+        );
+        let _ = std::fs::remove_file(&local_path);
+    }
+
     /// 构造使用内存 SFTP adapter 的测试 module。
     fn make_service() -> SftpService {
-        SftpService::with_connector(|_| Ok(empty_sftp()))
+        SftpService::with_connector(|_, _| Ok(empty_sftp()))
     }
 
     // ─── 基础结构测试 ───────────────────────────────────────────────────────
@@ -1922,7 +2243,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![1u8, 2, 3])));
+        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![1u8, 2, 3])));
         service.register_session("session-1".to_string(), make_host());
 
         let local_path = std::env::temp_dir().join(format!("titan-upload-{}.bin", Uuid::new_v4()));
@@ -1969,7 +2290,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![7u8; 4096])));
+        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![7u8; 4096])));
         service.register_session("session-1".to_string(), make_host());
 
         let local_path =
@@ -2053,7 +2374,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(failing_read_sftp()));
+        let service = SftpService::with_connector(|_, _| Ok(failing_read_sftp()));
         service.register_session("session-1".to_string(), make_host());
 
         let captured = capture_task_status_events(app.handle());
@@ -2107,7 +2428,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(failing_write_sftp()));
+        let service = SftpService::with_connector(|_, _| Ok(failing_write_sftp()));
         service.register_session("session-1".to_string(), make_host());
 
         let captured = capture_task_status_events(app.handle());
@@ -2159,7 +2480,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![7u8; 4096])));
+        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![7u8; 4096])));
         service.register_session("session-1".to_string(), make_host());
 
         // 本地目标指向已存在的目录：File::create 必然失败
@@ -2209,7 +2530,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(memory_sftp(Vec::new())));
+        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(Vec::new())));
         service.register_session("session-1".to_string(), make_host());
 
         let local_path =
@@ -2272,7 +2593,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = SftpService::with_connector(|_| Ok(memory_sftp(vec![1u8, 2, 3])));
+        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![1u8, 2, 3])));
         service.register_session("session-1".to_string(), make_host());
 
         let local_path = std::env::temp_dir().join(format!("titan-sync-{}.bin", Uuid::new_v4()));
