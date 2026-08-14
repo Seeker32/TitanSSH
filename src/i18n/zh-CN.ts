@@ -84,6 +84,7 @@ export const zhCN = {
   'sftp.done': '完成',
   'sftp.failed': '失败',
   'sftp.cancelled': '已取消',
+  'sftp.clearTerminal': '清除已结束',
   'sftp.defaultDownload': '下载',
 
   // 服务器监控

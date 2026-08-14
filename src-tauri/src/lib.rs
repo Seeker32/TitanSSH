@@ -50,7 +50,9 @@ pub fn run() {
             commands::sftp::sftp_list_dir,
             commands::sftp::sftp_download,
             commands::sftp::sftp_upload,
-            commands::sftp::sftp_cancel_task
+            commands::sftp::sftp_cancel_task,
+            commands::sftp::sftp_task_snapshot,
+            commands::sftp::sftp_clear_terminal_tasks
         ])
         .run(tauri::generate_context!())
         .expect("error while running Titan SSH");

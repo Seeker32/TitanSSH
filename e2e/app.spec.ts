@@ -14,6 +14,8 @@ test.beforeEach(async ({ page }) => {
     const task = { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: 'Pending', createdAt: Date.now() };
     // 与正式 typed event contract（src/types/sftp.ts TransferTask）一致：结构化 error 字段
     const transfer = { taskId: 'transfer-1', sessionId: 'session-1', transferType: 'Download', remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'syslog', totalBytes: 100, transferredBytes: 0, speedBps: 0, status: 'Pending', error: null, createdAt: Date.now() };
+    // sftp_task_snapshot 的权威响应；测试可在打开会话前注入
+    let snapshotTasks: unknown[] = [];
     // 待消费的失败注入队列：按 command 匹配，命中则让 invoke 以结构化错误拒绝
     const failQueue: Array<{ command: string; error: { code: string; detail?: string } }> = [];
     const internals = {
@@ -63,6 +65,8 @@ test.beforeEach(async ({ page }) => {
         if (command === 'sftp_list_dir') return [{ name: 'syslog', path: '/syslog', isDir: false, size: 100, modifiedAt: Date.now(), permissions: 'rw-r--r--' }];
         if (command === 'sftp_download') return transfer;
         if (command === 'sftp_upload') return { ...transfer, taskId: 'transfer-2', transferType: 'Upload', fileName: 'upload.txt' };
+        if (command === 'sftp_task_snapshot') return snapshotTasks;
+        if (command === 'sftp_clear_terminal_tasks') return undefined;
         return undefined;
       },
     };
@@ -77,6 +81,10 @@ test.beforeEach(async ({ page }) => {
         /** 让下一次匹配 command 的 invoke 以结构化错误拒绝（与后端 AppErrorInfo 契约一致）。 */
         failNext(command: string, error: { code: string; detail?: string }) {
           failQueue.push({ command, error });
+        },
+        /** 设置 sftp_task_snapshot 的权威响应（打开会话前注入）。 */
+        setSnapshotTasks(tasks: unknown[]) {
+          snapshotTasks = tasks;
         },
       },
     });
@@ -305,4 +313,49 @@ test('重试 invoke 失败仅显示在原任务行，不写入文件浏览器错
   await expect(page.getByTestId('task-action-error')).toHaveText(/SFTP 权限拒绝: \/var\/log/);
   await page.getByTestId('tab-explorer').click();
   await expect(page.locator('.state-msg--error')).toHaveCount(0);
+});
+
+test('会话打开后从后端权威任务快照恢复传输队列', async ({ page }) => {
+  await page.goto('/');
+  // 打开会话前注入后端快照：模拟错过的事件已沉淀为权威终态
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { setSnapshotTasks: (tasks: unknown[]) => void };
+  }).__TAURI_TEST__.setSnapshotTasks([{
+    taskId: 'transfer-snap', sessionId: 'session-1', transferType: 'Download',
+    remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'snapshot.log',
+    totalBytes: 100, transferredBytes: 100, speedBps: 0, status: 'Done', error: null, createdAt: Date.now(),
+  }]));
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await page.getByTestId('tab-queue').click();
+  await expect(page.getByText('snapshot.log')).toBeVisible();
+  await expect(page.getByText('完成')).toBeVisible();
+  const snapshotCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'sftp_task_snapshot'));
+  expect(snapshotCalls).toHaveLength(1);
+  expect(snapshotCalls[0].args).toEqual({ sessionId: 'session-1' });
+});
+
+test('清除已结束按钮清空终态任务且保留活动任务', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const emit = (name: string, payload: unknown) => page.evaluate(([eventName, eventPayload]) => {
+    (window as unknown as { __TAURI_TEST__: { emit: (event: string, value: unknown) => void } }).__TAURI_TEST__.emit(eventName as string, eventPayload);
+  }, [name, payload] as const);
+  await emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null });
+  await page.getByText('syslog').click();
+  await page.getByRole('button', { name: '下载' }).click();
+  await page.getByRole('button', { name: '上传' }).click();
+  await emit('sftp:task_status', { taskId: 'transfer-1', sessionId: 'session-1', status: 'Done', error: null });
+  await emit('sftp:task_status', { taskId: 'transfer-2', sessionId: 'session-1', status: 'Running', error: null });
+  await page.getByTestId('tab-queue').click();
+  await expect(page.getByTestId('clear-terminal-btn')).toBeVisible();
+  await page.getByTestId('clear-terminal-btn').click();
+  await expect(page.getByText('upload.txt')).toBeVisible();
+  await expect(page.getByText('syslog')).toHaveCount(0);
+  await expect(page.getByTestId('clear-terminal-btn')).toHaveCount(0);
+  const clearCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'sftp_clear_terminal_tasks'));
+  expect(clearCalls).toHaveLength(1);
 });

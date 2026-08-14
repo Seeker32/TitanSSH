@@ -8,7 +8,7 @@ import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { TaskStatus } from '@/types/monitor';
-import type { RemoteEntry } from '@/types/sftp';
+import type { RemoteEntry, TransferTask } from '@/types/sftp';
 import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
@@ -651,11 +651,102 @@ describe('Zustand stores', () => {
     expect(useSftpStore.getState().pendingTaskEvents.has('task-sftp-1')).toBe(false);
   });
 
-  it('clearSession 清理同会话的缓存任务事件', () => {
+  it('clearSession 清理同会话的缓存任务事件并拒绝迟到事件落回缓存', () => {
+    useSftpStore.getState().ensureState('session-1');
+    useSftpStore.getState().ensureState('session-2');
     useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Running', error: null });
     useSftpStore.getState().applyTaskStatus({ taskId: 'task-y', sessionId: 'session-2', status: 'Running', error: null });
     useSftpStore.getState().clearSession('session-1');
     expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
     expect(useSftpStore.getState().pendingTaskEvents.has('task-y')).toBe(true);
+    // 关闭后到达的迟到状态事件（后端 cleanup 的 Cancelled）直接丢弃，不再落回缓存
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Cancelled', error: null });
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
+  });
+
+  it('打开会话时从后端权威快照恢复任务投影', async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') return makeSession();
+      if (command === 'start_monitoring') return makeTaskInfo();
+      if (command === 'sftp_list_dir') return [];
+      if (command === 'sftp_task_snapshot') return [makeTransferTask()];
+      return undefined;
+    });
+    await useSessionStore.getState().openSession('host-1');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_task_snapshot', { sessionId: 'session-1' });
+    const task = useSftpStore.getState().getState('session-1')?.tasks.get('task-sftp-1');
+    expect(task).toBeDefined();
+  });
+
+  it('SFTP 任务快照替换旧投影并补投加载期间早到的事件', async () => {
+    let resolveInvoke!: (tasks: TransferTask[]) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<TransferTask[]>((resolve) => { resolveInvoke = resolve; }));
+    const stale = makeTransferTask({ taskId: 'task-stale', status: 'Done' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[stale.taskId, stale]]), taskActionErrors: new Map(), dirRequestSeq: 0,
+    }]]) });
+
+    const loadPromise = useSftpStore.getState().loadTaskSnapshot('session-1');
+    // invoke 返回前到达的早到事件：任务未知，先进入缓存
+    useSftpStore.getState().applyTaskStatus({ taskId: 'task-sftp-1', sessionId: 'session-1', status: 'Done', error: null });
+    resolveInvoke([makeTransferTask()]);
+    await loadPromise;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.tasks.has('task-stale')).toBe(false);
+    const task = state?.tasks.get('task-sftp-1');
+    expect(task?.status).toBe('Done');
+    expect(task?.transferredBytes).toBe(makeTransferTask().totalBytes);
+    expect(useSftpStore.getState().pendingTaskEvents.has('task-sftp-1')).toBe(false);
+  });
+
+  it('SFTP 快照返回时保留请求开始后入队的新任务', async () => {
+    let resolveSnapshot!: (tasks: TransferTask[]) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<TransferTask[]>((resolve) => { resolveSnapshot = resolve; }));
+    const fresh = makeTransferTask({ taskId: 'task-fresh', createdAt: Date.now() });
+    mockInvoke.mockResolvedValueOnce(fresh); // sftp_download enqueue 响应
+    const loadPromise = useSftpStore.getState().loadTaskSnapshot('session-1');
+    await useSftpStore.getState().download('session-1', '/var/log/syslog', '/tmp/syslog');
+    resolveSnapshot([]); // 后端快照采集早于 enqueue：不包含新任务
+    await loadPromise;
+
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.tasks.get('task-fresh')?.status).toBe('Pending');
+    expect(state?.tasks.size).toBe(1);
+  });
+
+  it('SFTP 任务快照 invoke 失败时写入文件浏览器错误区', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpChannelError', detail: 'session 已关闭' });
+    await expect(useSftpStore.getState().loadTaskSnapshot('session-1')).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error).toEqual({
+      code: 'SftpChannelError', detail: 'session 已关闭',
+    });
+  });
+
+  it('SFTP 清除终态任务仅移除终态、保留活动任务并清理对应 actionError', async () => {
+    const done = makeTransferTask({ taskId: 'task-done', status: 'Done' });
+    const failed = makeTransferTask({ taskId: 'task-failed', status: 'Failed' });
+    const running = makeTransferTask({ taskId: 'task-running', status: 'Running' });
+    useSftpStore.setState({ sessionStates: new Map([['session-1', {
+      currentPath: '/', entries: [], selectedPaths: new Set(), loading: false, error: null,
+      tasks: new Map([[done.taskId, done], [failed.taskId, failed], [running.taskId, running]]),
+      taskActionErrors: new Map([[done.taskId, { code: 'SftpTaskNotFound', detail: done.taskId }]]),
+      dirRequestSeq: 0,
+    }]]) });
+    mockInvoke.mockResolvedValue(undefined);
+    await useSftpStore.getState().clearTerminalTasks('session-1');
+    expect(mockInvoke).toHaveBeenCalledWith('sftp_clear_terminal_tasks', { sessionId: 'session-1' });
+    const state = useSftpStore.getState().getState('session-1');
+    expect(state?.tasks.has('task-running')).toBe(true);
+    expect(state?.tasks.has('task-done')).toBe(false);
+    expect(state?.tasks.has('task-failed')).toBe(false);
+    expect(state?.taskActionErrors.has('task-done')).toBe(false);
+  });
+
+  it('SFTP 清除终态任务 invoke 失败时写入文件浏览器错误区', async () => {
+    mockInvoke.mockRejectedValueOnce({ code: 'SftpChannelError', detail: 'registry locked' });
+    await expect(useSftpStore.getState().clearTerminalTasks('session-1')).resolves.toBeUndefined();
+    expect(useSftpStore.getState().getState('session-1')?.error?.code).toBe('SftpChannelError');
   });
 });

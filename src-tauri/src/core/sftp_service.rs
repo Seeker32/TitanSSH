@@ -16,6 +16,9 @@ use uuid::Uuid;
 /// 全局并发传输上限（跨所有 session 的信号量容量）
 const MAX_CONCURRENT_TRANSFERS: usize = 5;
 
+/// 每个 Session 最多保留的终态任务条数（Done/Failed/Cancelled）；Pending/Running 不计入且永不淘汰
+const MAX_TERMINAL_TASKS_PER_SESSION: usize = 100;
+
 /// 全局并发信号量，最多允许 MAX_CONCURRENT_TRANSFERS 个传输任务同时运行（跨所有 session）
 static TRANSFER_SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
 
@@ -568,6 +571,10 @@ impl SftpService {
         }
         task.status = status.clone();
         task.error = error.clone();
+        // 终态迁移在 registry 同一临界区内执行淘汰：不暴露超限中间状态
+        if is_terminal(&status) {
+            evict_old_terminal_tasks(&mut tasks, session_id);
+        }
         drop(tasks);
 
         // 终态后移除取消令牌；session 已关闭时（cleanup 后）跳过
@@ -634,6 +641,40 @@ impl SftpService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .retain(|_, task| task.session_id != session_id);
         }
+    }
+
+    /// 返回指定 Session 的权威任务快照，按 createdAt 最新优先排序。
+    ///
+    /// 前端用快照重建投影以恢复错过的事件，后续事件继续增量更新；
+    /// Session 关闭后 registry 已整体清空，快照返回空列表。
+    ///
+    /// # 参数
+    /// - `session_id`: 关联会话 ID
+    pub fn task_snapshot(&self, session_id: &str) -> Vec<TransferTask> {
+        let mut tasks: Vec<TransferTask> = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|task| task.session_id == session_id)
+            .cloned()
+            .collect();
+        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        tasks
+    }
+
+    /// 清除指定 Session 的全部终态记录（Done/Failed/Cancelled）。
+    ///
+    /// Pending/Running 活动任务与其他 Session 的记录不受影响；Session 不存在或
+    /// 无终态任务时静默成功（幂等），不产生失败路径。
+    ///
+    /// # 参数
+    /// - `session_id`: 关联会话 ID
+    pub fn clear_terminal_tasks(&self, session_id: &str) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, task| task.session_id != session_id || !is_terminal(&task.status));
     }
 
     /// 在独立 tokio task 中执行传输，等待信号量 permit，通过 transition 更新 registry 并推送状态事件
@@ -754,6 +795,26 @@ fn is_terminal(status: &SftpTaskStatus) -> bool {
         status,
         SftpTaskStatus::Done | SftpTaskStatus::Failed | SftpTaskStatus::Cancelled
     )
+}
+
+/// 淘汰指定 Session 超出上限的最旧终态任务；Pending/Running 永不淘汰。
+///
+/// 只在终态迁移后的同一 registry 临界区内调用：淘汰与迁移原子完成，
+/// 快照和并发 worker 观察不到超过 MAX_TERMINAL_TASKS_PER_SESSION 的中间状态。
+/// 相同 createdAt 时按 task_id 降序破平：UUID 唯一且不随时间变化，淘汰结果跨运行确定。
+fn evict_old_terminal_tasks(tasks: &mut HashMap<String, TransferTask>, session_id: &str) {
+    let mut terminal: Vec<(i64, String)> = tasks
+        .iter()
+        .filter(|(_, task)| task.session_id == session_id && is_terminal(&task.status))
+        .map(|(task_id, task)| (task.created_at, task_id.clone()))
+        .collect();
+    if terminal.len() <= MAX_TERMINAL_TASKS_PER_SESSION {
+        return;
+    }
+    terminal.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1))); // 最新优先，task_id 破平
+    for (_, task_id) in terminal.into_iter().skip(MAX_TERMINAL_TASKS_PER_SESSION) {
+        tasks.remove(&task_id);
+    }
 }
 
 /// 判断目录/元数据操作错误是否为失效控制连接信号，值得淘汰并自动重连一次。
@@ -1587,6 +1648,29 @@ mod tests {
         captured
     }
 
+    /// 构造测试用 TransferTask 字面量（registry 直写的统一入口）。
+    fn make_task(
+        session_id: &str,
+        task_id: &str,
+        status: SftpTaskStatus,
+        created_at: i64,
+    ) -> TransferTask {
+        TransferTask {
+            task_id: task_id.to_string(),
+            session_id: session_id.to_string(),
+            transfer_type: TransferType::Download,
+            remote_path: "/tmp/file".to_string(),
+            local_path: "/local/file".to_string(),
+            file_name: "file".to_string(),
+            total_bytes: 1024,
+            transferred_bytes: 0,
+            speed_bps: 0,
+            status,
+            error: None,
+            created_at,
+        }
+    }
+
     /// 构造已注册的传输任务，同时注册取消令牌，返回令牌供断言。
     fn insert_task(service: &SftpService, task_id: &str, status: SftpTaskStatus) -> CancelToken {
         let token = CancelToken::new();
@@ -1599,20 +1683,7 @@ mod tests {
             .insert(task_id.to_string(), token.clone());
         service.tasks.lock().unwrap().insert(
             task_id.to_string(),
-            TransferTask {
-                task_id: task_id.to_string(),
-                session_id: "session-1".to_string(),
-                transfer_type: TransferType::Download,
-                remote_path: "/tmp/file".to_string(),
-                local_path: "/local/file".to_string(),
-                file_name: "file".to_string(),
-                total_bytes: 1024,
-                transferred_bytes: 0,
-                speed_bps: 0,
-                status,
-                error: None,
-                created_at: 0,
-            },
+            make_task("session-1", task_id, status, 0),
         );
         token
     }
@@ -2220,5 +2291,286 @@ mod tests {
             SftpTaskStatus::Done
         );
         let _ = std::fs::remove_file(&local_path);
+    }
+
+    // ─── 任务快照与队列上限测试 ──────────────────────────────────────────────
+
+    /// 直接写入 registry 的测试任务（不经过传输 worker），created_at 可控。
+    fn insert_registry_task(
+        service: &SftpService,
+        session_id: &str,
+        task_id: &str,
+        status: SftpTaskStatus,
+        created_at: i64,
+    ) {
+        service.tasks.lock().unwrap().insert(
+            task_id.to_string(),
+            make_task(session_id, task_id, status, created_at),
+        );
+    }
+
+    /// 快照只返回指定 Session 的任务，且按 createdAt 最新优先排序。
+    #[test]
+    fn task_snapshot_returns_only_requested_session_tasks_newest_first() {
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        service.register_session("session-2".to_string(), make_host());
+        insert_registry_task(&service, "session-1", "t1-old", SftpTaskStatus::Done, 1);
+        insert_registry_task(&service, "session-1", "t1-new", SftpTaskStatus::Running, 2);
+        insert_registry_task(&service, "session-2", "t2", SftpTaskStatus::Done, 3);
+
+        let snapshot = service.task_snapshot("session-1");
+        let ids: Vec<&str> = snapshot.iter().map(|task| task.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["t1-new", "t1-old"]);
+    }
+
+    /// Session 关闭后 registry 清空，快照返回空列表（前端据此清空投影）。
+    #[test]
+    fn task_snapshot_after_session_close_is_empty() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        insert_registry_task(&service, "session-1", "t1", SftpTaskStatus::Done, 1);
+
+        service.cleanup_session("session-1", &app.handle().clone());
+
+        assert!(service.task_snapshot("session-1").is_empty());
+    }
+
+    /// 终态任务超过 100 条时淘汰最旧记录；Pending/Running 与其他 Session 不受影响。
+    #[test]
+    fn terminal_eviction_keeps_latest_100_and_protects_active_tasks() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        for i in 0..100 {
+            insert_registry_task(
+                &service,
+                "session-1",
+                &format!("terminal-{}", i),
+                SftpTaskStatus::Done,
+                i,
+            );
+        }
+        // 活动任务 created_at 与最旧终态相同：淘汰不得触碰
+        insert_registry_task(
+            &service,
+            "session-1",
+            "running-old",
+            SftpTaskStatus::Running,
+            0,
+        );
+        insert_registry_task(
+            &service,
+            "session-1",
+            "pending-new",
+            SftpTaskStatus::Pending,
+            1000,
+        );
+        insert_registry_task(
+            &service,
+            "session-2",
+            "other-terminal",
+            SftpTaskStatus::Done,
+            0,
+        );
+
+        // 第 101 条终态产生：最旧的 terminal-0 被淘汰（Pending → Running → Done 合法迁移）
+        assert!(service.transition_task(
+            &app.handle(),
+            "pending-new",
+            "session-1",
+            SftpTaskStatus::Running,
+            None
+        ));
+        assert!(service.transition_task(
+            &app.handle(),
+            "pending-new",
+            "session-1",
+            SftpTaskStatus::Done,
+            None
+        ));
+
+        let tasks = service.tasks.lock().unwrap();
+        let terminal_count = tasks
+            .values()
+            .filter(|task| task.session_id == "session-1" && is_terminal(&task.status))
+            .count();
+        assert_eq!(terminal_count, 100, "每 Session 终态上限为 100");
+        assert!(!tasks.contains_key("terminal-0"), "最旧终态任务应被淘汰");
+        assert!(tasks.contains_key("terminal-1"));
+        assert!(tasks.contains_key("pending-new"));
+        assert!(tasks.contains_key("running-old"), "活动任务不得被淘汰");
+        assert!(
+            tasks.contains_key("other-terminal"),
+            "其他 Session 的终态任务不得被本 Session 淘汰"
+        );
+    }
+
+    /// 恰好 100 条终态时不做任何淘汰（边界不越界）。
+    #[test]
+    fn terminal_eviction_at_exact_100_keeps_all() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        for i in 0..99 {
+            insert_registry_task(
+                &service,
+                "session-1",
+                &format!("terminal-{}", i),
+                SftpTaskStatus::Done,
+                i,
+            );
+        }
+        insert_registry_task(
+            &service,
+            "session-1",
+            "pending-new",
+            SftpTaskStatus::Pending,
+            1000,
+        );
+
+        assert!(service.transition_task(
+            &app.handle(),
+            "pending-new",
+            "session-1",
+            SftpTaskStatus::Running,
+            None
+        ));
+        assert!(service.transition_task(
+            &app.handle(),
+            "pending-new",
+            "session-1",
+            SftpTaskStatus::Done,
+            None
+        ));
+
+        let tasks = service.tasks.lock().unwrap();
+        assert_eq!(
+            tasks
+                .values()
+                .filter(|task| is_terminal(&task.status))
+                .count(),
+            100
+        );
+        assert!(
+            tasks.contains_key("terminal-0"),
+            "恰好 100 条终态时不得淘汰"
+        );
+    }
+
+    /// 相同 createdAt 的终态任务按 task_id 升序淘汰最小者，结果跨运行确定。
+    #[test]
+    fn terminal_eviction_with_equal_created_at_is_deterministic() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        for i in 0..100 {
+            insert_registry_task(
+                &service,
+                "session-1",
+                &format!("t-{:03}", i),
+                SftpTaskStatus::Done,
+                0,
+            );
+        }
+        insert_registry_task(
+            &service,
+            "session-1",
+            "pending-new",
+            SftpTaskStatus::Pending,
+            1,
+        );
+
+        assert!(service.transition_task(
+            &app.handle(),
+            "pending-new",
+            "session-1",
+            SftpTaskStatus::Running,
+            None
+        ));
+        assert!(service.transition_task(
+            &app.handle(),
+            "pending-new",
+            "session-1",
+            SftpTaskStatus::Done,
+            None
+        ));
+
+        let tasks = service.tasks.lock().unwrap();
+        assert!(
+            !tasks.contains_key("t-000"),
+            "相同 createdAt 时按 task_id 升序淘汰最小者"
+        );
+        assert!(tasks.contains_key("t-099"));
+        assert!(tasks.contains_key("pending-new"));
+    }
+
+    /// 清除终态只移除 Done/Failed/Cancelled；活动任务与其他 Session 保留，重复调用幂等。
+    #[test]
+    fn clear_terminal_tasks_removes_only_terminal_and_is_idempotent() {
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        insert_registry_task(&service, "session-1", "done", SftpTaskStatus::Done, 1);
+        insert_registry_task(&service, "session-1", "failed", SftpTaskStatus::Failed, 2);
+        insert_registry_task(
+            &service,
+            "session-1",
+            "cancelled",
+            SftpTaskStatus::Cancelled,
+            3,
+        );
+        insert_registry_task(&service, "session-1", "running", SftpTaskStatus::Running, 4);
+        insert_registry_task(&service, "session-1", "pending", SftpTaskStatus::Pending, 5);
+        insert_registry_task(&service, "session-2", "other-done", SftpTaskStatus::Done, 6);
+
+        service.clear_terminal_tasks("session-1");
+
+        let ids: Vec<String> = service.tasks.lock().unwrap().keys().cloned().collect();
+        assert!(ids.contains(&"running".to_string()), "Running 必须保留");
+        assert!(ids.contains(&"pending".to_string()), "Pending 必须保留");
+        assert!(
+            ids.contains(&"other-done".to_string()),
+            "其他 Session 任务不受影响"
+        );
+        assert!(!ids.contains(&"done".to_string()));
+        assert!(!ids.contains(&"failed".to_string()));
+        assert!(!ids.contains(&"cancelled".to_string()));
+        assert_eq!(ids.len(), 3);
+
+        service.clear_terminal_tasks("session-1");
+        assert_eq!(service.tasks.lock().unwrap().len(), 3, "重复清除应幂等");
+    }
+
+    /// Session 关闭清空 registry 后，迟到 worker 的终态迁移因任务不存在被拒绝。
+    #[test]
+    fn session_close_clears_registry_and_rejects_late_worker_updates() {
+        use tauri::test::mock_app;
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        let token = insert_task(&service, "task-late", SftpTaskStatus::Pending);
+
+        service.cleanup_session("session-1", &app.handle().clone());
+
+        assert!(token.is_cancelled());
+        assert!(
+            service.tasks.lock().unwrap().is_empty(),
+            "关闭后 registry 应整体清空"
+        );
+        assert!(
+            !service.transition_task(
+                &app.handle(),
+                "task-late",
+                "session-1",
+                SftpTaskStatus::Done,
+                None
+            ),
+            "迟到 worker 更新必须被拒绝"
+        );
     }
 }

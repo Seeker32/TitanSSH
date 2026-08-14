@@ -202,7 +202,8 @@ export default function HomePage() {
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
-          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry} />}
+          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry}
+          onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeView)} />}
       </div>
     </section>
     <HostEditorDialog open={editorOpen} editingHost={editingHost} groups={useMemo(

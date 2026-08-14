@@ -70,3 +70,26 @@ pub fn sftp_cancel_task(
         .cancel_task(&task_id)
         .map_err(AppErrorInfo::from)
 }
+
+/// 获取指定 Session 的权威任务快照（按 createdAt 最新优先），供前端恢复错过的事件
+///
+/// # 参数
+/// - `session_id`: 关联的 SSH 会话 ID
+#[tauri::command]
+pub fn sftp_task_snapshot(
+    session_id: String,
+    sftp_service: State<'_, SftpService>,
+) -> Vec<TransferTask> {
+    sftp_service.task_snapshot(&session_id)
+}
+
+/// 清除指定 Session 的全部终态任务记录；Pending/Running 活动任务不受影响
+///
+/// 幂等：无终态任务或 Session 不存在时静默成功。
+///
+/// # 参数
+/// - `session_id`: 关联的 SSH 会话 ID
+#[tauri::command]
+pub fn sftp_clear_terminal_tasks(session_id: String, sftp_service: State<'_, SftpService>) {
+    sftp_service.clear_terminal_tasks(&session_id);
+}

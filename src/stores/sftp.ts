@@ -2,10 +2,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
 import { toAppError, type AppErrorInfo } from '@/i18n';
+import { isTerminalStatus } from '@/types/sftp';
 import type {
   RemoteEntry,
   SftpProgressEvent,
   SftpSessionState,
+  SftpTaskSnapshot,
   SftpTaskStatusEvent,
   TransferTask,
 } from '@/types/sftp';
@@ -14,12 +16,16 @@ interface SftpState {
   sessionStates: Map<string, SftpSessionState>;
   /** invoke 返回前到达的任务状态事件缓存，任务元数据到达后补投 */
   pendingTaskEvents: Map<string, SftpTaskStatusEvent>;
+  /** 已关闭会话 ID：清理后迟到的状态事件直接丢弃，不再落回缓存 */
+  closedSessions: Set<string>;
   getState: (sessionId: string) => SftpSessionState | undefined;
   ensureState: (sessionId: string) => SftpSessionState;
   listDir: (sessionId: string, path: string) => Promise<void>;
+  loadTaskSnapshot: (sessionId: string) => Promise<void>;
   download: (sessionId: string, remotePath: string, localPath: string, parentTaskId?: string) => Promise<void>;
   upload: (sessionId: string, localPath: string, remotePath: string, parentTaskId?: string) => Promise<void>;
   cancelTask: (taskId: string, sessionId: string) => Promise<void>;
+  clearTerminalTasks: (sessionId: string) => Promise<void>;
   toggleSelect: (sessionId: string, path: string) => void;
   clearSession: (sessionId: string) => void;
   applyProgress: (event: SftpProgressEvent) => void;
@@ -94,18 +100,27 @@ function startDirRequest(
 export const useSftpStore = create<SftpState>((set, get) => ({
   sessionStates: new Map(),
   pendingTaskEvents: new Map(),
+  closedSessions: new Set(),
 
   /** 获取指定会话状态；不存在时返回 undefined。 */
   getState(sessionId) {
     return get().sessionStates.get(sessionId);
   },
 
-  /** 懒初始化并返回指定会话状态。 */
+  /** 懒初始化并返回指定会话状态；重新打开已关闭会话时撤下关闭标记。 */
   ensureState(sessionId) {
     const existing = get().sessionStates.get(sessionId);
     if (existing) return existing;
     const created = emptySessionState();
-    set((state) => ({ sessionStates: new Map(state.sessionStates).set(sessionId, created) }));
+    set((state) => {
+      const closedSessions = state.closedSessions.has(sessionId)
+        ? new Set([...state.closedSessions].filter((id) => id !== sessionId))
+        : state.closedSessions;
+      return {
+        sessionStates: new Map(state.sessionStates).set(sessionId, created),
+        closedSessions,
+      };
+    });
     return created;
   },
 
@@ -128,6 +143,36 @@ export const useSftpStore = create<SftpState>((set, get) => ({
         if (state.dirRequestSeq !== requestSeq) return state; // 旧请求失败不得结束最新 loading
         return { ...state, error: toAppError(error), loading: false };
       });
+    }
+  },
+
+  /** 用后端权威快照重建指定会话的任务投影（恢复错过的事件），并补投
+   *  快照返回前到达、被缓存的早到状态事件；后续事件继续增量更新。
+   *  invoke 拒绝不向外抛出，错误写入文件浏览器错误区。 */
+  async loadTaskSnapshot(sessionId) {
+    const startedAt = Date.now(); // 快照请求开始时间：其后入队的任务比快照更新
+    try {
+      const tasks = await invoke<SftpTaskSnapshot>('sftp_task_snapshot', { sessionId });
+      updateSession(set, sessionId, (state) => {
+        const merged = new Map((tasks ?? []).map((task) => [task.taskId, task]));
+        // 快照采集时刻早于本次 invoke：请求开始后入队的任务本地投影更新，覆盖快照旧状态
+        for (const [taskId, task] of state.tasks) {
+          if (task.createdAt >= startedAt) merged.set(taskId, task);
+        }
+        return { ...state, tasks: merged };
+      });
+      // 会话重新打开：撤下关闭标记，后续事件恢复增量更新
+      if (get().closedSessions.has(sessionId)) {
+        set((state) => ({
+          closedSessions: new Set([...state.closedSessions].filter((id) => id !== sessionId)),
+        }));
+      }
+      // 补投快照返回前到达的早到事件；未知任务的事件补投失败后会重新落回缓存
+      for (const event of [...get().pendingTaskEvents.values()]) {
+        if (event.sessionId === sessionId) get().applyBufferedTaskStatus(event.taskId);
+      }
+    } catch (error) {
+      updateSession(set, sessionId, (state) => ({ ...state, error: toAppError(error) }));
     }
   },
 
@@ -178,6 +223,28 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     }
   },
 
+  /** 清除指定会话的全部终态任务：后端权威清除成功后同步本地投影，
+   *  Pending/Running 活动任务保留，并清理被移除任务行的 actionError。
+   *  invoke 拒绝不向外抛出，错误写入文件浏览器错误区。 */
+  async clearTerminalTasks(sessionId) {
+    try {
+      await invoke('sftp_clear_terminal_tasks', { sessionId });
+      updateSession(set, sessionId, (state) => {
+        const tasks = new Map(state.tasks);
+        const taskActionErrors = new Map(state.taskActionErrors);
+        for (const [taskId, task] of tasks) {
+          if (isTerminalStatus(task.status)) {
+            tasks.delete(taskId);
+            taskActionErrors.delete(taskId);
+          }
+        }
+        return { ...state, tasks, taskActionErrors };
+      });
+    } catch (error) {
+      updateSession(set, sessionId, (state) => ({ ...state, error: toAppError(error) }));
+    }
+  },
+
   /** 切换指定远程路径的选中状态。 */
   toggleSelect(sessionId, path) {
     updateSession(set, sessionId, (state) => {
@@ -187,7 +254,8 @@ export const useSftpStore = create<SftpState>((set, get) => ({
     });
   },
 
-  /** 清理已关闭会话的全部 SFTP 状态与同会话的缓存事件。 */
+  /** 清理已关闭会话的全部 SFTP 状态与同会话的缓存事件，并登记关闭标记；
+   *  此后到达的迟到状态事件直接丢弃，不再落回缓存。 */
   clearSession(sessionId) {
     set((state) => {
       const sessionStates = new Map(state.sessionStates);
@@ -196,7 +264,11 @@ export const useSftpStore = create<SftpState>((set, get) => ({
       for (const [taskId, event] of pendingTaskEvents) {
         if (event.sessionId === sessionId) pendingTaskEvents.delete(taskId);
       }
-      return { sessionStates, pendingTaskEvents };
+      return {
+        sessionStates,
+        pendingTaskEvents,
+        closedSessions: new Set(state.closedSessions).add(sessionId),
+      };
     });
   },
 
@@ -204,7 +276,7 @@ export const useSftpStore = create<SftpState>((set, get) => ({
   applyProgress(event) {
     const state = get().sessionStates.get(event.sessionId);
     const task = state?.tasks.get(event.taskId);
-    if (!state || !task || ['Done', 'Failed', 'Cancelled'].includes(task.status)) return;
+    if (!state || !task || isTerminalStatus(task.status)) return;
     updateSession(set, event.sessionId, (current) => ({
       ...current,
       tasks: new Map(current.tasks).set(event.taskId, {
@@ -214,8 +286,10 @@ export const useSftpStore = create<SftpState>((set, get) => ({
   },
 
   /** 应用传输任务终态；完成时强制进度为总大小。未知任务缓存最新事件。
-   *  任务到达终态时同步清除对应任务行的 actionError（取消失败等操作错误已失去意义）。 */
+   *  会话已关闭（投影已清空）时迟到事件直接丢弃；任务到达终态时同步清除
+   *  对应任务行的 actionError（取消失败等操作错误已失去意义）。 */
   applyTaskStatus(event) {
+    if (get().closedSessions.has(event.sessionId)) return;
     const state = get().sessionStates.get(event.sessionId);
     const task = state?.tasks.get(event.taskId);
     if (!task) {
@@ -225,7 +299,7 @@ export const useSftpStore = create<SftpState>((set, get) => ({
       return;
     }
     updateSession(set, event.sessionId, (current) => {
-      const taskActionErrors = ['Done', 'Failed', 'Cancelled'].includes(event.status)
+      const taskActionErrors = isTerminalStatus(event.status)
         ? (() => {
             const next = new Map(current.taskActionErrors);
             next.delete(event.taskId);

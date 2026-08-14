@@ -56,6 +56,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         statusMessage: translate(useLocaleStore.getState().locale, 'session.connecting', { name: `${session.username}@${session.host}` }),
       }));
       void useSftpStore.getState().listDir(session.sessionId, '/');
+      void useSftpStore.getState().loadTaskSnapshot(session.sessionId);
       try {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
       } catch {

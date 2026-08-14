@@ -166,7 +166,7 @@ describe('React components', () => {
     expect(rows[0].querySelector('svg')).not.toBeNull();
     expect(rows[1].querySelector('svg')).not.toBeNull();
     const tasks = new Map([[makeTransferTask().taskId, makeTransferTask()]]);
-    render(<TransferQueue tasks={tasks} actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} />);
+    render(<TransferQueue tasks={tasks} actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onClearTerminal={vi.fn()} />);
     expect(container.querySelectorAll('svg').length).toBeGreaterThan(0);
     expect(screen.queryByText('📁')).not.toBeInTheDocument();
     expect(screen.queryByText('⬇')).not.toBeInTheDocument();
@@ -336,7 +336,7 @@ describe('React components', () => {
     const retry = vi.fn();
     const running = makeTransferTask({ transferredBytes: 25600, speedBps: 1024, status: 'Running' });
     const failed = makeTransferTask({ taskId: 'task-2', status: 'Failed', error: { code: 'SftpTransferError', detail: 'network' } });
-    render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} actionErrors={new Map()} onCancel={cancel} onRetry={retry} />);
+    render(<TransferQueue tasks={new Map([[running.taskId, running], [failed.taskId, failed]])} actionErrors={new Map()} onCancel={cancel} onRetry={retry} onClearTerminal={vi.fn()} />);
     expect(screen.getByText('50%')).toBeInTheDocument();
     expect(screen.getByText(/network/)).toBeInTheDocument();
     await user.click(screen.getByTestId('cancel-btn'));
@@ -348,14 +348,37 @@ describe('React components', () => {
   it('任务行渲染取消/重试操作失败的结构化错误', () => {
     const task = makeTransferTask({ status: 'Running' });
     const actionErrors = new Map([[task.taskId, { code: 'SftpTaskNotFound', detail: task.taskId }]]);
-    render(<TransferQueue tasks={new Map([[task.taskId, task]])} actionErrors={actionErrors} onCancel={vi.fn()} onRetry={vi.fn()} />);
+    render(<TransferQueue tasks={new Map([[task.taskId, task]])} actionErrors={actionErrors} onCancel={vi.fn()} onRetry={vi.fn()} onClearTerminal={vi.fn()} />);
     expect(screen.getByTestId('task-action-error')).toHaveTextContent('SFTP 任务不存在');
     expect(screen.getByTestId('task-action-error')).toHaveTextContent(task.taskId);
   });
 
+  it('传输队列按 createdAt 最新优先展示任务', () => {
+    const oldTask = makeTransferTask({ taskId: 'task-old', fileName: 'old.log', createdAt: 1_000 });
+    const newTask = makeTransferTask({ taskId: 'task-new', fileName: 'new.log', createdAt: 2_000 });
+    const { container } = render(<TransferQueue tasks={new Map([[oldTask.taskId, oldTask], [newTask.taskId, newTask]])}
+      actionErrors={new Map()} onCancel={vi.fn()} onRetry={vi.fn()} onClearTerminal={vi.fn()} />);
+    const names = [...container.querySelectorAll('.task-name')].map((node) => node.textContent);
+    expect(names).toEqual(['new.log', 'old.log']);
+  });
+
+  it('传输队列存在终态任务时显示清除按钮并回调，仅活动任务时不显示', async () => {
+    const user = userEvent.setup();
+    const onClearTerminal = vi.fn();
+    const done = makeTransferTask({ taskId: 'task-done', status: 'Done' });
+    const running = makeTransferTask({ taskId: 'task-running', status: 'Running' });
+    const props = { actionErrors: new Map(), onCancel: vi.fn(), onRetry: vi.fn() };
+    const { rerender } = render(<TransferQueue tasks={new Map([[done.taskId, done], [running.taskId, running]])}
+      {...props} onClearTerminal={onClearTerminal} />);
+    await user.click(screen.getByTestId('clear-terminal-btn'));
+    expect(onClearTerminal).toHaveBeenCalledOnce();
+    rerender(<TransferQueue tasks={new Map([[running.taskId, running]])} {...props} onClearTerminal={onClearTerminal} />);
+    expect(screen.queryByTestId('clear-terminal-btn')).not.toBeInTheDocument();
+  });
+
   it('SFTP 面板在浏览器和队列间切换并保留占位', async () => {
     const user = userEvent.setup();
-    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn() };
+    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn(), onClearTerminal: vi.fn() };
     const { rerender } = render(<SftpPanel sessionId="session-1" state={null} {...handlers} />);
     expect(screen.getByText('请选择会话')).toBeInTheDocument();
     const state = { currentPath: '/', entries: [], selectedPaths: new Set<string>(), loading: false, error: null, tasks: new Map(), taskActionErrors: new Map(), dirRequestSeq: 0 };
@@ -366,7 +389,7 @@ describe('React components', () => {
   });
 
   it('SFTP 高度拖动阻止文本选中：阻止默认行为并仅拖动期间加禁选类', () => {
-    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn() };
+    const handlers = { onNavigate: vi.fn(), onSelect: vi.fn(), onUpload: vi.fn(), onDownload: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn(), onClearTerminal: vi.fn() };
     render(<SftpPanel sessionId="session-1" state={null} {...handlers} />);
     const resizer = screen.getByTestId('sftp-resizer');
     const start = new Event('pointerdown', { bubbles: true, cancelable: true });

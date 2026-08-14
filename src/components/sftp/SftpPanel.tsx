@@ -15,6 +15,7 @@ interface Props {
   onDownload: (sessionId: string, paths: string[]) => void;
   onCancel: (taskId: string) => void;
   onRetry: (task: TransferTask) => void;
+  onClearTerminal: () => void;
 }
 
 const MIN_HEIGHT = 120;
@@ -77,6 +78,6 @@ export default function SftpPanel(props: Props) {
         onUpload={() => props.onUpload(props.sessionId, props.state!.currentPath)}
         onDownload={(paths) => props.onDownload(props.sessionId, paths)} />
         : <TransferQueue tasks={props.state.tasks} actionErrors={props.state.taskActionErrors}
-          onCancel={props.onCancel} onRetry={props.onRetry} />}
+          onCancel={props.onCancel} onRetry={props.onRetry} onClearTerminal={props.onClearTerminal} />}
   </div>;
 }

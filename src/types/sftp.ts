@@ -46,6 +46,17 @@ export interface SftpTaskStatusEvent {
   error: AppErrorInfo | null;
 }
 
+/** sftp_task_snapshot 响应：指定 Session 的权威任务列表（createdAt 最新优先） */
+export type SftpTaskSnapshot = TransferTask[];
+
+/** 终态集合：不再接受任何状态迁移的任务状态（与后端 is_terminal 对齐） */
+export const TERMINAL_TASK_STATUSES: readonly SftpTaskStatus[] = ['Done', 'Failed', 'Cancelled'];
+
+/** 判断任务状态是否为终态。 */
+export function isTerminalStatus(status: SftpTaskStatus): boolean {
+  return TERMINAL_TASK_STATUSES.includes(status);
+}
+
 /** per-session SFTP 状态；selectedPaths 为运行时 Set，不序列化到 Tauri 边界 */
 export interface SftpSessionState {
   currentPath: string;

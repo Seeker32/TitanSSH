@@ -86,6 +86,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'sftp.done': 'Done',
   'sftp.failed': 'Failed',
   'sftp.cancelled': 'Cancelled',
+  'sftp.clearTerminal': 'Clear finished',
   'sftp.defaultDownload': 'download',
 
   // Server monitoring
