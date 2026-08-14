@@ -1,6 +1,6 @@
 import type { HostIdentityChallenge, SessionConnection, SessionInfo } from '@/types/session';
-import { SessionStatus } from '@/types/session';
-import { connectionLabel, overlayStatus } from '@/stores/session';
+import { ConnectionPhase, SessionStatus } from '@/types/session';
+import { connectionLabel, overlayStatus, progressLabel } from '@/stores/session';
 import EmptyState from '@/components/shell/EmptyState';
 import HostIdentityCard from './HostIdentityCard';
 import TerminalOverlay from './TerminalOverlay';
@@ -30,6 +30,11 @@ export default function TerminalPane({ sessions, activeView, connections, challe
         {activeView === null && <EmptyState onCreateHost={onCreateHost} />}
         {sessions.map((session) => {
           const challenge = challenges.get(session.sessionId);
+          const connection = connections.get(session.sessionId);
+          // 等待确认期间在确认卡内展示主机身份验证阶段（不渲染独立覆盖层）
+          const phaseLabel = connection?.phase === ConnectionPhase.VerifyingHostKey
+            ? progressLabel(connection.phase)
+            : null;
           return (
             <div key={session.sessionId} className="terminal-session" hidden={activeView !== session.sessionId}>
               <XtermView sessionId={session.sessionId}
@@ -37,12 +42,12 @@ export default function TerminalPane({ sessions, activeView, connections, challe
                 interactive={session.status === SessionStatus.Connected}
                 onInput={onInput} onResize={onResize} />
               {challenge ? (
-                <HostIdentityCard challenge={challenge}
+                <HostIdentityCard challenge={challenge} phaseLabel={phaseLabel}
                   onAccept={() => onAcceptIdentity(session.sessionId)}
                   onReject={() => onRejectIdentity(session.sessionId)} />
               ) : overlayStatus(session.status) && (
                 <TerminalOverlay status={session.status}
-                  message={connectionLabel(session, connections.get(session.sessionId))}
+                  message={connectionLabel(session, connection)}
                   onClose={() => onCloseTab(session.sessionId)} />
               )}
             </div>

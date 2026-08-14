@@ -186,21 +186,14 @@ fn start_terminal_session_with_parts<R, F>(
 
         // 等待连接结果：固定短轮询，按当前阶段决定是否消耗连接总超时预算。
         // 主机身份确认（VerifyingHostKey）等待用户决定期间不设独立自动超时、
-        // 不占用预算；其余阶段共享总预算，超过截止即上报 Timeout。
-        let overall_deadline = Instant::now() + connect_timeout;
+        // 不占用预算：进入验证阶段时预算冻结，离开时重新授予完整预算（用户
+        // 接受后认证仍有完整窗口，不因等待时长被立即判超时）；其余阶段共享
+        // 预算，超过截止即上报 Timeout。连接结果优先于截止判定：已完成但
+        // 尚未被读取的连接不得因旧截止被误杀。
+        let mut overall_deadline = Instant::now() + connect_timeout;
+        let mut verify_wait_start: Option<Instant> = None;
         let mut terminal = loop {
             let active_phase = current_phase_value(&current_phase);
-            let verifying = active_phase == ConnectionPhase::VerifyingHostKey;
-            if !verifying && Instant::now() >= overall_deadline {
-                emit_session_status(
-                    &app,
-                    &session_id,
-                    &runtime_status,
-                    SessionStatus::Timeout,
-                    Some(phase_timeout_message(&active_phase)),
-                );
-                return;
-            }
             match conn_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(terminal)) => break terminal,
                 Ok(Err(error)) => {
@@ -209,7 +202,25 @@ fn start_terminal_session_with_parts<R, F>(
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // 回到循环顶：重新读取阶段并按截止判定（验证阶段无限等待）
+                    let verifying = active_phase == ConnectionPhase::VerifyingHostKey;
+                    match (verifying, verify_wait_start) {
+                        (true, None) => verify_wait_start = Some(Instant::now()),
+                        (false, Some(_)) => {
+                            overall_deadline = Instant::now() + connect_timeout;
+                            verify_wait_start = None;
+                        }
+                        _ => {}
+                    }
+                    if !verifying && Instant::now() >= overall_deadline {
+                        emit_session_status(
+                            &app,
+                            &session_id,
+                            &runtime_status,
+                            SessionStatus::Timeout,
+                            Some(phase_timeout_message(&active_phase)),
+                        );
+                        return;
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     emit_session_status(
@@ -434,16 +445,19 @@ fn phase_message(phase: &ConnectionPhase) -> &'static str {
 /// 返回连接阶段的超时提示文本
 ///
 /// 不同阶段使用明确文案，便于用户和开发者快速判断阻塞点。
+/// 主机身份确认（VerifyingHostKey）不设独立自动超时，永不进入此函数。
 fn phase_timeout_message(phase: &ConnectionPhase) -> String {
     match phase {
         ConnectionPhase::LoadingCredentials => "读取系统凭据超时".to_string(),
         ConnectionPhase::ConnectingTcp => "建立 TCP 连接超时".to_string(),
         ConnectionPhase::SshHandshake => "SSH 握手超时".to_string(),
-        ConnectionPhase::VerifyingHostKey => "主机身份确认超时".to_string(),
         ConnectionPhase::Authenticating => "SSH 认证超时".to_string(),
         ConnectionPhase::OpeningChannel => "打开终端通道超时".to_string(),
         ConnectionPhase::RequestingPty => "请求终端 PTY 超时".to_string(),
         ConnectionPhase::StartingShell => "启动 Shell 超时".to_string(),
+        // 防御性分支：验证阶段无自动超时，deadline 判定不会进入此函数；
+        // 若协议层超时错误在阶段回读时仍显示为验证阶段，返回通用文案而非 panic
+        ConnectionPhase::VerifyingHostKey => "连接超时".to_string(),
     }
 }
 
@@ -1128,6 +1142,81 @@ mod integration_tests {
             wait_for_final_status(&runtime_status, Duration::from_secs(2)),
             SessionStatus::Connected,
             "仅本次接受后终端继续认证并连接成功"
+        );
+    }
+
+    /// 预算在验证等待期间耗尽后接受：等待不消耗预算，连接完成优先于截止判定；
+    /// 用户接受后会话必须继续认证而不是被立即判超时。
+    #[test]
+    fn accept_after_deadline_expired_during_verification_still_connects() {
+        use tauri::test::mock_app;
+
+        // 验证后继续认证需要一定时间（接受后 400ms 才完成连接），
+        // 暴露"预算在等待期间耗尽"与"认证仍在进行"的交错：接受不得被立即判超时。
+        let connect_fn: TerminalConnectFn = Box::new(
+            move |_host,
+                  _password,
+                  _passphrase,
+                  verifier,
+                  on_phase: &mut dyn FnMut(ConnectPhase)| {
+                on_phase(ConnectPhase::ConnectingTcp);
+                on_phase(ConnectPhase::SshHandshake);
+                on_phase(ConnectPhase::VerifyingHostKey);
+                let presented = PresentedHostKey {
+                    host: "10.0.0.8".to_string(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".to_string(),
+                    fingerprint: "SHA256:terminal-deadline".to_string(),
+                };
+                verifier(&presented)?;
+                on_phase(ConnectPhase::Authenticating);
+                thread::sleep(Duration::from_millis(400));
+                Ok(crate::core::ssh_transport::test_support::idle_terminal())
+            },
+        );
+
+        let app = mock_app();
+        let identity = HostIdentityService::new();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-identity-deadline".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| Ok((Some("password".to_string()), None)),
+            identity.verifier(
+                app.handle().clone(),
+                "session-identity-deadline".to_string(),
+            ),
+            connect_fn,
+            // 预算远小于验证等待时长：预算在等待期间耗尽
+            Duration::from_millis(300),
+        );
+
+        // challenge 出现后等待超过预算，再接受
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while identity
+            .pending_challenge("session-identity-deadline")
+            .is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = identity
+            .pending_challenge("session-identity-deadline")
+            .expect("终端连接产生主机身份 challenge");
+        thread::sleep(Duration::from_millis(1_000));
+
+        identity.accept(&challenge.challenge_id).unwrap();
+        assert_eq!(
+            wait_for_final_status(&runtime_status, Duration::from_secs(2)),
+            SessionStatus::Connected,
+            "预算在等待期间耗尽，用户接受后会话仍应继续认证"
         );
     }
 

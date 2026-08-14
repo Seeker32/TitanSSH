@@ -229,20 +229,35 @@ describe('React components', () => {
       keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_000_000,
     };
     render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
-      connections={new Map()} challenges={new Map([['session-1', challenge]])}
+      connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
+      challenges={new Map([['session-1', challenge]])}
       onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
       onAcceptIdentity={accept} onRejectIdentity={reject} />);
     const card = screen.getByTestId('host-identity-card');
     expect(card).toHaveTextContent('10.0.0.8:2222');
     expect(card).toHaveTextContent('ssh-ed25519');
     expect(card).toHaveTextContent('SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD');
-    // 确认卡存在时不显示连接覆盖层；xterm 仍不可交互
+    // 等待确认期间展示主机身份验证阶段；确认卡存在时不显示连接覆盖层；xterm 仍不可交互
+    expect(card).toHaveTextContent('正在验证主机身份...');
     expect(screen.queryByRole('status')).toBeNull();
     expect(screen.getByTestId('xterm')).toHaveAttribute('data-interactive', 'false');
     await user.click(screen.getByRole('button', { name: '仅本次接受' }));
     expect(accept).toHaveBeenCalledWith('session-1');
     await user.click(screen.getByRole('button', { name: '拒绝' }));
     expect(reject).toHaveBeenCalledWith('session-1');
+  });
+
+  it('非验证阶段的连接投影不向确认卡注入阶段文案', async () => {
+    const challenge: HostIdentityChallenge = {
+      challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+      connections={new Map([['session-1', { phase: ConnectionPhase.Authenticating, error: null }]])}
+      challenges={new Map([['session-1', challenge]])}
+      onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
+      onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    expect(screen.getByTestId('host-identity-card')).not.toHaveTextContent('正在验证主机身份...');
   });
 
   it('英文环境下主机身份确认卡使用英文文案', async () => {

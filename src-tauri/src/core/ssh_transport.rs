@@ -414,17 +414,19 @@ where
     session.set_tcp_stream(tcp);
     session.handshake().map_err(protocol_error)?;
 
-    // 主机身份统一校验：计算指纹并等待用户决定；任何拒绝在认证前终止连接
+    // 主机身份统一校验：计算指纹并等待用户决定；任何拒绝在认证前终止连接。
+    // 服务器未呈现主机密钥同样不得进入认证（无法验证身份即不发送凭据）。
     on_phase(ConnectPhase::VerifyingHostKey);
-    if let Some((blob, key_type)) = session.host_key() {
-        let presented = PresentedHostKey {
-            host: host.host.clone(),
-            port: host.port,
-            algorithm: algorithm_name(key_type).to_string(),
-            fingerprint: fingerprint_sha256(blob),
-        };
-        verifier(&presented)?;
-    }
+    let (blob, key_type) = session.host_key().ok_or_else(|| {
+        AppError::SshProtocolError("服务器未提供主机密钥，无法验证主机身份，已阻止认证".to_string())
+    })?;
+    let presented = PresentedHostKey {
+        host: host.host.clone(),
+        port: host.port,
+        algorithm: algorithm_name(key_type).to_string(),
+        fingerprint: fingerprint_sha256(blob),
+    };
+    verifier(&presented)?;
 
     on_phase(ConnectPhase::Authenticating);
     match host.auth_type {
@@ -1437,7 +1439,6 @@ pub(crate) mod test_support {
         }
     }
 
-    /// 创建返回空目录的 SFTP 测试 capability。
     /// 构建总是放行的主机身份校验器（真实 SSH E2E 与 transport 测试使用）。
     pub(crate) fn allow_all_verifier() -> crate::core::host_identity::HostKeyVerifier {
         std::sync::Arc::new(|_presented: &crate::core::host_identity::PresentedHostKey| Ok(()))

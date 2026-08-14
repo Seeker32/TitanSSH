@@ -18,6 +18,36 @@ test.beforeEach(async ({ page }) => {
     let snapshotTasks: unknown[] = [];
     // 待消费的失败注入队列：按 command 匹配，命中则让 invoke 以结构化错误拒绝
     const failQueue: Array<{ command: string; error: { code: string; detail?: string } }> = [];
+    // 主机身份确认建模（issue #31）：pending challenge 与 gated capability 等待者。
+    // 真实后端：未知主机在握手后、认证前阻断 Terminal/SFTP/Monitoring 连接并派发 challenge；
+    // mock 以 pendingChallenges 充当同一后端权威，sftp_list_dir/start_monitoring 在决定前不返回。
+    const pendingChallenges = new Map<string, {
+      challenge: { challengeId: string; sessionId: string };
+      waiters: Array<{ command: string; resolve: () => void; reject: (error: unknown) => void }>;
+    }>();
+    // 每个 gated capability 的决定终局（接受 code=null），供断言三 capability 服从同一决定
+    const identityWaiterResults: Array<{ command: string; code: string | null }> = [];
+    // 测试开启后，open_session 立即派发未知主机 challenge（模拟后端连接到达校验门）
+    let autoHostIdentity = false;
+    /** 向所有已注册监听器派发结构化 Tauri 事件。 */
+    const emitEvent = (name: string, payload: unknown) => {
+      if (name === 'host-identity:challenge' && payload && typeof payload === 'object' && 'sessionId' in payload) {
+        const challenge = payload as { challengeId: string; sessionId: string };
+        pendingChallenges.set(challenge.sessionId, { challenge, waiters: [] });
+      }
+      listeners.get(name)?.forEach((id) => callbacks.get(id)?.({ event: name, id, payload }));
+    };
+    /** 命中 pending challenge 时返回等待决定的门控 Promise；否则直接返回正常响应。 */
+    const gateOnIdentity = (command: string, sessionId: string, produce: () => unknown) => {
+      const entry = pendingChallenges.get(sessionId);
+      if (!entry) return Promise.resolve(produce());
+      return new Promise((resolve, reject) => {
+        entry.waiters.push({ command, resolve: () => resolve(produce()), reject });
+      });
+    };
+    /** 按 challengeId 取出 pending challenge（跨 session 匹配，与命令契约一致）。 */
+    const pendingByChallengeId = (challengeId: unknown) =>
+      [...pendingChallenges.values()].find((entry) => entry.challenge.challengeId === challengeId);
     const internals = {
       /** 注册 Tauri 回调并返回数字句柄。 */
       transformCallback(callback?: (event: unknown) => void) {
@@ -56,13 +86,65 @@ test.beforeEach(async ({ page }) => {
           }
           return hostsStore;
         }
-        if (command === 'open_session') return session;
+        if (command === 'close_session') {
+          // 关闭标签/会话：取消该 Session 的 pending challenge 与全部等待者（不进入认证）
+          const entry = pendingChallenges.get(String(args.sessionId));
+          if (entry) {
+            pendingChallenges.delete(entry.challenge.sessionId);
+            entry.waiters.forEach((waiter) => {
+              identityWaiterResults.push({ command: waiter.command, code: 'HostKeyVerificationCancelled' });
+              waiter.reject({ code: 'HostKeyVerificationCancelled', detail: String(args.sessionId) });
+            });
+          }
+          return undefined;
+        }
+        if (command === 'open_session') {
+          // 未知主机：连接到达统一校验门，mock 后端派发 challenge；认证前不返回 capability 数据
+          if (autoHostIdentity) {
+            emitEvent('host-identity:challenge', {
+              challengeId: 'challenge-auto',
+              sessionId: 'session-1',
+              host: '10.0.0.8',
+              port: 22,
+              keyAlgorithm: 'ssh-ed25519',
+              fingerprint: 'SHA256:aGVscG1l',
+              timestamp: Date.now(),
+            });
+            // 终端连接到达主机身份验证阶段（会话注册后再派发，投影方可接收）
+            setTimeout(() => {
+              emitEvent('session:progress', { sessionId: 'session-1', phase: 'VerifyingHostKey', timestamp: Date.now() });
+            }, 0);
+          }
+          return session;
+        }
+        if (command === 'accept_host_identity') {
+          const entry = pendingByChallengeId(args.challengeId);
+          if (!entry) throw { code: 'HostKeyChallengeNotFound', detail: String(args.challengeId) };
+          pendingChallenges.delete(entry.challenge.sessionId);
+          entry.waiters.forEach((waiter) => {
+            identityWaiterResults.push({ command: waiter.command, code: null });
+            waiter.resolve();
+          });
+          // 后端放行认证：终端会话进入 Connected
+          emitEvent('session:status', { sessionId: entry.challenge.sessionId, status: 'Connected', message: null });
+          return undefined;
+        }
+        if (command === 'reject_host_identity') {
+          const entry = pendingByChallengeId(args.challengeId);
+          if (!entry) throw { code: 'HostKeyChallengeNotFound', detail: String(args.challengeId) };
+          pendingChallenges.delete(entry.challenge.sessionId);
+          entry.waiters.forEach((waiter) => {
+            identityWaiterResults.push({ command: waiter.command, code: 'HostKeyRejected' });
+            waiter.reject({ code: 'HostKeyRejected', detail: '10.0.0.8:22' });
+          });
+          return undefined;
+        }
         if (command === 'delete_host') {
           hostsStore = hostsStore.filter((item) => item.id !== (args.hostId as string));
           return hostsStore;
         }
-        if (command === 'start_monitoring') return task;
-        if (command === 'sftp_list_dir') return [{ name: 'syslog', path: '/syslog', isDir: false, size: 100, modifiedAt: Date.now(), permissions: 'rw-r--r--' }];
+        if (command === 'start_monitoring') return gateOnIdentity('start_monitoring', String(args.sessionId), () => task);
+        if (command === 'sftp_list_dir') return gateOnIdentity('sftp_list_dir', String(args.sessionId), () => [{ name: 'syslog', path: '/syslog', isDir: false, size: 100, modifiedAt: Date.now(), permissions: 'rw-r--r--' }]);
         if (command === 'sftp_download') return transfer;
         if (command === 'sftp_upload') return { ...transfer, taskId: 'transfer-2', transferType: 'Upload', fileName: 'upload.txt' };
         if (command === 'sftp_task_snapshot') return snapshotTasks;
@@ -76,7 +158,19 @@ test.beforeEach(async ({ page }) => {
         calls,
         /** 向所有已注册监听器派发结构化 Tauri 事件。 */
         emit(name: string, payload: unknown) {
-          listeners.get(name)?.forEach((id) => callbacks.get(id)?.({ event: name, id, payload }));
+          emitEvent(name, payload);
+        },
+        /** 开启主机身份确认建模：open_session 后 mock 后端派发未知主机 challenge 并阻塞 capability。 */
+        enableHostIdentity() {
+          autoHostIdentity = true;
+        },
+        /** 当前等待统一决定的 gated capability 数（sftp_list_dir / start_monitoring）。 */
+        pendingIdentityWaits() {
+          return [...pendingChallenges.values()].reduce((total, entry) => total + entry.waiters.length, 0);
+        },
+        /** 每个 gated capability 的决定终局，证明三 capability 服从同一决定。 */
+        identityWaiterResults() {
+          return [...identityWaiterResults];
         },
         /** 让下一次匹配 command 的 invoke 以结构化错误拒绝（与后端 AppErrorInfo 契约一致）。 */
         failNext(command: string, error: { code: string; detail?: string }) {
@@ -388,4 +482,112 @@ test('清除已结束按钮清空终态任务且保留活动任务', async ({ pa
     __TAURI_TEST__: { calls: Array<{ command: string }> };
   }).__TAURI_TEST__.calls.filter((call) => call.command === 'sftp_clear_terminal_tasks'));
   expect(clearCalls).toHaveLength(1);
+});
+
+test('首次主机身份：内联确认卡仅本次接受，三 capability 统一等待决定', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableHostIdentity: () => void };
+  }).__TAURI_TEST__.enableHostIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+
+  // 等待决定期间：标签保持 Connecting 状态点，确认卡内联于终端区域而非全局 Modal
+  await expect(page.locator('.tab .dot-connecting')).toHaveCount(1);
+  const card = page.locator('.terminal-pane').getByTestId('host-identity-card');
+  await expect(card).toBeVisible();
+  await expect(card).toContainText('10.0.0.8:22');
+  await expect(card).toContainText('ssh-ed25519');
+  await expect(card).toContainText('SHA256:aGVscG1l');
+  // 等待期间展示主机身份验证阶段；终端不可交互（不绕过校验）
+  await expect(card).toContainText('正在验证主机身份...');
+  await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'false');
+  await expect(page.locator('.ant-modal')).toHaveCount(0);
+
+  // 三 capability 不绕过：SFTP 目录与监控任务均阻塞在统一校验门后
+  await expect(page.getByText('syslog')).toHaveCount(0);
+  await expect(page.locator('.state-msg')).toContainText('加载中');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(2);
+
+  // 仅本次接受：同一决定放行全部等待者
+  await page.getByTestId('host-identity-accept').click();
+  const acceptCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity'));
+  expect(acceptCalls).toEqual([{ command: 'accept_host_identity', args: { challengeId: 'challenge-auto' } }]);
+  await expect(card).toHaveCount(0);
+  await expect(page.locator('.terminal-overlay')).toHaveCount(0);
+  await expect(page.getByText('syslog')).toBeVisible();
+  await expect(page.locator('.terminal-view')).toHaveAttribute('data-interactive', 'true');
+  expect(await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { pendingIdentityWaits: () => number };
+  }).__TAURI_TEST__.pendingIdentityWaits())).toBe(0);
+  const results = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { identityWaiterResults: () => Array<{ command: string; code: string | null }> };
+  }).__TAURI_TEST__.identityWaiterResults());
+  expect(results).toEqual([
+    { command: 'sftp_list_dir', code: null },
+    { command: 'start_monitoring', code: null },
+  ]);
+});
+
+test('拒绝未知主机身份：三 capability 以 HostKeyRejected 失败并关闭整个 Session', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableHostIdentity: () => void };
+  }).__TAURI_TEST__.enableHostIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(page.getByTestId('host-identity-card')).toBeVisible();
+
+  await page.getByTestId('host-identity-reject').click();
+  const rejectCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'reject_host_identity'));
+  expect(rejectCalls).toEqual([{ command: 'reject_host_identity', args: { challengeId: 'challenge-auto' } }]);
+
+  // 同一决定：全部等待者以 HostKeyRejected 失败，不进入认证；Session 整体关闭
+  await expect(page.locator('.empty-state')).toBeVisible();
+  const results = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { identityWaiterResults: () => Array<{ command: string; code: string | null }> };
+  }).__TAURI_TEST__.identityWaiterResults());
+  expect(results).toEqual([
+    { command: 'sftp_list_dir', code: 'HostKeyRejected' },
+    { command: 'start_monitoring', code: 'HostKeyRejected' },
+  ]);
+  await expect(page.getByTestId('host-identity-card')).toHaveCount(0);
+  await expect(page.getByRole('tab', { name: /root@10.0.0.8/ })).toHaveCount(0);
+  // 后端在拒绝命令内完成 teardown，前端不得重复 close_session（无冗余 invoke）
+  const closeCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'close_session'));
+  expect(closeCalls).toHaveLength(0);
+});
+
+test('等待确认期间关闭标签取消验证：不发起认证并取消全部等待者', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { enableHostIdentity: () => void };
+  }).__TAURI_TEST__.enableHostIdentity());
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await expect(page.getByTestId('host-identity-card')).toBeVisible();
+
+  // 关闭标签：不发起任何接受/拒绝决定，等待者全部取消，Session 关闭
+  await page.locator('.tab .close-btn').click();
+  await expect(page.locator('.empty-state')).toBeVisible();
+  const decisions = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'accept_host_identity' || call.command === 'reject_host_identity'));
+  expect(decisions).toHaveLength(0);
+  const results = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { identityWaiterResults: () => Array<{ command: string; code: string | null }> };
+  }).__TAURI_TEST__.identityWaiterResults());
+  expect(results).toEqual([
+    { command: 'sftp_list_dir', code: 'HostKeyVerificationCancelled' },
+    { command: 'start_monitoring', code: 'HostKeyVerificationCancelled' },
+  ]);
+  const closeCalls = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'close_session'));
+  expect(closeCalls).toEqual([{ command: 'close_session', args: { sessionId: 'session-1' } }]);
 });

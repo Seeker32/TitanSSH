@@ -150,6 +150,7 @@ export default function XtermView({ sessionId, active, interactive, onInput, onR
   }
 
   return <div ref={containerRef} className="terminal-view" hidden={!active}
+    data-interactive={interactive}
     style={{ background: terminalThemes[terminalTheme].background }}>
     <div className="custom-scrollbar"><div ref={thumbRef} className="custom-scrollbar__thumb" onMouseDown={startThumbDrag} /></div>
   </div>;

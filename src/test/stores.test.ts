@@ -343,7 +343,7 @@ describe('Zustand stores', () => {
     cleanup();
   });
 
-  it('拒绝主机身份调用后端拒绝与关闭，并清理会话与 SFTP/监控投影', async () => {
+  it('拒绝主机身份调用后端拒绝，后端已 teardown 不重复 close_session，并清理会话与 SFTP/监控投影', async () => {
     const challenge = {
       challengeId: 'challenge-2', sessionId: 'session-1', host: '10.0.0.8', port: 22,
       keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
@@ -353,21 +353,67 @@ describe('Zustand stores', () => {
       activeView: 'session-1',
       hostKeyChallenges: new Map([['session-1', challenge]]),
     });
-    // 后端拒绝命令已 teardown，close_session 可能报 SessionNotFound
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === 'reject_host_identity') return undefined;
-      throw new Error('SessionNotFound');
-    });
+    mockInvoke.mockResolvedValue(undefined);
 
     await useSessionStore.getState().rejectHostIdentity('session-1');
 
     expect(mockInvoke).toHaveBeenCalledWith('reject_host_identity', { challengeId: 'challenge-2' });
-    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    // 后端在拒绝命令内完成 teardown，前端不得重复 close_session（性能规则：无冗余 invoke）
+    expect(mockInvoke).not.toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
     expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
     expect(useSessionStore.getState().activeView).toBeNull();
     expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
+  });
+
+  it('接受主机身份时 challenge 已不存在（重复操作）仅撤下过期确认卡，不抛错', async () => {
+    const challenge = {
+      challengeId: 'challenge-gone', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-gone' });
+
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(true);
+  });
+
+  it('接受主机身份其他错误保留确认卡，避免掩盖未决决定', async () => {
+    const challenge = {
+      challengeId: 'challenge-err', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({ hostKeyChallenges: new Map([['session-1', challenge]]) });
+    mockInvoke.mockRejectedValue({ code: 'SshProtocolError', detail: 'boom' });
+
+    await useSessionStore.getState().acceptHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(true);
+  });
+
+  it('拒绝主机身份时 challenge 已不存在仅撤下确认卡，不误杀仍存活的会话投影', async () => {
+    const challenge = {
+      challengeId: 'challenge-gone', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
+    };
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      activeView: 'session-1',
+      hostKeyChallenges: new Map([['session-1', challenge]]),
+    });
+    mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-gone' });
+
+    await useSessionStore.getState().rejectHostIdentity('session-1');
+
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(true);
+    expect(useSessionStore.getState().activeView).toBe('session-1');
   });
 
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {

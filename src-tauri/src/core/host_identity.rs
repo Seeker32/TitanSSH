@@ -85,6 +85,21 @@ struct IdentityState {
     pending: HashMap<String, Arc<ChallengeWait>>,
     /// 并发合并索引：同一 Session、endpoint 与指纹共用一个 challenge
     pending_index: HashMap<IdentityKey, String>,
+    /// 已关闭（或应用退出）的 Session：迟到到达的校验器立即失败，
+    /// 不再创建无人取消的 pending challenge（等待者不得永久阻塞）
+    cancelled: HashSet<String>,
+}
+
+impl IdentityKey {
+    /// 从 challenge 派生复合键（Session + endpoint + 指纹），accept/取消路径复用。
+    fn from_challenge(challenge: &HostIdentityChallenge) -> Self {
+        Self {
+            session_id: challenge.session_id.clone(),
+            host: challenge.host.clone(),
+            port: challenge.port,
+            fingerprint: challenge.fingerprint.clone(),
+        }
+    }
 }
 
 /// 主机身份确认服务：临时信任、pending challenge 与等待者的后端权威。
@@ -100,12 +115,14 @@ impl Default for HostIdentityService {
 }
 
 impl HostIdentityService {
+    /// 构建空状态的主机身份确认服务。
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(IdentityState {
                 trusted: HashSet::new(),
                 pending: HashMap::new(),
                 pending_index: HashMap::new(),
+                cancelled: HashSet::new(),
             })),
         }
     }
@@ -135,6 +152,13 @@ impl HostIdentityService {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // 会话已关闭：迟到校验器（如已发放给 Monitoring worker）立即失败，
+            // 不再创建无人取消的 challenge
+            if state.cancelled.contains(session_id) {
+                return Err(AppError::HostKeyVerificationCancelled(
+                    session_id.to_string(),
+                ));
+            }
             if state.trusted.contains(&key) {
                 return Ok(());
             }
@@ -209,19 +233,23 @@ impl HostIdentityService {
     }
 
     /// 仅本次接受：为该 Runtime Session 记录临时信任并唤醒全部等待者。
+    /// pending 移除与信任写入在同一锁内完成：并发连接要么看到信任直接放行，
+    /// 要么看到同一 challenge 继续等待，不存在"接受后重复确认"的窗口。
     pub fn accept(&self, challenge_id: &str) -> Result<(), AppError> {
-        let wait = self.remove_pending(challenge_id)?;
-        let key = IdentityKey {
-            session_id: wait.challenge.session_id.clone(),
-            host: wait.challenge.host.clone(),
-            port: wait.challenge.port,
-            fingerprint: wait.challenge.fingerprint.clone(),
+        let wait = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let wait = state
+                .pending
+                .remove(challenge_id)
+                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
+            let key = IdentityKey::from_challenge(&wait.challenge);
+            state.pending_index.remove(&key);
+            state.trusted.insert(key);
+            wait
         };
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .trusted
-            .insert(key);
         Self::decide(&wait, Decision::Accepted);
         Ok(())
     }
@@ -243,6 +271,7 @@ impl HostIdentityService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.trusted.retain(|key| key.session_id != session_id);
+            state.cancelled.insert(session_id.to_string());
             let targets: Vec<Arc<ChallengeWait>> = state
                 .pending
                 .iter()
@@ -251,13 +280,9 @@ impl HostIdentityService {
                 .collect();
             for wait in &targets {
                 state.pending.remove(&wait.challenge.challenge_id);
-                let key = IdentityKey {
-                    session_id: wait.challenge.session_id.clone(),
-                    host: wait.challenge.host.clone(),
-                    port: wait.challenge.port,
-                    fingerprint: wait.challenge.fingerprint.clone(),
-                };
-                state.pending_index.remove(&key);
+                state
+                    .pending_index
+                    .remove(&IdentityKey::from_challenge(&wait.challenge));
             }
             targets
         };
@@ -291,13 +316,9 @@ impl HostIdentityService {
                 .pending
                 .remove(challenge_id)
                 .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
-            let key = IdentityKey {
-                session_id: wait.challenge.session_id.clone(),
-                host: wait.challenge.host.clone(),
-                port: wait.challenge.port,
-                fingerprint: wait.challenge.fingerprint.clone(),
-            };
-            state.pending_index.remove(&key);
+            state
+                .pending_index
+                .remove(&IdentityKey::from_challenge(&wait.challenge));
             wait
         };
         Ok(wait)
@@ -343,6 +364,27 @@ impl HostIdentityService {
             .get(challenge_id)
             .map(|wait| wait.waiting.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// 判断指定 Session 的 endpoint+指纹是否已写入临时信任（测试观察清除行为）。
+    #[cfg(test)]
+    pub(crate) fn is_trusted(
+        &self,
+        session_id: &str,
+        host: &str,
+        port: u16,
+        fingerprint: &str,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trusted
+            .contains(&IdentityKey {
+                session_id: session_id.to_string(),
+                host: host.to_string(),
+                port,
+                fingerprint: fingerprint.to_string(),
+            })
     }
 }
 
@@ -550,9 +592,80 @@ mod tests {
         assert_eq!(error.code(), "HostKeyVerificationCancelled");
         assert!(service.pending_challenge("session-1").is_none());
 
-        // 清除临时信任：预先接受再取消后，新连接不再放行
-        let challenge = service.pending_challenge("session-1");
-        assert!(challenge.is_none());
+        // 清除临时信任：另一 Session 先接受后取消，信任必须被移除（直接观察状态，
+        // 因为取消后的 Session 校验器按设计直接失败，不会再产生 challenge）
+        let verifier_b = service.verifier(app.handle().clone(), "session-2".to_string());
+        let v = verifier_b.clone();
+        let p = presented.clone();
+        let waiter = thread::spawn(move || v(&p));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.pending_challenge("session-2").is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let challenge = service
+            .pending_challenge("session-2")
+            .expect("session-2 产生 challenge");
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("接受后放行");
+        assert!(
+            service.is_trusted("session-2", "10.0.0.8", 22, "SHA256:cancel"),
+            "接受后写入临时信任"
+        );
+        service.cancel_session("session-2");
+        assert!(
+            !service.is_trusted("session-2", "10.0.0.8", 22, "SHA256:cancel"),
+            "Session 关闭必须清除临时信任"
+        );
+    }
+
+    /// 关闭后的 Session 上迟到到达的校验器（如已发放给 Monitoring worker）不得再
+    /// 创建无人取消的 challenge：verify 立即以取消错误返回，等待者不会永久阻塞。
+    #[test]
+    fn cancelled_session_verifier_fails_fast_without_new_challenge() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        let verifier = service.verifier(app.handle().clone(), "session-gone".to_string());
+
+        service.cancel_session("session-gone");
+        let error = verifier(&make_presented("SHA256:late")).unwrap_err();
+        assert_eq!(error.code(), "HostKeyVerificationCancelled");
+        assert!(
+            service.pending_challenge("session-gone").is_none(),
+            "取消后的 Session 不得产生新的 pending challenge"
+        );
+    }
+
+    /// 应用退出路径：cancel_all 唤醒全部 Session 的全部等待者，pending 清空。
+    #[test]
+    fn cancel_all_wakes_all_waiters() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+
+        let waiters: Vec<_> = [("session-a", &verifier_a), ("session-b", &verifier_b)]
+            .iter()
+            .map(|(session_id, verifier)| {
+                let v = (*verifier).clone();
+                let p = make_presented(&format!("SHA256:exit-{session_id}"));
+                thread::spawn(move || v(&p))
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (service.pending_challenge("session-a").is_none()
+            || service.pending_challenge("session-b").is_none())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        service.cancel_all();
+        for waiter in waiters {
+            let error = waiter.join().unwrap().unwrap_err();
+            assert_eq!(error.code(), "HostKeyVerificationCancelled");
+        }
+        assert!(service.pending_challenge("session-a").is_none());
+        assert!(service.pending_challenge("session-b").is_none());
     }
 
     /// accept/reject 不存在的 challenge 返回稳定错误。

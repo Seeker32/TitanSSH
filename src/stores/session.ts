@@ -4,7 +4,7 @@ import { create } from 'zustand';
 import type { HostIdentityChallenge, SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
-import { formatAppError, translate } from '@/i18n';
+import { formatAppError, toAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { useMonitorStore } from './monitor';
 import { useSftpStore } from './sftp';
@@ -164,11 +164,17 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }));
     },
 
-    /** 仅本次接受未知主机身份：接受该 Runtime Session 的 Terminal、SFTP、Monitoring 及重连。 */
+    /** 仅本次接受未知主机身份：接受该 Runtime Session 的 Terminal、SFTP、Monitoring 及重连。
+     *  challenge 已不存在（重复操作/并发解决）时仅撤下过期确认卡，不误杀会话投影。 */
     async acceptHostIdentity(sessionId) {
       const challenge = get().hostKeyChallenges.get(sessionId);
       if (!challenge) return;
-      await invoke('accept_host_identity', { challengeId: challenge.challengeId });
+      try {
+        await invoke('accept_host_identity', { challengeId: challenge.challengeId });
+      } catch (error) {
+        // 后端权威：challenge 已解决时确认卡投影已过期；其他错误保留确认卡，避免掩盖未决决定
+        if (toAppError(error).code !== 'HostKeyChallengeNotFound') return;
+      }
       set((state) => {
         const hostKeyChallenges = new Map(state.hostKeyChallenges);
         hostKeyChallenges.delete(sessionId);
@@ -176,22 +182,23 @@ export const useSessionStore = create<SessionState>((set, get) => {
       });
     },
 
-    /** 拒绝未知主机身份并关闭整个 Session：Terminal、SFTP 与 Monitoring 服从同一决定。 */
+    /** 拒绝未知主机身份并关闭整个 Session：Terminal、SFTP 与 Monitoring 服从同一决定。
+     *  后端在拒绝命令内完成 teardown，前端只清理本地投影，不重复 close_session。
+     *  challenge 已不存在时仅撤下过期确认卡，不误杀仍存活的会话投影。 */
     async rejectHostIdentity(sessionId) {
       const challenge = get().hostKeyChallenges.get(sessionId);
       if (!challenge) return;
-      await invoke('reject_host_identity', { challengeId: challenge.challengeId });
-      set((state) => {
-        const hostKeyChallenges = new Map(state.hostKeyChallenges);
-        hostKeyChallenges.delete(sessionId);
-        return { hostKeyChallenges };
-      });
-      // 后端已在拒绝时执行 teardown；close_session 可能因会话已移除而报 SessionNotFound，
-      // 失败时仍清理本地投影，保证标签关闭
       try {
-        await invoke('close_session', { sessionId });
-      } catch {
-        // 会话已由后端关闭
+        await invoke('reject_host_identity', { challengeId: challenge.challengeId });
+      } catch (error) {
+        if (toAppError(error).code !== 'HostKeyChallengeNotFound') return;
+        // 决定已生效（重复操作/并发）：仅撤下确认卡，会话可能仍存活
+        set((state) => {
+          const hostKeyChallenges = new Map(state.hostKeyChallenges);
+          hostKeyChallenges.delete(sessionId);
+          return { hostKeyChallenges };
+        });
+        return;
       }
       get().removeSessionProjection(sessionId);
     },

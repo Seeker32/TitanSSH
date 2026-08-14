@@ -196,6 +196,8 @@ describe('HomePage integration', () => {
     expect(card).toHaveTextContent('10.0.0.8:22');
     expect(card).toHaveTextContent('ssh-ed25519');
     expect(card).toHaveTextContent('SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD');
+    // 等待确认期间 Session 保持 Connecting，并在确认卡内展示主机身份验证阶段
+    expect(card).toHaveTextContent('正在验证主机身份...');
     expect(screen.queryByRole('status')).toBeNull();
 
     mockInvoke.mockClear();
@@ -212,14 +214,11 @@ describe('HomePage integration', () => {
       });
     });
     mockInvoke.mockClear();
-    // 后端拒绝时已 teardown，close_session 可能报错（会话已移除）
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === 'reject_host_identity') return undefined;
-      throw new Error('SessionNotFound');
-    });
+    mockInvoke.mockResolvedValue(undefined);
     await user.click(screen.getByRole('button', { name: '拒绝' }));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('reject_host_identity', { challengeId: 'challenge-2' }));
-    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    // 后端在拒绝命令内 teardown，前端不得重复 close_session
+    expect(mockInvoke).not.toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     await waitFor(() => expect(useSessionStore.getState().sessions.has('session-1')).toBe(false));
     expect(screen.queryByTestId('host-identity-card')).toBeNull();
   });
