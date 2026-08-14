@@ -5,3 +5,4 @@ pub mod session_manager;
 pub mod sftp_service;
 pub mod ssh_transport;
 pub mod terminal_service;
+mod transfer_pool;

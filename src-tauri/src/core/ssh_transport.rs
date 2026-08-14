@@ -114,8 +114,8 @@ impl Write for RemoteFile {
     }
 }
 
-/// SFTP capability 的 module 内部 adapter seam。
-trait SftpOps: Send {
+/// SFTP capability 的 module 内部 adapter seam；仅 crate 内可见。
+pub(crate) trait SftpOps: Send {
     /// 读取远端目录。
     fn list_dir(&mut self, path: &str) -> Result<Vec<SftpEntry>, AppError>;
     /// 查询远端文件大小。
@@ -479,8 +479,8 @@ fn build_connect_error(
 pub(crate) mod test_support {
     use super::{ExecOps, ExecTransport, RemoteFile, SftpEntry, SftpOps, SftpTransport};
     use crate::errors::app_error::AppError;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
 
     struct EmptySftp;
 
@@ -738,6 +738,153 @@ pub(crate) mod test_support {
         }
     }
 
+    /// 上传写入放行门：阻塞的测试传输在此等待，测试显式放行控制完成时序。
+    pub(crate) struct Gate {
+        released: Mutex<bool>,
+        cond: Condvar,
+    }
+
+    impl Gate {
+        /// 创建未放行的门。
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                released: Mutex::new(false),
+                cond: Condvar::new(),
+            })
+        }
+
+        /// 放行所有在该门后等待的传输；放行后新写入立即成功。
+        pub(crate) fn open(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            self.cond.notify_all();
+        }
+    }
+
+    /// 上传写入在放行门后阻塞的传输 adapter；每个 transport 持有独立门，
+    /// 供“五路并发/第六个等待”contract 测试控制每个传输的完成时序。
+    pub(crate) struct GatedCreateSftp {
+        pub(crate) released: Arc<Gate>,
+    }
+
+    /// 首次写入等待放行、放行后写入立即成功的远端写句柄。
+    struct GatedWriteFile {
+        released: Arc<Gate>,
+    }
+
+    impl std::io::Read for GatedWriteFile {
+        /// 本句柄不产生输入。
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl std::io::Write for GatedWriteFile {
+        /// 首次写入等待放行；放行后直接成功。
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let mut released = self
+                .released
+                .released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = self
+                    .released
+                    .cond
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            Ok(buffer.len())
+        }
+
+        /// 本句柄不刷新。
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SftpOps for GatedCreateSftp {
+        /// 返回空目录。
+        fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            Ok(Vec::new())
+        }
+
+        /// 本 adapter 不查询文件大小。
+        fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
+            Ok(0)
+        }
+
+        /// 本 adapter 不打开远端读文件。
+        fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Err(AppError::SftpTransferError("unused".to_string()))
+        }
+
+        /// 返回在放行门后阻塞写入的远端写句柄。
+        fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
+            Ok(RemoteFile {
+                inner: Box::new(GatedWriteFile {
+                    released: self.released.clone(),
+                }),
+            })
+        }
+
+        /// 本 adapter 无需删除远端文件。
+        fn unlink(&mut self, _path: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 包装 adapter 的存活计数守卫：构造时计数加一、释放时减一，
+    /// 供连接池回收测试观察 capability 的真实释放时机。
+    struct LiveCountSftp<T: SftpOps> {
+        inner: T,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl<T: SftpOps> LiveCountSftp<T> {
+        /// 构造守卫并登记存活计数。
+        fn counted(inner: T, live: Arc<AtomicUsize>) -> Self {
+            live.fetch_add(1, Ordering::SeqCst);
+            Self { inner, live }
+        }
+    }
+
+    impl<T: SftpOps> Drop for LiveCountSftp<T> {
+        /// 通知测试该 transport 已被释放。
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl<T: SftpOps> SftpOps for LiveCountSftp<T> {
+        /// 委托给内部 adapter。
+        fn list_dir(&mut self, path: &str) -> Result<Vec<SftpEntry>, AppError> {
+            self.inner.list_dir(path)
+        }
+
+        /// 委托给内部 adapter。
+        fn file_size(&mut self, path: &str) -> Result<u64, AppError> {
+            self.inner.file_size(path)
+        }
+
+        /// 委托给内部 adapter。
+        fn open_read(&mut self, path: &str) -> Result<RemoteFile, AppError> {
+            self.inner.open_read(path)
+        }
+
+        /// 委托给内部 adapter。
+        fn create(&mut self, path: &str) -> Result<RemoteFile, AppError> {
+            self.inner.create(path)
+        }
+
+        /// 委托给内部 adapter。
+        fn unlink(&mut self, path: &str) -> Result<(), AppError> {
+            self.inner.unlink(path)
+        }
+    }
+
     /// 首读即失败的远端读句柄，供运行时读取失败测试。
     struct FailingReadFile;
 
@@ -972,6 +1119,19 @@ pub(crate) mod test_support {
     /// 创建支持内存读写（丢弃写入内容）的 SFTP 测试 capability，供 worker 全链路测试。
     pub(crate) fn memory_sftp(content: Vec<u8>) -> SftpTransport {
         SftpTransport::from_backend(MemorySftp { content })
+    }
+
+    /// 创建上传写入在放行门后阻塞的 SFTP 传输测试 capability。
+    pub(crate) fn gated_create_sftp(released: Arc<Gate>) -> SftpTransport {
+        SftpTransport::from_backend(GatedCreateSftp { released })
+    }
+
+    /// 包装内部 adapter 的存活计数测试 capability；构造时计数加一，释放时减一。
+    pub(crate) fn counted_sftp(
+        inner: impl SftpOps + 'static,
+        live: Arc<AtomicUsize>,
+    ) -> SftpTransport {
+        SftpTransport::from_backend(LiveCountSftp::counted(inner, live))
     }
 }
 
