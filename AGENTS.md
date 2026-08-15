@@ -58,3 +58,7 @@ Issues live in GitHub Issues (via the `gh` CLI). See `docs/agents/issue-tracker.
 ### Domain docs
 
 Single-context — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Releases
+
+Tag-driven GitHub Actions releases. See `docs/agents/release.md`.
