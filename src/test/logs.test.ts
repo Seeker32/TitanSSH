@@ -26,24 +26,63 @@ describe('logs store', () => {
     expect(useLogsStore.getState().lines).toEqual(['old-line']);
   });
 
-  it('load 对非数组响应回退为空列表（IPC 边界防御）', async () => {
+  it('load 对非数组 payload 视为读取失败：保留旧行并写入错误', async () => {
+    useLogsStore.setState({ lines: ['old-line'] });
     mockInvoke.mockResolvedValue(undefined);
     await useLogsStore.getState().load();
-    expect(useLogsStore.getState().lines).toEqual([]);
-    expect(useLogsStore.getState().loadError).toBeNull();
+    expect(useLogsStore.getState().lines).toEqual(['old-line']);
+    expect(useLogsStore.getState().loadError).toEqual({
+      code: 'Unknown',
+      detail: 'Invalid log payload (get_recent_logs)',
+    });
   });
 
-  it('export 以所选路径调用后端并清除导出错误', async () => {
+  it('exportLogs 调用后端导出并清除导出错误', async () => {
     useLogsStore.setState({ exportError: { code: 'IoError', detail: 'stale' } });
     mockInvoke.mockResolvedValue(undefined);
-    await useLogsStore.getState().export('/tmp/titanssh.log');
-    expect(mockInvoke).toHaveBeenCalledWith('export_logs', { path: '/tmp/titanssh.log' });
+    await useLogsStore.getState().exportLogs();
+    expect(mockInvoke).toHaveBeenCalledWith('export_logs');
     expect(useLogsStore.getState().exportError).toBeNull();
   });
 
-  it('export 失败写入结构化错误', async () => {
+  it('exportLogs 失败写入结构化错误', async () => {
     mockInvoke.mockRejectedValue({ code: 'IoError', detail: 'copy failed' });
-    await useLogsStore.getState().export('/tmp/titanssh.log');
+    await useLogsStore.getState().exportLogs();
     expect(useLogsStore.getState().exportError).toEqual({ code: 'IoError', detail: 'copy failed' });
+  });
+
+  it('慢请求晚到不覆盖新响应（latest-wins）', async () => {
+    let resolveSlow!: (value: unknown) => void;
+    let resolveFast!: (value: unknown) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSlow = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFast = resolve; }));
+    const slow = useLogsStore.getState().load();
+    const fast = useLogsStore.getState().load();
+    // 后发起的请求先返回
+    resolveFast(['fresh-line']);
+    await fast;
+    expect(useLogsStore.getState().lines).toEqual(['fresh-line']);
+    // 先发起的慢请求后返回：不得覆盖新数据
+    resolveSlow(['stale-line']);
+    await slow;
+    expect(useLogsStore.getState().lines).toEqual(['fresh-line']);
+    expect(useLogsStore.getState().loadError).toBeNull();
+  });
+
+  it('慢请求晚到的失败同样不覆盖新状态', async () => {
+    let rejectSlow!: (error: unknown) => void;
+    let resolveFast!: (value: unknown) => void;
+    mockInvoke
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectSlow = reject; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFast = resolve; }));
+    const slow = useLogsStore.getState().load();
+    const fast = useLogsStore.getState().load();
+    resolveFast(['fresh-line']);
+    await fast;
+    rejectSlow({ code: 'IoError', detail: 'stale fail' });
+    await slow;
+    expect(useLogsStore.getState().lines).toEqual(['fresh-line']);
+    expect(useLogsStore.getState().loadError).toBeNull();
   });
 });

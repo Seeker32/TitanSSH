@@ -2,11 +2,12 @@
 mod tests {
     use crate::core::logging::{
         LOG_FILE_NAME, LOG_MAX_BYTES, LOG_VIEW_MAX_LINES, LogStore, ensure_log_file, format_entry,
-        install_logger,
+        install_logger, logger_install_recorded,
     };
     use log::Level;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     /// 格式化输出固定单行：时间戳 + 等级 + 目标 + 消息。
@@ -59,6 +60,19 @@ mod tests {
             .read_recent()
             .unwrap();
         assert!(lines.is_empty());
+    }
+
+    /// seek 尾读：首行超过尾读窗口时整行被丢弃，只返回窗口内的完整行。
+    /// （全文件读取会把超长首行也返回，本测试守护 seek 实现。）
+    #[test]
+    fn read_recent_seeks_tail_and_skips_partial_first_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let giant = "x".repeat(200_000);
+        fs::write(&path, format!("{giant}\ntail-1\ntail-2\ntail-3\n")).unwrap();
+
+        let lines = LogStore::from_file_path(path).read_recent().unwrap();
+        assert_eq!(lines, vec!["tail-1", "tail-2", "tail-3"]);
     }
 
     /// 导出复制内容并可覆盖已存在的目标文件。
@@ -117,13 +131,61 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// 重复安装不 panic（第二次 set_logger 被忽略）；路径缺失时退化为仅 stderr。
+    /// 外部日志器占位：首次安装失败必须被记录（触发 stderr 降级诊断），
+    /// 重复安装保持静默（幂等语义，不重复报错）。
     #[test]
-    fn install_logger_is_idempotent_and_falls_back_to_stderr_only() {
+    fn install_logger_foreign_occupation_is_recorded_and_reinstall_is_silent() {
+        struct ForeignLogger;
+        impl log::Log for ForeignLogger {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                false
+            }
+            fn log(&self, _: &log::Record) {}
+            fn flush(&self) {}
+        }
+        // 模拟插件抢先安装的其他日志器（测试进程内无其他测试占用全局槽位）
+        log::set_boxed_logger(Box::new(ForeignLogger)).expect("日志器槽位应空闲");
+
         let dir = tempdir().unwrap();
         let path = dir.path().join(LOG_FILE_NAME);
-        install_logger(Some(&path));
-        install_logger(Some(&path));
+        install_logger(Some(&path)); // 首次安装失败：记录并留 stderr 诊断
+        assert!(
+            logger_install_recorded(),
+            "首次安装失败必须被记录，否则降级诊断不会输出"
+        );
+        install_logger(Some(&path)); // 已记录：静默，不 panic
         install_logger(None);
+    }
+
+    /// 直接构造 Logger 验证文件落盘与 flush（不依赖全局日志器槽位，
+    /// 避免与其他测试竞争全局 log facade 状态）。
+    #[test]
+    fn logger_writes_records_to_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let file = ensure_log_file(&path).unwrap();
+        let logger = crate::core::logging::Logger {
+            stderr_logger: env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Trace)
+                .build(),
+            file: Some(Mutex::new(file)),
+        };
+        let metadata = log::MetadataBuilder::new()
+            .level(Level::Info)
+            .target("core::logging")
+            .build();
+        let record = log::Record::builder()
+            .metadata(metadata)
+            .args(format_args!("连接已建立"))
+            .build();
+        log::Log::log(&logger, &record);
+        log::Log::flush(&logger);
+        drop(logger);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("[INFO] core::logging: 连接已建立"),
+            "日志应写入文件，实际内容: {content}"
+        );
     }
 }
