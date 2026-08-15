@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.4] - 2026-08-15
+
+### Features
+
+- Added host identity verification flow with saved and reused endpoint trust records.
+- Added host identity change detection and cross-session trust decision handling.
+- Added read-only trusted hosts list with full-chain acceptance.
+- Added automatic trust record cleanup tied to the HostConfig lifecycle.
+- Added Linux keyring fallback for secure storage.
+- Added per-tab terminal connection lifecycle presentation.
+- Added SFTP five-channel transfer pool per session.
+- Added SFTP separated control and transfer connections to keep directory browsing responsive during transfers.
+- Added cross-session fair transfer scheduling and safe uploads with target directory auto-refresh.
+- Added download overwrite protection with per-file confirmation.
+- Added structured transfer errors displayed in the file browser and task rows.
+- Added file context menu in FileExplorer.
+- Added English and Chinese translations for application settings and UI elements.
+
+### Changed
+
+- Improved drag-and-drop handling to prevent text selection during sidebar and SFTP panel resizing.
+- Updated GitHub Actions to use latest versions of checkout, pnpm, and setup-node.
+
+### Fixed
+
+- Fixed missing metrics being treated as unknown and removed CPU guest double-counting.
+- Bundled monitor loop parameters into a struct and fixed clippy warnings.
+
 ## [0.1.3] - 2026-08-10
 
 ### Added
