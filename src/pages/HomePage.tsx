@@ -10,6 +10,7 @@ import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
 import TrustedHostsSection from '@/components/settings/TrustedHostsSection';
+import LogViewer from '@/components/settings/LogViewer';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
@@ -275,7 +276,9 @@ function FooterActions({ theme }: { theme: string }) {
       <button type="button" className="sidebar-footer-btn" aria-label={translate(locale, 'settings.title')} title={translate(locale, 'settings.title')} onClick={() => setSettingsOpen(true)}>
         <Settings size={14} />
       </button>
-      <Modal open={settingsOpen} title={translate(locale, 'settings.title')} footer={null} width={680} onCancel={() => setSettingsOpen(false)}>
+      {/* destroyOnHidden：关闭后卸载子节点，日志查看器随之卸载并停止 2 秒轮询
+          （antd v6 Modal 子节点被 memo 包装，open 变化不会触发子节点重渲染，条件渲染无效） */}
+      <Modal open={settingsOpen} destroyOnHidden title={translate(locale, 'settings.title')} footer={null} width={680} onCancel={() => setSettingsOpen(false)}>
         <div className="settings-layout">
           <nav className="settings-nav" aria-label={translate(locale, 'settings.title')}>
             {(['general', 'terminal', 'trustedHosts', 'logging'] as const).map((section) => <button key={section} type="button" data-testid={`settings-section-${section}`}
@@ -306,11 +309,14 @@ function FooterActions({ theme }: { theme: string }) {
               </div>
             </>}
             {settingsSection === 'trustedHosts' && <TrustedHostsSection onRetry={() => void useTrustedHostsStore.getState().load()} />}
-            {settingsSection === 'logging' && <label className="settings-field">{translate(locale, 'settings.logLevel')}
-              <select value={logLevel} onChange={(event) => setLogLevel(event.target.value as LogLevel)}>
-                {LOG_LEVELS.map((level) => <option key={level} value={level}>{translate(locale, `settings.logLevel.${level}` as Parameters<typeof translate>[1])}</option>)}
-              </select>
-            </label>}
+            {settingsSection === 'logging' && <>
+              <label className="settings-field">{translate(locale, 'settings.logLevel')}
+                <select value={logLevel} onChange={(event) => setLogLevel(event.target.value as LogLevel)}>
+                  {LOG_LEVELS.map((level) => <option key={level} value={level}>{translate(locale, `settings.logLevel.${level}` as Parameters<typeof translate>[1])}</option>)}
+                </select>
+              </label>
+              <LogViewer />
+            </>}
           </section>
         </div>
       </Modal>

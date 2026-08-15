@@ -11,6 +11,7 @@ import { useMonitorStore } from '@/stores/monitor';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useLogLevelStore } from '@/stores/log-level';
+import { useLogsStore } from '@/stores/logs';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
@@ -27,6 +28,7 @@ function resetStores() {
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
   useLogLevelStore.setState(useLogLevelStore.getInitialState(), true);
+  useLogsStore.setState(useLogsStore.getInitialState(), true);
   useTerminalThemeStore.setState(useTerminalThemeStore.getInitialState(), true);
 }
 
@@ -433,6 +435,41 @@ describe('HomePage integration', () => {
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('set_log_level', { level: 'debug' }));
     expect(useLogLevelStore.getState().logLevel).toBe('debug');
     expect(localStorage.getItem('log-level')).toBe('debug');
+  });
+
+  it('设置 → 日志分区内嵌查看器并加载最近日志', async () => {
+    const user = userEvent.setup();
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'list_hosts') return [makeHost()];
+      if (command === 'get_recent_logs') return ['2025-06-01 14:30:00.123 [INFO] core::session: 会话已打开'];
+      return undefined;
+    });
+    render(<HomePage />);
+    await user.click(await screen.findByRole('button', { name: '设置' }));
+    const dialog = screen.getByRole('dialog', { name: '设置' });
+    await user.click(within(dialog).getByTestId('settings-section-logging'));
+    expect(await within(dialog).findByTestId('log-viewer-lines')).toHaveTextContent('会话已打开');
+  });
+
+  it('关闭设置弹窗后停止日志轮询（Modal 子节点保持挂载时不后台 invoke）', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<HomePage />);
+      // 同步打开设置 → 日志分区（fireEvent 不依赖定时器，避免 userEvent 与假定时器死锁）
+      fireEvent.click(screen.getByRole('button', { name: '设置' }));
+      const dialog = screen.getByRole('dialog', { name: '设置' });
+      fireEvent.click(within(dialog).getByTestId('settings-section-logging'));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      const logCalls = () => mockInvoke.mock.calls.filter(([command]) => command === 'get_recent_logs').length;
+      expect(logCalls()).toBe(1);
+      // 关闭弹窗：antd Modal 不卸载子节点，但查看器必须随 settingsOpen 卸载停止轮询
+      fireEvent.click(document.querySelector('.ant-modal-close') as HTMLElement);
+      expect(logCalls()).toBe(1);
+      await act(async () => { vi.advanceTimersByTime(4000); });
+      expect(logCalls()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('侧栏拖拽区同时承载尺寸调整光标与拖动事件', async () => {

@@ -243,6 +243,7 @@ test.beforeEach(async ({ page }) => {
         if (command === 'sftp_upload') return { ...transfer, taskId: 'transfer-2', transferType: 'Upload', fileName: 'upload.txt' };
         if (command === 'sftp_task_snapshot') return snapshotTasks;
         if (command === 'sftp_clear_terminal_tasks') return undefined;
+        if (command === 'get_recent_logs') return ['2025-06-01 14:30:00.123 [INFO] core::session: session ready'];
         return undefined;
       },
     };
@@ -1104,4 +1105,15 @@ test('自动清理：重复引用保留记录，最后一个 HostConfig 引用�
   await page.getByTestId('settings-section-trustedHosts').click();
   await expect(page.getByTestId('trusted-hosts-empty')).toBeVisible();
   await expect(page.getByTestId('trusted-host-row-10.0.0.8-22')).toHaveCount(0);
+});
+
+test('设置日志分区：内嵌查看器展示后端日志且刷新可用', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: '设置' }).click();
+  await page.getByTestId('settings-section-logging').click();
+  await expect(page.getByTestId('log-viewer')).toBeVisible();
+  await expect(page.getByTestId('log-viewer-lines')).toContainText('session ready');
+  // 刷新按钮重新拉取，不报错；导出打开原生对话框，e2e 不驱动
+  await page.getByTestId('log-refresh-btn').click();
+  await expect(page.getByTestId('log-viewer-lines')).toContainText('session ready');
 });

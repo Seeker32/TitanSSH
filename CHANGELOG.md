@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Added backend log file persistence (app log dir, append + 10MB startup truncation) with an in-app log viewer (2s polling) and export via save dialog in Settings → Logging.
+
 ## [0.1.4] - 2026-08-15
 
 ### Features

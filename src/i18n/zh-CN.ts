@@ -18,6 +18,11 @@ export const zhCN = {
   'settings.logLevel.info': '信息',
   'settings.logLevel.debug': '调试',
   'settings.logLevel.trace': '追踪',
+  'settings.logRefresh': '刷新',
+  'settings.logExport': '导出日志',
+  'settings.logEmpty': '暂无日志记录。将日志等级设为调试或追踪后复现问题，日志会显示在这里。',
+  'settings.logLoadFailed': '无法读取日志',
+  'settings.logExportFailed': '导出日志失败',
   'settings.selected': '已选择',
 
   // 外观与语言

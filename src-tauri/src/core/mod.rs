@@ -1,5 +1,6 @@
 pub mod host_identity;
 pub mod host_service;
+pub mod logging;
 pub mod monitor_service;
 pub mod monitor_worker;
 pub mod session_manager;

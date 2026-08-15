@@ -20,6 +20,11 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'settings.logLevel.info': 'Info',
   'settings.logLevel.debug': 'Debug',
   'settings.logLevel.trace': 'Trace',
+  'settings.logRefresh': 'Refresh',
+  'settings.logExport': 'Export logs',
+  'settings.logEmpty': 'No log entries yet. Set the log level to Debug or Trace and reproduce the issue; entries will appear here.',
+  'settings.logLoadFailed': 'Unable to read logs',
+  'settings.logExportFailed': 'Failed to export logs',
   'settings.selected': 'Selected',
 
   // Appearance and locale
