@@ -35,25 +35,43 @@ pub async fn start_monitoring<R: Runtime>(
 /// 停止指定 task_id 对应的监控任务
 ///
 /// 委托给 monitor_service 设置关闭标志并清理任务句柄。
+/// 任务不存在（从未创建、已停止或已过期）时返回结构化错误
+/// MonitorTaskNotFound，前端可据此区分「已停止」与「早已消失」，
+/// 暴露陈旧/重复的任务状态。
 #[tauri::command]
 pub fn stop_monitoring(
     task_id: String,
     monitor_service: State<'_, MonitorService>,
 ) -> Result<(), AppErrorInfo> {
-    monitor_service.stop_monitoring(&task_id);
-    Ok(())
+    if monitor_service.stop_monitoring(&task_id) {
+        Ok(())
+    } else {
+        Err(AppErrorInfo::from(AppError::MonitorTaskNotFound(
+            task_id.into(),
+        )))
+    }
 }
 
 /// 获取指定会话的最新监控快照
 ///
-/// 从 monitor_service 的快照缓存中读取数据。
-/// 若该会话尚无监控数据，返回错误提示。
+/// 先从 session_manager 做会话存在性权威判定：仅当会话确实不存在时返回
+/// SessionNotFound；会话存在但尚无快照（首轮采集完成前、或监控已停止/失败）
+/// 返回 MonitorSnapshotUnavailable。SessionNotFound 是 close_session 式
+/// teardown 的键，瞬时无数据不得伪装成「会话已消失」触发前端拆除会话状态。
 #[tauri::command]
 pub fn get_monitor_status(
     session_id: String,
+    session_manager: State<'_, SessionManager>,
     monitor_service: State<'_, MonitorService>,
 ) -> Result<MonitorSnapshot, AppErrorInfo> {
+    session_manager
+        .host_config(&session_id)
+        .map_err(AppErrorInfo::from)?;
     monitor_service
         .get_monitor_status(&session_id)
-        .ok_or_else(|| AppErrorInfo::from(AppError::SessionNotFound(session_id.into())))
+        .ok_or_else(|| AppErrorInfo::from(AppError::MonitorSnapshotUnavailable(session_id.into())))
 }
+
+#[cfg(test)]
+#[path = "monitor_test.rs"]
+mod tests;

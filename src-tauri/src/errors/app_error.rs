@@ -149,6 +149,17 @@ pub enum AppError {
     #[error("SFTP 任务不存在: {0}")]
     SftpTaskNotFound(ErrorDetail),
 
+    /// 监控任务不存在（从未创建、已停止或已过期）；stop_monitoring 对
+    /// 注册表 miss 时上报，前端据此区分「已停止」与「早已消失」
+    #[error("监控任务不存在: {0}")]
+    MonitorTaskNotFound(ErrorDetail),
+
+    /// 会话存在但尚无监控快照（首轮采集完成前、或监控已停止/失败）；
+    /// 与 SessionNotFound 严格区分：SessionNotFound 是 close_session 式
+    /// teardown 的键，瞬时无数据不得触发前端拆除会话状态
+    #[error("监控快照尚不可用: {0}")]
+    MonitorSnapshotUnavailable(ErrorDetail),
+
     /// 下载目标已存在且冲突策略为 Reject（前端据此逐文件确认覆盖）
     #[error("SFTP 目标已存在: {0}")]
     SftpTargetExists(ErrorDetail),
@@ -218,6 +229,8 @@ impl AppError {
             Self::SftpWriteError(_) => "SftpWriteError",
             Self::SftpCreateError(_) => "SftpCreateError",
             Self::SftpTaskNotFound(_) => "SftpTaskNotFound",
+            Self::MonitorTaskNotFound(_) => "MonitorTaskNotFound",
+            Self::MonitorSnapshotUnavailable(_) => "MonitorSnapshotUnavailable",
             Self::SftpTargetExists(_) => "SftpTargetExists",
             Self::SftpTargetBusy(_) => "SftpTargetBusy",
             Self::SftpPublishError(_) => "SftpPublishError",
@@ -267,6 +280,10 @@ impl AppError {
             Self::SftpWriteError(p) => Self::SftpWriteError(append(p, extra)),
             Self::SftpCreateError(p) => Self::SftpCreateError(append(p, extra)),
             Self::SftpTaskNotFound(p) => Self::SftpTaskNotFound(append(p, extra)),
+            Self::MonitorTaskNotFound(p) => Self::MonitorTaskNotFound(append(p, extra)),
+            Self::MonitorSnapshotUnavailable(p) => {
+                Self::MonitorSnapshotUnavailable(append(p, extra))
+            }
             Self::SftpTargetExists(p) => Self::SftpTargetExists(append(p, extra)),
             Self::SftpTargetBusy(p) => Self::SftpTargetBusy(append(p, extra)),
             Self::SftpPublishError(p) => Self::SftpPublishError(append(p, extra)),
@@ -309,6 +326,8 @@ impl From<&AppError> for AppErrorInfo {
             | AppError::SftpWriteError(p)
             | AppError::SftpCreateError(p)
             | AppError::SftpTaskNotFound(p)
+            | AppError::MonitorTaskNotFound(p)
+            | AppError::MonitorSnapshotUnavailable(p)
             | AppError::SftpTargetExists(p)
             | AppError::SftpTargetBusy(p)
             | AppError::SftpPublishError(p)

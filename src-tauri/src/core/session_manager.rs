@@ -255,6 +255,31 @@ impl SessionManager {
             .map(|handle| handle.host.clone())
             .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))
     }
+
+    /// 测试构造：直接注册一个会话句柄（绕开真实 SSH 连接），供命令层测试
+    /// 会话存在性判定。
+    #[cfg(test)]
+    pub(crate) fn insert_session_for_test(&self, session_id: &str, host: HostConfig) {
+        let (command_tx, _command_rx) = mpsc::channel();
+        self.sessions.lock().unwrap().insert(
+            session_id.to_string(),
+            SessionHandle {
+                meta: SessionInfo {
+                    session_id: session_id.to_string(),
+                    host_id: host.id.clone(),
+                    host: host.host.clone(),
+                    port: host.port,
+                    username: host.username.clone(),
+                    status: SessionStatus::Connecting,
+                    created_at: 1_710_000_000_000,
+                },
+                runtime_status: Arc::new(Mutex::new(SessionStatus::Connecting)),
+                command_tx,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                host,
+            },
+        );
+    }
 }
 
 #[cfg(test)]

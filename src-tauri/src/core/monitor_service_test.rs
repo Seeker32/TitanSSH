@@ -76,7 +76,7 @@ mod service_tests {
         assert_eq!(task.session_id, Some("session-1".to_string()));
     }
 
-    /// stop_monitoring 设置关闭标志后任务从 HashMap 中移除
+    /// stop_monitoring 设置关闭标志后任务从 HashMap 中移除，并返回 true 表示确实移除
     #[test]
     fn stop_monitoring_removes_task_handle() {
         use tauri::test::mock_app;
@@ -90,10 +90,23 @@ mod service_tests {
                 app.handle().clone(),
             )
             .unwrap();
-        service.stop_monitoring(&task.task_id);
+        assert!(
+            service.stop_monitoring(&task.task_id),
+            "存在的任务 stop 应返回 true"
+        );
         // 任务已从 HashMap 移除
         let tasks = service.tasks.lock().unwrap();
         assert!(!tasks.contains_key(&task.task_id));
+    }
+
+    /// 停止不存在的任务返回 false：调用方可区分「已停止」与「从未存在/早已消失」
+    #[test]
+    fn stop_monitoring_unknown_task_returns_false() {
+        let service = MonitorService::new();
+        assert!(
+            !service.stop_monitoring("task-never-existed"),
+            "未知任务 stop 应返回 false"
+        );
     }
 
     // ─── 任务状态迁移权威化测试 ──────────────────────────────────────────────
@@ -284,7 +297,7 @@ mod service_tests {
             emitted_ref.fetch_add(1, Ordering::Relaxed);
         });
 
-        service.stop_monitoring("task-1");
+        assert!(service.stop_monitoring("task-1"));
 
         assert!(!transition_task_status(
             &service.tasks,

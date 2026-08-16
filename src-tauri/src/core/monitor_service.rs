@@ -178,11 +178,19 @@ impl MonitorService {
     ///
     /// # 参数
     /// - `task_id`: 要停止的监控任务 ID
-    pub fn stop_monitoring(&self, task_id: &str) {
+    ///
+    /// # 返回
+    /// true 表示句柄确实存在并已移除；false 表示任务不存在（从未创建、
+    /// 已停止或已过期），调用方可据此区分「已停止」与「早已消失」
+    pub fn stop_monitoring(&self, task_id: &str) -> bool {
         let mut tasks = self.tasks.lock().unwrap();
-        if let Some(handle) = tasks.remove(task_id) {
-            // 通知工作线程退出
-            handle.shutdown.store(true, Ordering::Release);
+        match tasks.remove(task_id) {
+            Some(handle) => {
+                // 通知工作线程退出
+                handle.shutdown.store(true, Ordering::Release);
+                true
+            }
+            None => false,
         }
     }
 
@@ -208,6 +216,15 @@ impl MonitorService {
     pub fn get_monitor_status(&self, session_id: &str) -> Option<MonitorSnapshot> {
         let snapshots = self.snapshots.lock().unwrap();
         snapshots.get(session_id).cloned()
+    }
+
+    /// 测试构造：直接注入快照，供命令层测试有数据路径。
+    #[cfg(test)]
+    pub(crate) fn insert_snapshot_for_test(&self, snapshot: MonitorSnapshot) {
+        self.snapshots
+            .lock()
+            .unwrap()
+            .insert(snapshot.session_id.clone(), snapshot);
     }
 }
 
