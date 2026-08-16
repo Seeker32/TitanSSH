@@ -104,6 +104,10 @@ impl HostStore {
     /// 使用 pretty-print JSON 格式写入，便于人工排查问题。
     /// 写入前不含任何明文凭据，调用方必须确保已完成凭据剥离。
     ///
+    /// 原子写：先写同目录临时文件再 rename 覆盖，失败/崩溃时 hosts.json
+    /// 要么是旧内容要么是新内容，不会出现截断或半写状态。进程内并发已由
+    /// SharedHostConfigService 互斥锁串行化整个 load-modify-write 周期。
+    ///
     /// # 参数
     /// - `hosts`: 要持久化的主机配置切片（不含明文凭据）
     pub fn save(&self, hosts: &[HostConfig]) -> Result<(), AppError> {
@@ -114,12 +118,19 @@ impl HostStore {
             ))
         })?;
 
-        fs::write(&self.file_path, content).map_err(|error| {
-            AppError::StorageError(ErrorDetail::msg(
+        // ponytail: 跨进程文件锁未加；桌面应用单实例下 rename 原子性已保证
+        // 无损坏，若支持多实例共享配置目录再加锁。
+        let tmp_path = self.file_path.with_extension("tmp");
+        let write_result =
+            fs::write(&tmp_path, &content).and_then(|()| fs::rename(&tmp_path, &self.file_path));
+        if let Err(error) = write_result {
+            // 尽力清理临时文件，失败只留孤儿 tmp 条目，不阻断错误上报
+            let _ = fs::remove_file(&tmp_path);
+            return Err(AppError::StorageError(ErrorDetail::msg(
                 "写入主机配置文件失败: {0}",
                 vec![error.to_string()],
-            ))
-        })?;
+            )));
+        }
 
         Ok(())
     }

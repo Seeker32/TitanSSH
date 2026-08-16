@@ -104,6 +104,90 @@ mod tests {
         assert_eq!(loaded, hosts);
     }
 
+    /// 保存成功后目录内只有 hosts.json,无临时文件残留(原子写 tmp+rename)
+    #[test]
+    fn save_leaves_no_temp_file_residue() {
+        let file_path = temp_hosts_file();
+        let store = HostStore::from_file_path(file_path.clone());
+        store.save(&[sample_host()]).expect("save should succeed");
+        store
+            .save(&[sample_host()])
+            .expect("overwrite save should succeed");
+
+        let names: Vec<String> = fs::read_dir(file_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["hosts.json".to_string()], "不得残留临时文件");
+    }
+
+    /// hosts.json 只读但目录可写:tmp+rename 原子写可成功替换。
+    /// 修复前 fs::write 直写只读文件必然失败,且直写存在截断风险。
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_readonly_file_via_atomic_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let file_path = temp_hosts_file();
+        fs::write(&file_path, "[]").expect("seed hosts.json");
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let store = HostStore::from_file_path(file_path.clone());
+        let hosts = vec![sample_host()];
+
+        store.save(&hosts).expect("rename 替换只读文件应成功");
+
+        assert_eq!(store.load().expect("load should succeed"), hosts);
+        let names: Vec<String> = fs::read_dir(file_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["hosts.json".to_string()], "不得残留临时文件");
+    }
+
+    /// 写入失败(目录只读)时原 hosts.json 完整保留,且无临时文件残留
+    #[cfg(unix)]
+    #[test]
+    fn save_failure_preserves_original_file_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let file_path = temp_hosts_file();
+        let original = "[]";
+        fs::write(&file_path, original).expect("seed hosts.json");
+        let dir = file_path.parent().unwrap().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let store = HostStore::from_file_path(file_path.clone());
+
+        let result = store.save(&[sample_host()]);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "目录不可写时 save 必须失败");
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            original,
+            "原内容必须完整保留,不得截断"
+        );
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["hosts.json".to_string()], "不得残留临时文件");
+    }
+
+    /// rename 失败(目标路径被目录占据)时返回错误并清理临时文件
+    #[test]
+    fn save_rename_failure_cleans_up_temp_file() {
+        let file_path = temp_hosts_file();
+        fs::create_dir(&file_path).expect("hosts.json 路径占位为目录");
+        let store = HostStore::from_file_path(file_path.clone());
+
+        let result = store.save(&[sample_host()]);
+
+        assert!(result.is_err(), "rename 到目录必须失败");
+        let names: Vec<String> = fs::read_dir(file_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["hosts.json".to_string()], "临时文件必须被清理");
+    }
+
     #[test]
     fn load_returns_error_for_invalid_json() {
         let file_path = temp_hosts_file();

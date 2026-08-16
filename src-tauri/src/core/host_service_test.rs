@@ -230,9 +230,19 @@ mod tests {
     /// 生成带明文密码的保存请求
     fn request_with_password(id: &str, password: &str) -> SaveHostRequest {
         SaveHostRequest {
-            password: Some(password.to_string()),
+            password: Some(CredentialInput::Set(password.to_string())),
             ..sample_request(id, "prod")
         }
+    }
+
+    /// 构造三态凭据输入:Some(Set(value))
+    fn set_cred(value: &str) -> Option<CredentialInput> {
+        Some(CredentialInput::Set(value.to_string()))
+    }
+
+    /// 构造三态凭据输入:Some(Clear)
+    fn clear_cred() -> Option<CredentialInput> {
+        Some(CredentialInput::Clear { clear: true })
     }
 
     // --- 校验(通过生产 composition 入口) ---
@@ -266,6 +276,59 @@ mod tests {
             ..sample_request("id3", "prod")
         };
         assert!(service.save(&req).is_err());
+    }
+
+    #[test]
+    fn save_rejects_port_zero() {
+        let (_, service) = test_service();
+        let req = SaveHostRequest {
+            port: 0,
+            ..sample_request("id0", "prod")
+        };
+        assert!(service.save(&req).is_err(), "端口 0 不得落盘");
+        assert!(
+            service.list_hosts().unwrap().is_empty(),
+            "校验失败不得写入任何内容"
+        );
+    }
+
+    #[test]
+    fn save_accepts_port_boundaries() {
+        let (_, service) = test_service();
+        for port in [1u16, u16::MAX] {
+            let req = SaveHostRequest {
+                port,
+                ..sample_request("id1", "prod")
+            };
+            assert!(service.save(&req).is_ok(), "port {port} 应在合法范围内");
+        }
+    }
+
+    #[test]
+    fn save_rejects_private_key_without_path() {
+        let (creds, service) = test_service();
+        let req = SaveHostRequest {
+            auth_type: AuthType::PrivateKey,
+            private_key_path: None,
+            ..sample_request("id5", "prod")
+        };
+        assert!(service.save(&req).is_err(), "私钥认证缺路径必须拒绝");
+        assert!(
+            service.list_hosts().unwrap().is_empty(),
+            "校验失败不得写入任何内容"
+        );
+        assert!(creds.entries().is_empty(), "校验失败不得写入凭据");
+    }
+
+    #[test]
+    fn save_rejects_private_key_with_blank_path() {
+        let (_, service) = test_service();
+        let req = SaveHostRequest {
+            auth_type: AuthType::PrivateKey,
+            private_key_path: Some("   ".to_string()),
+            ..sample_request("id6", "prod")
+        };
+        assert!(service.save(&req).is_err(), "空白私钥路径必须拒绝");
     }
 
     #[test]
@@ -314,7 +377,7 @@ mod tests {
         let req = SaveHostRequest {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            passphrase: Some("pp-123".to_string()),
+            passphrase: set_cred("pp-123"),
             ..sample_request("host-key", "prod")
         };
         let hosts = service.save(&req).unwrap();
@@ -426,7 +489,7 @@ mod tests {
         let req = SaveHostRequest {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            passphrase: Some("pp-123".to_string()),
+            passphrase: set_cred("pp-123"),
             ..sample_request("host-1", "prod")
         };
         let hosts = service.save(&req).unwrap();
@@ -449,7 +512,7 @@ mod tests {
         let privkey_req = SaveHostRequest {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            passphrase: Some("pp-123".to_string()),
+            passphrase: set_cred("pp-123"),
             ..sample_request("host-2", "prod")
         };
         service.save(&privkey_req).unwrap();
@@ -491,6 +554,114 @@ mod tests {
             !creds.entries().contains_key("titanssh-host-1-password"),
             "切换时旧密码凭据必须删除"
         );
+    }
+
+    // --- 保存:三态凭据(Keep/Set/Clear) ---
+
+    /// Clear 显式清除已存密码:引用置 None,commit 后尽力删除凭据
+    #[test]
+    fn clear_password_removes_ref_and_deletes_credential() {
+        let (creds, service) = test_service();
+        service
+            .save(&request_with_password("host-1", "secret123"))
+            .unwrap();
+        let req = SaveHostRequest {
+            password: clear_cred(),
+            ..sample_request("host-1", "prod")
+        };
+        let hosts = service.save(&req).unwrap();
+        assert!(hosts[0].password_ref.is_none(), "Clear 后引用必须为 None");
+        assert!(
+            !creds.entries().contains_key("titanssh-host-1-password"),
+            "Clear 后凭据必须删除"
+        );
+    }
+
+    /// Clear 时 commit 失败:凭据与文件均保持原样,不得提前删除
+    #[cfg(unix)]
+    #[test]
+    fn clear_password_commit_failure_keeps_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let (creds, service, file_path, _cleanup) = test_service_with_path_and_cleanup();
+        service.save(&request_with_password("id1", "s1")).unwrap();
+        // 目录置为只读:load 成功而 commit 的临时文件写入必然失败
+        let dir = file_path.parent().unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let req = SaveHostRequest {
+            password: clear_cred(),
+            ..sample_request("id1", "prod")
+        };
+        let result = service.save(&req);
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err(), "落盘失败必须返回错误");
+        assert_eq!(
+            creds
+                .entries()
+                .get("titanssh-id1-password")
+                .map(String::as_str),
+            Some("s1"),
+            "commit 未成功时不得删除凭据"
+        );
+        assert_eq!(
+            service.list_hosts().unwrap()[0].password_ref.as_deref(),
+            Some("titanssh-id1-password"),
+            "文件未修改,引用保持原样"
+        );
+    }
+
+    /// Clear 无已存凭据时幂等成功,不产生新条目
+    #[test]
+    fn clear_password_without_stored_credential_is_idempotent() {
+        let (creds, service) = test_service();
+        service.save(&sample_request("host-1", "prod")).unwrap();
+        let req = SaveHostRequest {
+            password: clear_cred(),
+            ..sample_request("host-1", "prod")
+        };
+        let hosts = service.save(&req).unwrap();
+        assert!(hosts[0].password_ref.is_none());
+        assert!(creds.entries().is_empty(), "无凭据可清,不得写入新条目");
+    }
+
+    /// 与 auth 无关的 Clear 被忽略(仅解析 auth 相关的凭据)
+    #[test]
+    fn clear_irrelevant_credential_is_ignored() {
+        let (creds, service) = test_service();
+        let req = SaveHostRequest {
+            passphrase: clear_cred(),
+            ..request_with_password("host-1", "pwd-1")
+        };
+        let hosts = service.save(&req).unwrap();
+        assert!(hosts[0].passphrase_ref.is_none());
+        let entries = creds.entries();
+        assert_eq!(entries.len(), 1, "无关 Clear 不得触发任何凭据操作");
+        assert_eq!(
+            entries.get("titanssh-host-1-password").map(String::as_str),
+            Some("pwd-1")
+        );
+    }
+
+    /// wire 格式三态:字符串=Set、缺失/null=Keep、{clear:true}=Clear(向后兼容旧格式)
+    #[test]
+    fn credential_input_serde_three_states() {
+        let set: SaveHostRequest = serde_json::from_str(
+            r#"{"id":"h","name":"n","host":"10.0.0.1","port":22,"username":"u","authType":"Password","password":"secret","group":""}"#,
+        )
+        .unwrap();
+        assert_eq!(set.password, set_cred("secret"));
+
+        let clear: SaveHostRequest = serde_json::from_str(
+            r#"{"id":"h","name":"n","host":"10.0.0.1","port":22,"username":"u","authType":"Password","password":{"clear":true},"group":""}"#,
+        )
+        .unwrap();
+        assert_eq!(clear.password, clear_cred());
+
+        let keep: SaveHostRequest = serde_json::from_str(
+            r#"{"id":"h","name":"n","host":"10.0.0.1","port":22,"username":"u","authType":"Password","password":null,"group":""}"#,
+        )
+        .unwrap();
+        assert_eq!(keep.password, None);
     }
 
     // --- 保存:失败与补偿 ---
@@ -539,10 +710,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (creds, service, file_path, _cleanup) = test_service_with_path_and_cleanup();
         service.save(&request_with_password("id1", "s1")).unwrap();
-        // 文件置为只读:load 成功而 commit 写入必然失败
-        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+        // 目录置为只读:load 成功而 commit 的临时文件写入必然失败
+        let dir = file_path.parent().unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
         let result = service.save(&request_with_password("id1", "s2"));
-        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(result.is_err(), "落盘失败必须返回错误");
         assert_eq!(
@@ -566,7 +738,7 @@ mod tests {
         let req = SaveHostRequest {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            password: Some("leftover-pwd".to_string()),
+            password: set_cred("leftover-pwd"),
             ..sample_request("host-1", "prod")
         };
         let hosts = service.save(&req).unwrap();
@@ -590,12 +762,12 @@ mod tests {
         let privkey_req = SaveHostRequest {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            passphrase: Some("pp-123".to_string()),
+            passphrase: set_cred("pp-123"),
             ..sample_request("host-2", "prod")
         };
         service.save(&privkey_req).unwrap();
         let req = SaveHostRequest {
-            passphrase: Some("leftover-pp".to_string()),
+            passphrase: set_cred("leftover-pp"),
             ..request_with_password("host-2", "pwd-456")
         };
         let hosts = service.save(&req).unwrap();
@@ -648,7 +820,7 @@ mod tests {
         let (creds, service) = test_service();
         let req = SaveHostRequest {
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
-            passphrase: Some("pp-123".to_string()),
+            passphrase: set_cred("pp-123"),
             ..request_with_password("host-1", "pwd-1")
         };
         let hosts = service.save(&req).unwrap();
@@ -673,11 +845,11 @@ mod tests {
     fn private_key_auth_ignores_password_credential() {
         let (creds, service) = test_service();
         let req = SaveHostRequest {
-            password: Some("pwd-1".to_string()),
+            password: set_cred("pwd-1"),
             ..SaveHostRequest {
                 auth_type: AuthType::PrivateKey,
                 private_key_path: Some("~/.ssh/id_rsa".to_string()),
-                passphrase: Some("pp-123".to_string()),
+                passphrase: set_cred("pp-123"),
                 ..sample_request("host-1", "prod")
             }
         };
@@ -766,7 +938,7 @@ mod tests {
             username: "admin".to_string(),
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("~/.ssh/id".to_string()),
-            passphrase: Some("pp-1".to_string()),
+            passphrase: set_cred("pp-1"),
             remark: Some("note".to_string()),
             group: "grp".to_string(),
             ..sample_request("id1", "prod")
@@ -936,14 +1108,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (creds, service, file_path, cleanup) = test_service_with_path_and_cleanup();
         service.save(&request_with_password("id1", "s1")).unwrap();
-        // 文件置为只读：load 成功而 commit 写入必然失败
-        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+        // 目录置为只读:load 成功而 commit 的临时文件写入必然失败
+        let dir = file_path.parent().unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
         let result = service.save(&SaveHostRequest {
             host: "10.0.0.2".to_string(),
             ..request_with_password("id1", "s2")
         });
-        // 恢复权限，避免影响临时目录清理
-        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+        // 恢复权限,避免影响临时目录清理
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(result.is_err(), "落盘失败必须返回错误");
         assert!(
@@ -1293,7 +1466,7 @@ mod tests {
                     port,
                     username,
                     auth_type: AuthType::Password,
-                    password: Some(password),
+                    password: Some(CredentialInput::Set(password)),
                     private_key_path: None,
                     passphrase: None,
                     remark: None,
@@ -1323,7 +1496,7 @@ mod tests {
                     auth_type: AuthType::PrivateKey,
                     password: None,
                     private_key_path: Some(private_key_path),
-                    passphrase: Some(passphrase),
+                    passphrase: Some(CredentialInput::Set(passphrase)),
                     remark: None,
                     group: String::new(),
                 },
@@ -1351,9 +1524,9 @@ mod tests {
                         port,
                         username,
                         auth_type: AuthType::Password,
-                        password: Some(password),
+                        password: Some(CredentialInput::Set(password)),
                         private_key_path: Some(private_key_path),
-                        passphrase: Some(passphrase),
+                        passphrase: Some(CredentialInput::Set(passphrase)),
                         remark: None,
                         group: String::new(),
                     }
@@ -1369,7 +1542,10 @@ mod tests {
             service.save(&request).expect("save 应成功");
 
             let raw_content = fs::read_to_string(&file_path).expect("hosts.json 应可读取");
-            let plaintext = request.password.clone().unwrap();
+            let plaintext = match request.password.clone().unwrap() {
+                CredentialInput::Set(value) => value,
+                _ => unreachable!("策略生成的 password 必为 Set"),
+            };
             prop_assert!(
                 !raw_content.contains(&plaintext),
                 "hosts.json 不得包含明文密码,密码: {:?}",
@@ -1384,7 +1560,10 @@ mod tests {
             service.save(&request).expect("save 应成功");
 
             let raw_content = fs::read_to_string(&file_path).expect("hosts.json 应可读取");
-            let plaintext = request.passphrase.clone().unwrap();
+            let plaintext = match request.passphrase.clone().unwrap() {
+                CredentialInput::Set(value) => value,
+                _ => unreachable!("策略生成的 passphrase 必为 Set"),
+            };
             prop_assert!(
                 !raw_content.contains(&plaintext),
                 "hosts.json 不得包含明文口令,口令: {:?}",
@@ -1399,8 +1578,14 @@ mod tests {
             service.save(&request).expect("save 应成功");
 
             let raw_content = fs::read_to_string(&file_path).expect("hosts.json 应可读取");
-            let plaintext_password = request.password.clone().unwrap();
-            let plaintext_passphrase = request.passphrase.clone().unwrap();
+            let plaintext_password = match request.password.clone().unwrap() {
+                CredentialInput::Set(value) => value,
+                _ => unreachable!("策略生成的 password 必为 Set"),
+            };
+            let plaintext_passphrase = match request.passphrase.clone().unwrap() {
+                CredentialInput::Set(value) => value,
+                _ => unreachable!("策略生成的 passphrase 必为 Set"),
+            };
             prop_assert!(
                 !raw_content.contains(&plaintext_password),
                 "hosts.json 不得包含明文密码,密码: {:?}",

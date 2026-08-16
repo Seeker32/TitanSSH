@@ -15,6 +15,9 @@ export interface HostConfig {
   group: string;
 }
 
+/** 三态凭据输入:字符串=设置新值(空串=保持旧值),{clear:true}=显式清除,缺失/null=保持旧值 */
+export type CredentialInput = string | { clear: true };
+
 /** 保存主机请求，含明文凭据，仅用于提交时传递，不得持久化 */
 export interface SaveHostRequest {
   id: string;
@@ -23,9 +26,9 @@ export interface SaveHostRequest {
   port: number;
   username: string;
   authType: AuthType;
-  password?: string;
+  password?: CredentialInput | null;
   privateKeyPath?: string;
-  passphrase?: string;
+  passphrase?: CredentialInput | null;
   remark?: string;
   /** 分组名，空串表示"未分组" */
   group: string;

@@ -1,6 +1,6 @@
 use crate::core::host_identity::HostIdentityService;
 use crate::errors::app_error::{AppError, ErrorDetail};
-use crate::models::host::{AuthType, HostConfig, SaveHostRequest};
+use crate::models::host::{AuthType, CredentialInput, HostConfig, SaveHostRequest};
 use crate::storage::host_store::HostStore;
 use crate::storage::secure_store;
 use std::sync::Mutex;
@@ -126,10 +126,11 @@ impl HostConfigService {
 
     /// 保存主机配置，返回更新后的完整列表
     ///
-    /// 流程：校验 → 加载现有列表 → 写入与 auth type 相关的凭据并解析引用
-    /// （无关凭据不写入、引用置 None；相关凭据留空/缺省且 auth type 未变时
-    /// 保留旧引用）→ 构造 HostConfig → upsert → 落盘（commit 点）→
-    /// auth type 切换时尽力删除陈旧凭据 → endpoint 变化时清理旧信任记录。
+    /// 流程：校验 → 加载现有列表 → 写入与 auth type 相关的凭据并解析三态输入
+    /// （Keep/Set/Clear：无关凭据不写入、引用置 None；相关凭据 Keep 且 auth type
+    /// 未变时保留旧引用）→ 构造 HostConfig → upsert → 落盘（commit 点）→
+    /// 尽力删除显式 Clear 与 auth type 切换遗留的陈旧凭据 →
+    /// endpoint 变化时清理旧信任记录。
     ///
     /// # 一致性保证
     /// 任一失败（凭据写入或落盘）时，补偿将本次调用已写入的凭据还原到写入前状态：
@@ -146,6 +147,8 @@ impl HostConfigService {
 
         // 本次调用已写入的凭据及其写入前快照；任一失败时用于补偿还原，保持安全存储与文件一致
         let mut written: Vec<CredentialWrite> = Vec::new();
+        // 显式 Clear 的凭据 key；commit 成功后才尽力删除，失败时旧凭据保持可用
+        let mut clear_keys: Vec<String> = Vec::new();
 
         let result = (|| -> Result<SaveResult, AppError> {
             let existing_hosts = self.host_store.load()?;
@@ -172,6 +175,7 @@ impl HostConfigService {
                     existing.and_then(|host| host.password_ref.as_deref()),
                     auth_type_changed,
                     &mut written,
+                    &mut clear_keys,
                 )?;
                 (password_ref, None)
             } else {
@@ -182,6 +186,7 @@ impl HostConfigService {
                     existing.and_then(|host| host.passphrase_ref.as_deref()),
                     auth_type_changed,
                     &mut written,
+                    &mut clear_keys,
                 )?;
                 (None, passphrase_ref)
             };
@@ -209,10 +214,14 @@ impl HostConfigService {
                 hosts.push(host_config);
             }
 
-            // 落盘是 commit 点：文件更新成功后，才清理切换遗留的陈旧凭据。
+            // 落盘是 commit 点：文件更新成功后，才清理显式清除与切换遗留的陈旧凭据。
             // 被清理的是与旧 auth type 相关、本次未写入的 key（本调用只写与新
             // auth type 相关的凭据），不存在误删本次写入导致落盘引用悬空。
             self.host_store.save(&hosts)?;
+            for key in &clear_keys {
+                // 显式 Clear：引用已置 None，尽力删除已存凭据（失败只留孤儿条目，不阻断保存）
+                let _ = self.credential_store.delete(key);
+            }
             if auth_type_changed {
                 if request.auth_type == AuthType::PrivateKey {
                     // 旧密码不再适用，尽力删除（失败只留孤儿条目，不阻断保存）
@@ -319,28 +328,31 @@ impl HostConfigService {
         Ok(())
     }
 
-    /// 解析与 auth type 相关的单个凭据引用（调用方只对相关凭据调用本方法）:
-    /// 非空明文写入安全存储并返回新引用 key; 空/缺省时,认证方式未切换则
-    /// 保留旧引用,切换则置 None
+    /// 解析与 auth type 相关的单个三态凭据输入（调用方只对相关凭据调用本方法）:
+    /// - Set(非空)写入安全存储并返回新引用 key；空串等价于 Keep（兼容旧前端「留空则保持」）
+    /// - Keep 时认证方式未切换则保留旧引用，切换则置 None
+    /// - Clear 置 None 并把目标 key 记入 clear_keys，由 save 在 commit 后尽力删除
     ///
     /// # 参数
     /// - `host_id`: 主机 ID,用于派生引用 key
-    /// - `provided`: 请求中的明文凭据(可能为空串)
+    /// - `provided`: 三态凭据输入
     /// - `key_fn`: 引用 key 生成函数(password_key / passphrase_key)
     /// - `existing_ref`: 旧引用
     /// - `auth_type_changed`: 认证方式是否已切换
     /// - `written`: 本次调用已写入的凭据及写入前快照,供失败补偿还原
+    /// - `clear_keys`: 本次调用显式 Clear 的 key,commit 成功后由 save 尽力删除
     fn resolve_credential_ref(
         &self,
         host_id: &str,
-        provided: &Option<String>,
+        provided: &Option<CredentialInput>,
         key_fn: fn(&str) -> String,
         existing_ref: Option<&str>,
         auth_type_changed: bool,
         written: &mut Vec<CredentialWrite>,
+        clear_keys: &mut Vec<String>,
     ) -> Result<Option<String>, AppError> {
-        if let Some(value) = provided {
-            if !value.is_empty() {
+        match provided {
+            Some(CredentialInput::Set(value)) if !value.is_empty() => {
                 let key = key_fn(host_id);
                 // 覆盖前快照旧值：key 由 host_id 派生，与旧 hosts.json 引用相同，
                 // 失败补偿时需还原旧值而非删除；快照失败立即中止，避免盲覆盖破坏旧凭据
@@ -354,14 +366,23 @@ impl HostConfigService {
                     key: key.clone(),
                     prev,
                 });
-                return Ok(Some(key));
+                Ok(Some(key))
             }
-        }
-        if auth_type_changed {
-            // 切换认证方式:旧引用不再适用,置 None
-            Ok(None)
-        } else {
-            Ok(existing_ref.map(String::from))
+            Some(CredentialInput::Clear { .. }) => {
+                // 显式清除：引用置 None；已存凭据由 save 在 commit 后尽力删除，
+                // 不在此处删除——commit 失败时旧 hosts.json 仍引用该 key
+                clear_keys.push(key_fn(host_id));
+                Ok(None)
+            }
+            // Keep 或空串 Set（旧前端「留空则保持」语义）
+            _ => {
+                if auth_type_changed {
+                    // 切换认证方式:旧引用不再适用,置 None
+                    Ok(None)
+                } else {
+                    Ok(existing_ref.map(String::from))
+                }
+            }
         }
     }
 }
@@ -416,7 +437,8 @@ impl SharedHostConfigService {
     }
 }
 
-/// 验证保存主机请求的必填字段，name/host/username 不得为空白
+/// 验证保存主机请求的必填字段：name/host/username 不得为空白，
+/// 端口必须在 1-65535 之间，PrivateKey 认证必须提供非空私钥路径
 fn validate_save_request(request: &SaveHostRequest) -> Result<(), AppError> {
     if request.name.trim().is_empty() {
         return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
@@ -433,6 +455,23 @@ fn validate_save_request(request: &SaveHostRequest) -> Result<(), AppError> {
     if request.username.trim().is_empty() {
         return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
             "用户名为必填项",
+            Vec::new(),
+        )));
+    }
+    if request.port == 0 {
+        return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
+            "端口号必须在 1-65535 之间",
+            Vec::new(),
+        )));
+    }
+    if request.auth_type == AuthType::PrivateKey
+        && request
+            .private_key_path
+            .as_deref()
+            .map_or(true, |path| path.trim().is_empty())
+    {
+        return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
+            "私钥认证必须提供私钥文件路径",
             Vec::new(),
         )));
     }

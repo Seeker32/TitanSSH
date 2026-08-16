@@ -16,8 +16,14 @@ interface Props {
   onSave: (request: SaveHostRequest) => void;
 }
 
+/** 表单内部状态：凭据字段为字符串，提交时转换为三态 wire 格式 */
+type EditorForm = Omit<SaveHostRequest, 'password' | 'passphrase'> & {
+  password: string;
+  passphrase: string;
+};
+
 /** 根据编辑目标创建不含旧凭据的表单状态。 */
-function formFromHost(host: HostConfig | null): SaveHostRequest {
+function formFromHost(host: HostConfig | null): EditorForm {
   return {
     id: host?.id ?? '',
     name: host?.name ?? '',
@@ -37,14 +43,14 @@ function formFromHost(host: HostConfig | null): SaveHostRequest {
 export default function HostEditorDialog({ open, editingHost, groups, saveError, onClose, onSave }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   const t = (key: Parameters<typeof translate>[1]) => translate(locale, key);
-  const [form, setForm] = useState<SaveHostRequest>(() => formFromHost(editingHost));
+  const [form, setForm] = useState<EditorForm>(() => formFromHost(editingHost));
 
   useEffect(() => {
     if (open) setForm(formFromHost(editingHost));
   }, [open, editingHost]);
 
   /** 更新单个表单字段。 */
-  function update<K extends keyof SaveHostRequest>(key: K, value: SaveHostRequest[K]) {
+  function update<K extends keyof EditorForm>(key: K, value: EditorForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
 
