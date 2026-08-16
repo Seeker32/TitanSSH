@@ -2,6 +2,7 @@
 mod tests {
     use crate::core::host_identity::*;
     use crate::models::host_identity::TrustedHostInfo;
+    use crate::models::session::HostIdentityChallengeDismissed;
     use crate::storage::trust_store::{TrustRecord, TrustStore};
     use serde_json::Value;
     use std::fs;
@@ -49,6 +50,78 @@ mod tests {
             .expect("challenge 已创建")
     }
 
+    /// verify 的持久化命中分支不得在持有 trust_store 锁时进入 lookup/重取 state 锁：
+    /// 与 accept_and_save 的 state → trust store 锁序构成 AB-BA 死锁。
+    ///
+    /// 用 FIFO 文件让 store.lookup 的首次文件读取确定性阻塞，并用非阻塞 writer
+    /// 探测 verify 是否已进入 lookup（reader 就位）：store 锁占用 + reader 就位
+    /// 同时成立即锁序违规；store 锁空闲 + reader 就位即修复后的正确行为。
+    #[test]
+    fn verify_persisted_hit_releases_store_lock_before_state_lock() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("titan-identity-fifo-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let fifo = dir.join("known_hosts");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("应能创建 FIFO")
+                .success()
+        );
+
+        let app = mock_app();
+        // 缓存未加载（records=None）：verify 的 lookup 触发文件读取并阻塞在 FIFO 上
+        let service = HostIdentityService::with_trust_store_path(fifo.clone());
+        let presented = make_presented("SHA256:match");
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let handle = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+
+        // 非阻塞 writer 探测 reader 就位：O_NONBLOCK（Linux 全架构 0x800）下
+        // FIFO 已有 reader 时 writer 打开立即成功，无 reader 时以 ENXIO 失败。
+        // 不依赖任何时序假设，只观察「verify 阻塞在 lookup」这一确定性状态。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut probe_writer = None;
+        while Instant::now() < deadline {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x800)
+                .open(&fifo)
+            {
+                Ok(writer) => {
+                    probe_writer = Some(writer);
+                    // verify 已阻塞在 lookup（reader 就位）；此时 store 锁必须空闲
+                    assert!(
+                        service.trust_store.try_lock().is_ok(),
+                        "verify 在持有 trust_store 锁时进入 lookup，\
+                         与 accept_and_save 的 state → store 锁序构成 AB-BA 死锁"
+                    );
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let mut writer = probe_writer.expect("verify 应在期限内进入 lookup");
+
+        // 解除 lookup 阻塞：写入与呈现匹配的记录，verify 应继续并放行
+        writer
+            .write_all(b"10.0.0.8 ssh-ed25519 YmxvYg\n")
+            .expect("应能写入记录");
+        drop(writer);
+        handle
+            .join()
+            .expect("verify 线程不应 panic")
+            .expect("匹配记录应放行");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 已保存 key 精确匹配：verify 在认证前直接放行，不产生 challenge。
     #[test]
     fn saved_key_exact_match_skips_challenge() {
@@ -71,6 +144,66 @@ mod tests {
         assert_eq!(events.load(Ordering::Relaxed), 0, "匹配时不产生 challenge");
     }
 
+    /// 过期的取消标记不再拒绝校验：保留期后标记被清理（内存有界），
+    /// 复用该 session_id 的校验器按未知主机正常走 challenge 流程。
+    #[test]
+    fn expired_cancelled_marker_stops_rejecting() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        // 直接注入过期的取消标记（模拟很久以前关闭的 Session）
+        {
+            let mut state = service.state.lock().unwrap();
+            state.cancelled.insert(
+                "session-old".to_string(),
+                Instant::now() - CANCELLED_RETENTION - Duration::from_secs(1),
+            );
+        }
+        let verifier = service.verifier(app.handle().clone(), "session-old".to_string());
+        let presented = make_presented("SHA256:old");
+        let waiter = thread::spawn(move || verifier(&presented));
+        let challenge = wait_pending(&service, "session-old");
+        service.reject(&challenge.challenge_id).unwrap();
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().code(),
+            "HostKeyRejected",
+            "过期标记不得以取消错误拒绝校验"
+        );
+        // 过期条目在检查时被清理，集合保持有界
+        assert!(service.state.lock().unwrap().cancelled.is_empty());
+    }
+
+    /// cancel_session 插入新标记时清理过期的旧标记。
+    #[test]
+    fn cancel_session_prunes_expired_markers() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        {
+            let mut state = service.state.lock().unwrap();
+            state.cancelled.insert(
+                "session-old".to_string(),
+                Instant::now() - CANCELLED_RETENTION - Duration::from_secs(1),
+            );
+        }
+        service.cancel_session(app.handle(), "session-new");
+        let state = service.state.lock().unwrap();
+        assert!(
+            !state.cancelled.contains_key("session-old"),
+            "过期的旧标记应在插入时被清理"
+        );
+        assert!(state.cancelled.contains_key("session-new"), "新标记应保留");
+    }
+
+    /// 应用退出路径：cancel_all 清空取消标记，集合不再持有已退出会话的历史。
+    #[test]
+    fn cancel_all_clears_cancelled_markers() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        service.cancel_session(app.handle(), "session-1");
+        service.cancel_session(app.handle(), "session-2");
+        service.cancel_all(app.handle());
+        assert!(service.state.lock().unwrap().cancelled.is_empty());
+    }
+
     /// 已关闭 Session 的迟到校验器不得借持久化信任继续认证：取消检查先于匹配放行。
     #[test]
     fn cancelled_session_fails_even_when_key_is_saved() {
@@ -83,7 +216,7 @@ mod tests {
         });
         let verifier = service.verifier(app.handle().clone(), "session-gone".to_string());
 
-        service.cancel_session("session-gone");
+        service.cancel_session(app.handle(), "session-gone");
         let error = verifier(&make_presented("SHA256:match")).unwrap_err();
         assert_eq!(
             error.code(),
@@ -255,7 +388,9 @@ mod tests {
         let waiter = thread::spawn(move || verifier(&presented));
         let challenge = wait_pending(&service, "session-1");
 
-        service.accept_and_save(&challenge.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge.challenge_id)
+            .unwrap();
         waiter.join().unwrap().expect("保存成功后放行认证");
         // 磁盘真实内容：endpoint 记录已写入（含原无关记录，不丢其他 endpoint）
         let records = TrustStore::from_file_path(path).reload().unwrap();
@@ -287,7 +422,9 @@ mod tests {
         let waiter = thread::spawn(move || verifier(&presented));
         let challenge = wait_pending(&service, "session-1");
 
-        service.accept_and_save(&challenge.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge.challenge_id)
+            .unwrap();
         waiter.join().unwrap().unwrap();
         let records = TrustStore::from_file_path(path).reload().unwrap();
         assert_eq!(records.len(), 1, "同一 endpoint 只保留一条记录");
@@ -323,7 +460,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir_all(&path).unwrap();
         let error = service
-            .accept_and_save(&challenge.challenge_id)
+            .accept_and_save(app.handle(), &challenge.challenge_id)
             .unwrap_err();
         assert_eq!(error.code(), "HostKeySaveFailed");
         // challenge 保持未决：等待者仍在等待，pending 未清除
@@ -373,7 +510,9 @@ mod tests {
         let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
         let waiter = thread::spawn(move || verifier(&presented));
         let challenge = wait_pending(&service, "session-1");
-        service.accept_and_save(&challenge.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge.challenge_id)
+            .unwrap();
         waiter.join().unwrap().unwrap();
         // 初始化后的持久化信任生效：新 Session 同 endpoint 静默放行
         let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
@@ -395,7 +534,7 @@ mod tests {
         let challenge = wait_pending(&service, "session-1");
 
         let error = service
-            .accept_and_save(&challenge.challenge_id)
+            .accept_and_save(app.handle(), &challenge.challenge_id)
             .unwrap_err();
         assert_eq!(error.code(), "HostKeySaveFailed");
         assert_eq!(
@@ -429,7 +568,9 @@ mod tests {
         let challenge_b = wait_pending(&service, "session-b");
         assert_ne!(challenge_a.challenge_id, challenge_b.challenge_id);
 
-        service.accept_and_save(&challenge_a.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge_a.challenge_id)
+            .unwrap();
         waiter_a.join().unwrap().expect("发起保存的 Session 放行");
         waiter_b
             .join()
@@ -460,7 +601,9 @@ mod tests {
         let challenge_a = wait_pending(&service, "session-a");
         let challenge_c = wait_pending(&service, "session-c");
 
-        service.accept_and_save(&challenge_a.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge_a.challenge_id)
+            .unwrap();
         waiter_a.join().unwrap().unwrap();
         // session-c 的 key 不同：保存不自动放行，challenge 仍待用户决定
         assert_eq!(
@@ -469,6 +612,396 @@ mod tests {
         );
         service.accept(&challenge_c.challenge_id).unwrap();
         waiter_c.join().unwrap().unwrap();
+    }
+
+    /// 持久化记录的放行/挑战决定必须在最终 state 锁内做出：
+    /// 查找若发生在锁外，并发 accept_and_save（他 Session 刚保存本 key）会在
+    /// 查找与决定之间留下 stale kind 竞态窗口。用 FIFO 阻塞 lookup，观察 lookup
+    /// 期间 state 锁被持有（记录决定与 challenge 创建在同一临界区内），
+    /// 且 lookup 期间才落盘的匹配记录仍被采用（静默放行，不弹挑战）。
+    #[test]
+    fn persisted_record_decision_happens_under_final_state_lock() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("titan-identity-fifo-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let fifo = dir.join("known_hosts");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("应能创建 FIFO")
+                .success()
+        );
+
+        let app = mock_app();
+        // 缓存未加载：lookup 触发文件读取并阻塞在 FIFO 上
+        let service = HostIdentityService::with_trust_store_path(fifo.clone());
+        let presented = make_presented("SHA256:match");
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let handle = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+
+        // 非阻塞 writer 探测 lookup 阻塞（reader 就位）：此时 state 锁必须被持有，
+        // 否则记录决定发生在锁外，存在 stale kind 竞态窗口
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut probe_writer = None;
+        while Instant::now() < deadline {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x800)
+                .open(&fifo)
+            {
+                Ok(writer) => {
+                    probe_writer = Some(writer);
+                    assert!(
+                        service.state.try_lock().is_err(),
+                        "持久化记录决定必须发生在最终 state 锁内（lookup 期间 state 锁应被持有）"
+                    );
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let mut writer = probe_writer.expect("verify 应在期限内进入 lookup");
+
+        // lookup 期间才落盘的精确匹配记录也必须生效：写入匹配记录后
+        // verify 应静默放行，不因过期快照把用户多阻塞一次
+        writer
+            .write_all(b"10.0.0.8 ssh-ed25519 YmxvYg\n")
+            .expect("应能写入记录");
+        drop(writer);
+        handle
+            .join()
+            .expect("verify 线程不应 panic")
+            .expect("匹配记录应放行");
+        assert!(service.pending_challenge("session-1").is_none());
+        assert!(service.is_trusted("session-1", "10.0.0.8", 22, "SHA256:match"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// pending_index 与 pending 脱同步（历史 bug / 未来重构残留）时不得在
+    /// 传输线程上 panic：按未命中处理重新创建 challenge，校验继续正常完成。
+    #[test]
+    fn desynced_pending_index_falls_back_to_new_challenge() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        let key = IdentityKey {
+            session_id: "session-1".to_string(),
+            host: "10.0.0.8".to_string(),
+            port: 22,
+            fingerprint: "SHA256:desync".to_string(),
+        };
+        // 人为制造索引指向不存在 challenge 的脱同步状态
+        {
+            let mut state = service.state.lock().unwrap();
+            state
+                .pending_index
+                .insert(key.clone(), "ghost-challenge".to_string());
+        }
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:desync");
+        let waiter = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+        assert_ne!(
+            challenge.challenge_id, "ghost-challenge",
+            "脱同步索引必须按未命中重新创建 challenge"
+        );
+        // 创建路径以新 challenge 覆盖残留索引条目
+        {
+            let state = service.state.lock().unwrap();
+            assert_eq!(
+                state.pending_index.get(&key),
+                Some(&challenge.challenge_id),
+                "新 challenge 应覆盖残留索引"
+            );
+        }
+        service.accept(&challenge.challenge_id).unwrap();
+        waiter.join().unwrap().expect("脱同步索引不得使校验 panic");
+    }
+
+    /// 事件派发失败（webview 已销毁、runtime 错误等）不得静默吞掉：
+    /// challenge 必须移除，全部等待者立即以 HostKeyVerificationCancelled 失败，
+    /// 连接不得在用户看不到的 challenge 上永久阻塞。
+    #[test]
+    fn emit_failure_cancels_challenge_and_wakes_all_waiters() {
+        let app = mock_app();
+        let service = HostIdentityService::new();
+        let presented = make_presented("SHA256:noemit");
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        // creator：派发阻塞在门后并最终失败（challenge 已插入 pending）
+        let creator = thread::spawn({
+            let service = service.clone();
+            let app_handle = app.handle().clone();
+            let presented = presented.clone();
+            move || {
+                service.verify_with_emitter(
+                    &app_handle,
+                    "session-1",
+                    &presented,
+                    |_app, _challenge| {
+                        gate_tx.send(()).expect("应能发送门信号");
+                        release_rx.recv().expect("应能收到放行信号");
+                        Err("mock 派发失败".to_string())
+                    },
+                )
+            }
+        });
+        // 等待 creator 进入 emit（challenge 已创建，仍 pending）
+        gate_rx.recv().expect("creator 应进入派发");
+
+        // joiner：合并到同一 challenge 的并发连接（created=false，不再派发）
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let joiner = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.waiting_connections(&challenge.challenge_id) < 1 && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            service.waiting_connections(&challenge.challenge_id) >= 1,
+            "并发连接应合并到同一 challenge"
+        );
+
+        // 放行派发失败：challenge 移除，两个等待者立即以取消错误失败
+        release_tx.send(()).expect("应能放行派发");
+        assert_eq!(
+            creator.join().unwrap().unwrap_err().code(),
+            "HostKeyVerificationCancelled"
+        );
+        assert_eq!(
+            joiner.join().unwrap().unwrap_err().code(),
+            "HostKeyVerificationCancelled"
+        );
+        assert!(
+            service.pending_challenge("session-1").is_none(),
+            "派发失败的 challenge 不得残留 pending"
+        );
+    }
+
+    /// 等待并收集指定数量的撤销事件（期限内不足则 panic）。
+    fn wait_dismissals(
+        dismissals: &Arc<Mutex<Vec<HostIdentityChallengeDismissed>>>,
+        count: usize,
+    ) -> Vec<HostIdentityChallengeDismissed> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let current = dismissals.lock().unwrap().clone();
+            if current.len() >= count {
+                return current;
+            }
+            assert!(Instant::now() < deadline, "撤销事件应在期限内到达");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// challenge 被新指纹取代时，旧 challenge 的确认卡必须收到撤销事件，
+    /// UI 不得残留孤儿提示（其 accept/reject 只会得到 HostKeyChallengeNotFound）。
+    #[test]
+    fn superseded_challenge_emits_dismissal() {
+        let app = mock_app();
+        let dismissals = Arc::new(Mutex::new(Vec::new()));
+        let captured = dismissals.clone();
+        app.listen("host-identity:challenge-dismissed", move |event| {
+            let payload: HostIdentityChallengeDismissed =
+                serde_json::from_str(event.payload()).expect("payload 可反序列化");
+            captured.lock().unwrap().push(payload);
+        });
+        let service = HostIdentityService::new();
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented_a = make_presented("SHA256:aaa");
+        let presented_b = PresentedHostKey {
+            fingerprint: "SHA256:bbb".to_string(),
+            ..presented_a.clone()
+        };
+
+        let waiter_a = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented_a.clone();
+            move || verifier(&presented)
+        });
+        let challenge_a = wait_pending(&service, "session-1");
+        let waiter_b = thread::spawn({
+            let verifier = verifier.clone();
+            move || verifier(&presented_b)
+        });
+        let challenge_b = wait_pending_other(&service, "session-1", &challenge_a.challenge_id);
+
+        // 旧 challenge 的确认卡必须收到撤销事件
+        let dismissals = wait_dismissals(&dismissals, 1);
+        assert_eq!(
+            dismissals,
+            vec![HostIdentityChallengeDismissed {
+                challenge_id: challenge_a.challenge_id,
+                session_id: "session-1".to_string(),
+            }]
+        );
+        // 旧等待者取消，新 challenge 可正常解决
+        assert_eq!(
+            waiter_a.join().unwrap().unwrap_err().code(),
+            "HostKeyVerificationCancelled"
+        );
+        service.accept(&challenge_b.challenge_id).unwrap();
+        waiter_b.join().unwrap().expect("新 challenge 接受后放行");
+    }
+
+    /// accept_and_save 异地解决的其他 Session challenge 必须收到撤销事件；
+    /// 发起保存的 challenge 由 UI 自行撤下，不重复派发。
+    #[test]
+    fn accept_and_save_dismisses_other_session_prompts() {
+        let app = mock_app();
+        let dismissals = Arc::new(Mutex::new(Vec::new()));
+        let captured = dismissals.clone();
+        app.listen("host-identity:challenge-dismissed", move |event| {
+            let payload: HostIdentityChallengeDismissed =
+                serde_json::from_str(event.payload()).expect("payload 可反序列化");
+            captured.lock().unwrap().push(payload);
+        });
+        let (service, _path) = service_with_record(TrustRecord {
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            algorithm: "ssh-ed25519".to_string(),
+            blob: b"unrelated".to_vec(),
+        });
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let presented = make_presented("SHA256:shared");
+        let waiter_a = thread::spawn({
+            let verifier = verifier_a.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let waiter_b = thread::spawn({
+            let verifier = verifier_b.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge_a = wait_pending(&service, "session-a");
+        let challenge_b = wait_pending(&service, "session-b");
+
+        service
+            .accept_and_save(app.handle(), &challenge_a.challenge_id)
+            .unwrap();
+        waiter_a.join().unwrap().expect("发起保存的 Session 放行");
+        waiter_b
+            .join()
+            .unwrap()
+            .expect("相同 endpoint+key 一并放行");
+
+        let dismissals = wait_dismissals(&dismissals, 1);
+        assert_eq!(
+            dismissals,
+            vec![HostIdentityChallengeDismissed {
+                challenge_id: challenge_b.challenge_id,
+                session_id: "session-b".to_string(),
+            }]
+        );
+    }
+
+    /// cancel_session 移除的未决 challenge 必须收到撤销事件，UI 不得残留孤儿提示。
+    #[test]
+    fn cancel_session_dismisses_pending_prompts() {
+        let app = mock_app();
+        let dismissals = Arc::new(Mutex::new(Vec::new()));
+        let captured = dismissals.clone();
+        app.listen("host-identity:challenge-dismissed", move |event| {
+            let payload: HostIdentityChallengeDismissed =
+                serde_json::from_str(event.payload()).expect("payload 可反序列化");
+            captured.lock().unwrap().push(payload);
+        });
+        let service = HostIdentityService::new();
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let presented = make_presented("SHA256:cancel");
+        let waiter = thread::spawn({
+            let verifier = verifier.clone();
+            let presented = presented.clone();
+            move || verifier(&presented)
+        });
+        let challenge = wait_pending(&service, "session-1");
+
+        service.cancel_session(app.handle(), "session-1");
+        assert_eq!(
+            waiter.join().unwrap().unwrap_err().code(),
+            "HostKeyVerificationCancelled"
+        );
+        assert_eq!(
+            wait_dismissals(&dismissals, 1),
+            vec![HostIdentityChallengeDismissed {
+                challenge_id: challenge.challenge_id,
+                session_id: "session-1".to_string(),
+            }]
+        );
+    }
+
+    /// cancel_all 移除的全部未决 challenge 必须收到撤销事件。
+    #[test]
+    fn cancel_all_dismisses_all_pending_prompts() {
+        let app = mock_app();
+        let dismissals = Arc::new(Mutex::new(Vec::new()));
+        let captured = dismissals.clone();
+        app.listen("host-identity:challenge-dismissed", move |event| {
+            let payload: HostIdentityChallengeDismissed =
+                serde_json::from_str(event.payload()).expect("payload 可反序列化");
+            captured.lock().unwrap().push(payload);
+        });
+        let service = HostIdentityService::new();
+        let verifier_a = service.verifier(app.handle().clone(), "session-a".to_string());
+        let verifier_b = service.verifier(app.handle().clone(), "session-b".to_string());
+        let waiters: Vec<_> = [
+            ("session-a", verifier_a.clone()),
+            ("session-b", verifier_b.clone()),
+        ]
+        .iter()
+        .map(|(session_id, verifier)| {
+            let verifier = verifier.clone();
+            let presented = make_presented(&format!("SHA256:exit-{session_id}"));
+            thread::spawn(move || verifier(&presented))
+        })
+        .collect();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (service.pending_challenge("session-a").is_none()
+            || service.pending_challenge("session-b").is_none())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        service.cancel_all(app.handle());
+        for waiter in waiters {
+            assert_eq!(
+                waiter.join().unwrap().unwrap_err().code(),
+                "HostKeyVerificationCancelled"
+            );
+        }
+        let mut dismissals = wait_dismissals(&dismissals, 2);
+        dismissals.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        assert_eq!(
+            dismissals
+                .iter()
+                .map(|d| d.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-a", "session-b"]
+        );
+        assert!(
+            dismissals.iter().all(|d| !d.challenge_id.is_empty()),
+            "撤销事件必须携带 challenge id"
+        );
     }
 
     /// 首次未知主机产生 challenge 事件；接受后同一 Session 的后续连接（含重连）直接放行。
@@ -651,7 +1184,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        service.cancel_session("session-1");
+        service.cancel_session(app.handle(), "session-1");
         let error = waiter.join().unwrap().unwrap_err();
         assert_eq!(error.code(), "HostKeyVerificationCancelled");
         assert!(service.pending_challenge("session-1").is_none());
@@ -675,7 +1208,7 @@ mod tests {
             service.is_trusted("session-2", "10.0.0.8", 22, "SHA256:cancel"),
             "接受后写入临时信任"
         );
-        service.cancel_session("session-2");
+        service.cancel_session(app.handle(), "session-2");
         assert!(
             !service.is_trusted("session-2", "10.0.0.8", 22, "SHA256:cancel"),
             "Session 关闭必须清除临时信任"
@@ -690,7 +1223,7 @@ mod tests {
         let service = HostIdentityService::new();
         let verifier = service.verifier(app.handle().clone(), "session-gone".to_string());
 
-        service.cancel_session("session-gone");
+        service.cancel_session(app.handle(), "session-gone");
         let error = verifier(&make_presented("SHA256:late")).unwrap_err();
         assert_eq!(error.code(), "HostKeyVerificationCancelled");
         assert!(
@@ -723,7 +1256,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        service.cancel_all();
+        service.cancel_all(app.handle());
         for waiter in waiters {
             let error = waiter.join().unwrap().unwrap_err();
             assert_eq!(error.code(), "HostKeyVerificationCancelled");
@@ -1015,7 +1548,9 @@ mod tests {
         assert_eq!(service.waiting_connections(&challenge.challenge_id), 1);
 
         // 替换成功：endpoint 只保留呈现 key
-        service.accept_and_save(&challenge.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge.challenge_id)
+            .unwrap();
         waiter.join().unwrap().expect("替换成功后放行认证");
         let records = TrustStore::from_file_path(path).reload().unwrap();
         assert_eq!(records.len(), 1);
@@ -1151,7 +1686,9 @@ mod tests {
         let challenge_d = wait_pending(&service, "session-d");
 
         // session-a 替换：同 endpoint + 同呈现 key 的 session-b 一并放行
-        service.accept_and_save(&challenge_a.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge_a.challenge_id)
+            .unwrap();
         waiter_a.join().unwrap().expect("发起替换的 Session 放行");
         waiter_b.join().unwrap().expect("兼容 challenge 一并放行");
         // 不同呈现 key / 不同 endpoint 的 challenge 不受影响，仍待各自决定
@@ -1203,7 +1740,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir_all(&path).unwrap();
         let error = service
-            .accept_and_save(&challenge.challenge_id)
+            .accept_and_save(app.handle(), &challenge.challenge_id)
             .unwrap_err();
         assert_eq!(error.code(), "HostKeySaveFailed");
         // 旧信任记录未被失败替换污染：新 Session 呈现旧 key 仍精确匹配静默放行
@@ -1278,7 +1815,7 @@ mod tests {
         );
         assert_eq!(
             service
-                .accept_and_save(&challenge_a.challenge_id)
+                .accept_and_save(app.handle(), &challenge_a.challenge_id)
                 .unwrap_err()
                 .code(),
             "HostKeyChallengeNotFound"
@@ -1291,7 +1828,9 @@ mod tests {
             "HostKeyChallengeNotFound"
         );
         // 新 challenge 正常可决：替换为新呈现 key
-        service.accept_and_save(&challenge_b.challenge_id).unwrap();
+        service
+            .accept_and_save(app.handle(), &challenge_b.challenge_id)
+            .unwrap();
         waiter_b.join().unwrap().expect("新 challenge 决定后放行");
         assert_eq!(
             events.load(Ordering::Relaxed),
@@ -1392,8 +1931,9 @@ mod tests {
             // 并发：保存 challenge_a（替换记录）与呈现新 key（取代旧 challenge）
             let save_handle = {
                 let service = service.clone();
+                let app_handle = app.handle().clone();
                 let challenge_id = challenge_a.challenge_id.clone();
-                thread::spawn(move || service.accept_and_save(&challenge_id))
+                thread::spawn(move || service.accept_and_save(&app_handle, &challenge_id))
             };
             let presented_b = PresentedHostKey {
                 blob: b"key-b".to_vec(),

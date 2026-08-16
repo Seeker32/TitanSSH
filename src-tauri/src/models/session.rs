@@ -78,6 +78,16 @@ pub struct HostIdentityChallenge {
     pub timestamp: i64,
 }
 
+/// 主机身份确认撤销事件 Payload（host-identity:challenge-dismissed）
+/// 后端移除未决 challenge（被新指纹取代、会话关闭、异地解决或应用退出）时
+/// 通知前端撤下对应确认卡，UI 不得残留孤儿提示。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostIdentityChallengeDismissed {
+    pub challenge_id: String,
+    pub session_id: String,
+}
+
 /// challenge 类型：未知主机 / 已保存记录与呈现 key 不一致（主机指纹变化）
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HostIdentityChallengeKind {

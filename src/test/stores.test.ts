@@ -340,6 +340,27 @@ describe('Zustand stores', () => {
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
   });
 
+  it('后端撤销事件撤下对应确认卡，且不误删已被新 challenge 取代的投影', async () => {
+    const oldChallenge = {
+      challengeId: 'challenge-old', sessionId: 'session-1', host: '10.0.0.8', port: 22,
+      keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:old', timestamp: 1_710_000_000_000,
+    };
+    const cleanup = await useSessionStore.getState().initListeners();
+
+    // 撤销事件到达：撤下匹配的确认卡
+    emitMockEvent('host-identity:challenge', oldChallenge);
+    emitMockEvent('host-identity:challenge-dismissed', { challengeId: 'challenge-old', sessionId: 'session-1' });
+    expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
+
+    // 新 challenge 取代后，旧 challenge 的迟到撤销事件不得误删新投影
+    const newChallenge = { ...oldChallenge, challengeId: 'challenge-new', fingerprint: 'SHA256:new' };
+    emitMockEvent('host-identity:challenge', newChallenge);
+    emitMockEvent('host-identity:challenge-dismissed', { challengeId: 'challenge-old', sessionId: 'session-1' });
+    expect(useSessionStore.getState().hostKeyChallenges.get('session-1')).toEqual(newChallenge);
+
+    cleanup();
+  });
+
   it('主机身份确认事件按 sessionId 投影，接受后调用后端并清除确认卡', async () => {
     const challenge = {
       challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,

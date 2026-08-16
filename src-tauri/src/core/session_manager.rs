@@ -196,7 +196,7 @@ impl SessionManager {
             .remove(session_id)
             .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))?;
         // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
-        self.identity_service.cancel_session(session_id);
+        self.identity_service.cancel_session(app, session_id);
         // 通知所有工作线程退出
         handle.shutdown.store(true, Ordering::Relaxed);
         // 发送关闭命令到终端工作线程

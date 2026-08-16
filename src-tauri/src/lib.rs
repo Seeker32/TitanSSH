@@ -76,7 +76,9 @@ pub fn run() {
         .run(|app_handle, event| {
             // 应用退出：取消全部主机身份等待者，等待中的连接不进入认证
             if let tauri::RunEvent::Exit = event {
-                app_handle.state::<HostIdentityService>().cancel_all();
+                app_handle
+                    .state::<HostIdentityService>()
+                    .cancel_all(app_handle);
             }
         });
 }

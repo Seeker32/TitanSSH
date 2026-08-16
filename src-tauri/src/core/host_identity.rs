@@ -8,7 +8,9 @@
 
 use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host_identity::TrustedHostInfo;
-use crate::models::session::{HostIdentityChallenge, HostIdentityChallengeKind};
+use crate::models::session::{
+    HostIdentityChallenge, HostIdentityChallengeDismissed, HostIdentityChallengeKind,
+};
 use crate::storage::trust_store::{TrustRecord, TrustStore};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -17,6 +19,7 @@ use ssh2::HostKeyType;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Runtime};
 use uuid::Uuid;
 
@@ -64,6 +67,13 @@ enum Decision {
     Cancelled,
 }
 
+/// 已关闭 Session 的取消标记保留时长：必须超过最大可能仍在途的传输生命周期
+/// （连接总预算 CONNECT_TOTAL_TIMEOUT_SECS=15s 再留调度余量），否则过早清理
+/// 会让已死 Session 的迟到校验器创建无人取消的 orphan challenge。过期后清理，
+/// 防止 cancelled 集合随会话数无界增长（慢内存泄漏），并使极晚到达的复用
+/// session_id 不再被永久拒绝。
+const CANCELLED_RETENTION: Duration = Duration::from_secs(60);
+
 /// 一个 pending challenge：事件 payload + 等待者的唤醒点。
 /// decision 单独加锁，等待者不持有服务级状态锁。
 struct ChallengeWait {
@@ -93,8 +103,18 @@ struct IdentityState {
     /// 并发合并索引：同一 Session、endpoint 与指纹共用一个 challenge
     pending_index: HashMap<IdentityKey, String>,
     /// 已关闭（或应用退出）的 Session：迟到到达的校验器立即失败，
-    /// 不再创建无人取消的 pending challenge（等待者不得永久阻塞）
-    cancelled: HashSet<String>,
+    /// 不再创建无人取消的 pending challenge（等待者不得永久阻塞）。
+    /// 值为关闭时刻，超过 CANCELLED_RETENTION 的条目在检查/插入时被清理。
+    cancelled: HashMap<String, Instant>,
+}
+
+/// 判断 session_id 是否在取消保留期内；顺带清理过期条目保持集合有界。
+///
+/// 同时供 verify 的三处取消检查和 cancel_session 的插入前清理复用：
+/// 保留期内的标记拒绝校验，过期标记视同不存在。
+fn is_cancelled_recent(cancelled: &mut HashMap<String, Instant>, session_id: &str) -> bool {
+    cancelled.retain(|_, closed_at| closed_at.elapsed() < CANCELLED_RETENTION);
+    cancelled.contains_key(session_id)
 }
 
 impl IdentityKey {
@@ -132,7 +152,7 @@ impl HostIdentityService {
                 trusted: HashSet::new(),
                 pending: HashMap::new(),
                 pending_index: HashMap::new(),
-                cancelled: HashSet::new(),
+                cancelled: HashMap::new(),
             })),
             trust_store: Arc::new(Mutex::new(None)),
         }
@@ -165,7 +185,7 @@ impl HostIdentityService {
                 trusted: HashSet::new(),
                 pending: HashMap::new(),
                 pending_index: HashMap::new(),
-                cancelled: HashSet::new(),
+                cancelled: HashMap::new(),
             })),
             trust_store: Arc::new(Mutex::new(Some(store))),
         }
@@ -189,12 +209,35 @@ impl HostIdentityService {
     /// 已验证决定在信任记录被生命周期清理移除后仍持续到 Session 关闭；
     /// 已关闭 Session 的迟到校验器（含已保存 key 精确匹配）仍必须立即失败，
     /// 不得借持久化信任继续认证。
+    ///
+    /// challenge 事件派发失败（webview 已销毁、runtime 错误等）时移除 challenge
+    /// 并以 HostKeyVerificationCancelled 唤醒全部等待者，连接立即失败而非
+    /// 在用户看不到的 challenge 上永久阻塞。
     pub fn verify<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         session_id: &str,
         presented: &PresentedHostKey,
     ) -> Result<(), AppError> {
+        self.verify_with_emitter(app, session_id, presented, move |app, challenge| {
+            app.emit("host-identity:challenge", challenge)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// verify 的可注入派发 seam：emit 通过闭包注入，生产传入真实 app.emit，
+    /// 测试可注入失败派发以验证失败路径（见 emit_failure 测试）。
+    pub(crate) fn verify_with_emitter<R, Emit>(
+        &self,
+        app: &AppHandle<R>,
+        session_id: &str,
+        presented: &PresentedHostKey,
+        emit: Emit,
+    ) -> Result<(), AppError>
+    where
+        R: Runtime,
+        Emit: FnOnce(&AppHandle<R>, &HostIdentityChallenge) -> Result<(), String>,
+    {
         let key = IdentityKey {
             session_id: session_id.to_string(),
             host: presented.host.clone(),
@@ -202,13 +245,13 @@ impl HostIdentityService {
             fingerprint: presented.fingerprint.clone(),
         };
         {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // 会话已关闭：迟到校验器（如已发放给 Monitoring worker）立即失败，
             // 不再创建无人取消的 challenge
-            if state.cancelled.contains(session_id) {
+            if is_cancelled_recent(&mut state.cancelled, session_id) {
                 return Err(AppError::HostKeyVerificationCancelled(
                     session_id.to_string().into(),
                 ));
@@ -217,50 +260,18 @@ impl HostIdentityService {
                 return Ok(());
             }
         }
-        // 持久化信任：精确 host+port+算法+完整公钥匹配即静默放行；存储错误 fail-closed。
-        // 已保存记录与呈现 key 不一致时快照旧记录（Changed challenge 的展示与替换依据），
-        // 不在此处改动旧记录。
-        let stored_record: Option<TrustRecord> = if let Some(store) = self
-            .trust_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            match store.lookup(&presented.host, presented.port)? {
-                Some(record)
-                    if record.matches(
-                        &presented.host,
-                        presented.port,
-                        &presented.algorithm,
-                        &presented.blob,
-                    ) =>
-                {
-                    // 已验证决定按 Session 记录：信任记录被生命周期清理移除后，
-                    // 同 Session 的重连仍静默放行，直到 Session 关闭
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if state.cancelled.contains(session_id) {
-                        return Err(AppError::HostKeyVerificationCancelled(
-                            session_id.to_string().into(),
-                        ));
-                    }
-                    state.trusted.insert(key);
-                    return Ok(());
-                }
-                mismatch => mismatch,
-            }
-        } else {
-            None
-        };
+        // 第二次状态锁内完成 持久化匹配放行 与 challenge 创建：记录在状态锁内
+        // 重新读取（state → store，与 accept_and_save 同序）。锁外快照会让并发
+        // accept_and_save/forget_endpoint 留下 stale kind——他 Session 刚保存本 key
+        // 时仍弹 Unknown 挑战白白阻塞用户，或记录已删除仍展示 Changed。
+        // store 锁只覆盖 clone，不与 state 锁嵌套。
         let (wait, created, superseded) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // 两次状态锁之间会话可能被关闭：再次校验，不得为已关闭会话创建 challenge
-            if state.cancelled.contains(session_id) {
+            if is_cancelled_recent(&mut state.cancelled, session_id) {
                 return Err(AppError::HostKeyVerificationCancelled(
                     session_id.to_string().into(),
                 ));
@@ -268,16 +279,43 @@ impl HostIdentityService {
             if state.trusted.contains(&key) {
                 return Ok(());
             }
-            match state.pending_index.get(&key) {
-                Some(challenge_id) => (
-                    state
-                        .pending
-                        .get(challenge_id)
-                        .cloned()
-                        .expect("pending_index 与 pending 同步维护"),
-                    false,
-                    Vec::new(),
-                ),
+            // 持久化信任：精确 host+port+算法+完整公钥匹配即静默放行；存储错误 fail-closed。
+            // 已保存记录与呈现 key 不一致时快照旧记录（Changed challenge 的展示与替换依据），
+            // 不在此处改动旧记录。
+            let stored = self
+                .trust_store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let stored_record: Option<TrustRecord> = if let Some(store) = stored {
+                match store.lookup(&presented.host, presented.port)? {
+                    Some(record)
+                        if record.matches(
+                            &presented.host,
+                            presented.port,
+                            &presented.algorithm,
+                            &presented.blob,
+                        ) =>
+                    {
+                        // 已验证决定按 Session 记录：信任记录被生命周期清理移除后，
+                        // 同 Session 的重连仍静默放行，直到 Session 关闭
+                        state.trusted.insert(key);
+                        return Ok(());
+                    }
+                    mismatch => mismatch,
+                }
+            } else {
+                None
+            };
+            // pending_index 命中但 pending 缺失说明索引与 pending 脱同步
+            // （历史 bug / 未来重构残留）：不得在传输线程上 panic，按未命中处理
+            // 走创建分支；创建路径会以新 challenge 覆盖残留索引条目。
+            match state
+                .pending_index
+                .get(&key)
+                .and_then(|challenge_id| state.pending.get(challenge_id).cloned())
+            {
+                Some(wait) => (wait, false, Vec::new()),
                 None => {
                     // 同一 Session、同一 endpoint 已有 pending challenge 但指纹不同：
                     // 服务端在 challenge 之后再次更换 key。旧 challenge 必须被取代——
@@ -336,15 +374,49 @@ impl HostIdentityService {
                 }
             }
         };
-        // 被取代的旧 challenge 等待者一律取消：绝不借旧决定认证新 key
-        for old in superseded {
+        // 被取代的旧 challenge 等待者一律取消：绝不借旧决定认证新 key；
+        // 同时通知前端撤下旧确认卡（旧 challenge 已从 pending 移除）
+        for old in &superseded {
             Self::decide(&old, Decision::Cancelled);
+            Self::emit_challenge_dismissed(app, &old.challenge);
         }
-        // 仅首个到达的连接派发 challenge 事件；合并到同一 challenge 的等待者不重复派发
+        // 仅首个到达的连接派发 challenge 事件；合并到同一 challenge 的等待者不重复派发。
+        // 派发失败（webview 已销毁、runtime 错误等）时用户看不到确认提示：移除
+        // challenge 并以 Cancelled 唤醒全部等待者，连接以 HostKeyVerificationCancelled
+        // 立即失败，不得在无人可见的 challenge 上永久阻塞。
         if created {
-            let _ = app.emit("host-identity:challenge", &wait.challenge);
+            if let Err(error) = emit(app, &wait.challenge) {
+                log::error!(
+                    "host-identity challenge 事件派发失败（session {}，challenge {}）: {error}",
+                    wait.challenge.session_id,
+                    wait.challenge.challenge_id
+                );
+                if self.remove_pending(&wait.challenge.challenge_id).is_ok() {
+                    Self::decide(&wait, Decision::Cancelled);
+                }
+                return Err(AppError::HostKeyVerificationCancelled(
+                    format!("challenge 事件派发失败: {error}").into(),
+                ));
+            }
         }
         Self::wait_for_decision(&wait, session_id)
+    }
+
+    /// 派发 challenge 撤销通知；派发失败仅记日志（残留确认卡轻于连接安全影响）。
+    fn emit_challenge_dismissed<R: Runtime>(app: &AppHandle<R>, challenge: &HostIdentityChallenge) {
+        if let Err(error) = app.emit(
+            "host-identity:challenge-dismissed",
+            HostIdentityChallengeDismissed {
+                challenge_id: challenge.challenge_id.clone(),
+                session_id: challenge.session_id.clone(),
+            },
+        ) {
+            log::warn!(
+                "host-identity challenge 撤销事件派发失败（session {}，challenge {}）: {error}",
+                challenge.session_id,
+                challenge.challenge_id
+            );
+        }
     }
 
     /// 阻塞等待决定；不设独立自动超时，由用户决定或会话关闭唤醒。
@@ -404,13 +476,18 @@ impl HostIdentityService {
     ///
     /// 保存失败时 challenge 保持未决（不授予任何信任，不自动降级为临时信任），
     /// 以 HostKeySaveFailed 结构化返回，用户可重试保存、改选仅本次接受或拒绝。
-    /// 保存成功后，其他 Session 中同 endpoint + 同 key 的 pending challenge 一并放行。
+    /// 保存成功后，其他 Session 中同 endpoint + 同 key 的 pending challenge 一并放行，
+    /// 并派发撤销事件让对应 UI 撤下确认卡；发起保存的 challenge 由 UI 自行撤下。
     ///
     /// 状态锁覆盖「存在性检查 → 持久化 → 移除」全程：保存期间 challenge 无法被
     /// 取代/拒绝/重复解决，stale 决定（challenge 已不存在）在写盘前即失败，
-    /// 绝不把过时 key 写入信任存储。锁顺序为 state → trust store，与 verify 的
-    /// 短暂 store 锁（释放后再取 state 锁）不构成环。
-    pub fn accept_and_save(&self, challenge_id: &str) -> Result<(), AppError> {
+    /// 绝不把过时 key 写入信任存储。锁顺序为 state → trust store；verify 的 store
+    /// 锁仅覆盖 clone（let 绑定后即释放，不与 state 锁嵌套），不构成环。
+    pub fn accept_and_save<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        challenge_id: &str,
+    ) -> Result<(), AppError> {
         let (wait, released_others) = {
             let mut state = self
                 .state
@@ -471,6 +548,7 @@ impl HostIdentityService {
         Self::decide(&wait, Decision::Accepted);
         for other in released_others {
             Self::decide(&other, Decision::Accepted);
+            Self::emit_challenge_dismissed(app, &other.challenge);
         }
         Ok(())
     }
@@ -533,14 +611,21 @@ impl HostIdentityService {
 
     /// 会话关闭路径：取消该 Session 的全部等待者并清除临时信任；
     /// 关闭标签、关闭 Session 与应用退出均不得遗留可认证的连接。
-    pub fn cancel_session(&self, session_id: &str) {
+    /// 被移除的未决 challenge 派发撤销事件，前端据此撤下确认卡。
+    pub fn cancel_session<R: Runtime>(&self, app: &AppHandle<R>, session_id: &str) {
         let cancelled = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.trusted.retain(|key| key.session_id != session_id);
-            state.cancelled.insert(session_id.to_string());
+            // 插入前清理过期标记，集合大小与保留窗口内的关闭频率成正比而非会话总数
+            state
+                .cancelled
+                .retain(|_, closed_at| closed_at.elapsed() < CANCELLED_RETENTION);
+            state
+                .cancelled
+                .insert(session_id.to_string(), Instant::now());
             let targets: Vec<Arc<ChallengeWait>> = state
                 .pending
                 .iter()
@@ -557,21 +642,31 @@ impl HostIdentityService {
         };
         for wait in cancelled {
             Self::decide(&wait, Decision::Cancelled);
+            Self::emit_challenge_dismissed(app, &wait.challenge);
         }
     }
 
     /// 取消全部等待者（应用退出路径与测试使用）。
-    pub fn cancel_all(&self) {
-        let all: Vec<String> = {
+    ///
+    /// 退出后不再有迟到校验器需要拒绝，清空取消标记释放历史会话内存；
+    /// 被移除的未决 challenge 派发撤销事件。
+    pub fn cancel_all<R: Runtime>(&self, app: &AppHandle<R>) {
+        let all: Vec<Arc<ChallengeWait>> = {
             let state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.pending.keys().cloned().collect()
+            state.pending.values().cloned().collect()
         };
-        for challenge_id in all {
-            let _ = self.cancel_by_id(&challenge_id);
+        for wait in &all {
+            let _ = self.cancel_by_id(&wait.challenge.challenge_id);
+            Self::emit_challenge_dismissed(app, &wait.challenge);
         }
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled
+            .clear();
     }
 
     /// 移除 pending challenge 并返回等待者句柄；不存在则报错。

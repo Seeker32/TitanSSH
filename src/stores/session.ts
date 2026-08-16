@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
-import type { HostIdentityChallenge, SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
+import type { HostIdentityChallenge, HostIdentityChallengeDismissed, SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, toAppError, translate } from '@/i18n';
@@ -26,6 +26,7 @@ interface SessionState {
   applySessionStatus: (payload: SessionStatusEvent) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
   applyHostIdentityChallenge: (payload: HostIdentityChallenge) => void;
+  applyHostIdentityChallengeDismissed: (payload: HostIdentityChallengeDismissed) => void;
   acceptAndSaveHostIdentity: (sessionId: string) => Promise<void>;
   acceptHostIdentity: (sessionId: string) => Promise<void>;
   rejectHostIdentity: (sessionId: string) => Promise<void>;
@@ -193,6 +194,16 @@ export const useSessionStore = create<SessionState>((set, get) => {
       });
     },
 
+    /** 应用后端挑战撤销事件：仅当当前确认卡仍是同一 challenge 时撤下（含保存错误），
+     *  不得误删已被新 challenge 取代的投影（旧撤销迟到于新 challenge 事件时）。 */
+    applyHostIdentityChallengeDismissed(payload) {
+      set((state) => {
+        const current = state.hostKeyChallenges.get(payload.sessionId);
+        if (!current || current.challengeId !== payload.challengeId) return state;
+        return withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, payload.sessionId);
+      });
+    },
+
     /** 接受并保存：把 challenge 快照的公钥持久化为长期信任并放行当前 Session。
      *  保存失败（HostKeySaveFailed）时 challenge 保持未决，结构化错误显示在所属标签，
      *  绝不自动降级为临时信任；用户可重试保存、改选仅本次接受或拒绝。 */
@@ -262,10 +273,14 @@ export const useSessionStore = create<SessionState>((set, get) => {
       const unlistenChallenge = await listen<HostIdentityChallenge>('host-identity:challenge', (event) => {
         get().applyHostIdentityChallenge(event.payload);
       });
+      const unlistenDismissed = await listen<HostIdentityChallengeDismissed>('host-identity:challenge-dismissed', (event) => {
+        get().applyHostIdentityChallengeDismissed(event.payload);
+      });
       return () => {
         unlistenStatus();
         unlistenProgress();
         unlistenChallenge();
+        unlistenDismissed();
       };
     },
   };

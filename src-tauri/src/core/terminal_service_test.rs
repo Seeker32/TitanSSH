@@ -515,7 +515,7 @@ mod integration_tests {
             thread::sleep(Duration::from_millis(10));
         }
         // 关闭 Session：取消全部等待者并清除临时信任
-        identity.cancel_session("session-identity-cancel");
+        identity.cancel_session(app.handle(), "session-identity-cancel");
 
         assert_eq!(
             wait_for_final_status(&runtime_status, Duration::from_secs(2)),

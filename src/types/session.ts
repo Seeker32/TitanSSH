@@ -56,6 +56,13 @@ export interface HostIdentityChallenge {
 /** challenge 类型：未知主机 / 已保存记录与呈现 key 不一致（主机指纹变化） */
 export type HostIdentityChallengeKind = 'Unknown' | 'Changed';
 
+/** 后端撤销未决挑战的通知（host-identity:challenge-dismissed）：
+ *  被新指纹取代、会话关闭、异地解决或应用退出时派发，前端据此撤下确认卡。 */
+export interface HostIdentityChallengeDismissed {
+  challengeId: string;
+  sessionId: string;
+}
+
 export enum SessionStatus {
   Connecting = "Connecting",
   Connected = "Connected",

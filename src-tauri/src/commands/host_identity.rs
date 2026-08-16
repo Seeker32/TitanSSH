@@ -43,12 +43,13 @@ pub fn accept_host_identity(
 /// 前端保持确认卡并展示错误，可重试保存、改选仅本次接受或拒绝。
 #[tauri::command]
 pub fn accept_and_save_host_identity(
+    app: AppHandle,
     challenge_id: String,
     session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
     session_manager
         .identity_service()
-        .accept_and_save(&challenge_id)
+        .accept_and_save(&app, &challenge_id)
         .map_err(AppErrorInfo::from)
 }
 
