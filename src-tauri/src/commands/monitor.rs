@@ -55,5 +55,5 @@ pub fn get_monitor_status(
 ) -> Result<MonitorSnapshot, AppErrorInfo> {
     monitor_service
         .get_monitor_status(&session_id)
-        .ok_or_else(|| AppErrorInfo::from(AppError::SessionNotFound(session_id)))
+        .ok_or_else(|| AppErrorInfo::from(AppError::SessionNotFound(session_id.into())))
 }

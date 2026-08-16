@@ -9,7 +9,7 @@
 //! - 文件不可读 / 无法解析 = fail-closed 错误，绝不静默视为空；
 //! - endpoint 不做小写、尾点、别名或解析 IP 合并，保留配置中的精确拼写。
 
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use std::fs;
@@ -57,12 +57,18 @@ impl TrustStore {
     ///
     /// 首次运行自动创建数据目录；目录创建失败返回 StorageError。
     pub fn new<R: tauri::Runtime>(app_handle: &AppHandle<R>) -> Result<Self, AppError> {
-        let app_data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .map_err(|error| AppError::TrustStoreError(format!("无法获取应用数据目录: {error}")))?;
-        fs::create_dir_all(&app_data_dir)
-            .map_err(|error| AppError::TrustStoreError(format!("无法创建应用数据目录: {error}")))?;
+        let app_data_dir = app_handle.path().app_data_dir().map_err(|error| {
+            AppError::TrustStoreError(ErrorDetail::msg(
+                "无法获取应用数据目录: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
+        fs::create_dir_all(&app_data_dir).map_err(|error| {
+            AppError::TrustStoreError(ErrorDetail::msg(
+                "无法创建应用数据目录: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
         Ok(Self::from_file_path(
             app_data_dir.join(KNOWN_HOSTS_FILE_NAME),
         ))
@@ -180,19 +186,22 @@ fn load_from_file(file_path: &Path) -> Result<Vec<TrustRecord>, AppError> {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(AppError::TrustStoreError(format!(
-                "读取信任存储失败: {} ({error})",
-                file_path.display()
+            return Err(AppError::TrustStoreError(ErrorDetail::msg(
+                "读取信任存储失败: {0} ({1})",
+                vec![file_path.display().to_string(), error.to_string()],
             )));
         }
     };
     let mut records = Vec::new();
     for (index, line) in content.lines().enumerate() {
         if let Some(record) = parse_entry(line).map_err(|reason| {
-            AppError::TrustStoreError(format!(
-                "解析信任存储失败: {} 第 {} 行 ({reason})",
-                file_path.display(),
-                index + 1
+            AppError::TrustStoreError(ErrorDetail::msg(
+                "解析信任存储失败: {0} 第 {1} 行 ({2})",
+                vec![
+                    file_path.display().to_string(),
+                    (index + 1).to_string(),
+                    reason,
+                ],
             ))
         })? {
             records.push(record);
@@ -298,20 +307,33 @@ fn serialize_records(records: &[TrustRecord]) -> String {
 fn write_records(file_path: &Path, records: &[TrustRecord]) -> Result<(), AppError> {
     let content = serialize_records(records);
     let dir = file_path.parent().ok_or_else(|| {
-        AppError::TrustStoreError(format!("信任存储路径无父目录: {}", file_path.display()))
+        AppError::TrustStoreError(ErrorDetail::msg(
+            "信任存储路径无父目录: {0}",
+            vec![file_path.display().to_string()],
+        ))
     })?;
-    let mut temp = NamedTempFile::new_in(dir)
-        .map_err(|error| AppError::TrustStoreError(format!("创建信任存储临时文件失败: {error}")))?;
-    temp.write_all(content.as_bytes())
-        .map_err(|error| AppError::TrustStoreError(format!("写入信任存储临时文件失败: {error}")))?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|error| AppError::TrustStoreError(format!("同步信任存储临时文件失败: {error}")))?;
+    let mut temp = NamedTempFile::new_in(dir).map_err(|error| {
+        AppError::TrustStoreError(ErrorDetail::msg(
+            "创建信任存储临时文件失败: {0}",
+            vec![error.to_string()],
+        ))
+    })?;
+    temp.write_all(content.as_bytes()).map_err(|error| {
+        AppError::TrustStoreError(ErrorDetail::msg(
+            "写入信任存储临时文件失败: {0}",
+            vec![error.to_string()],
+        ))
+    })?;
+    temp.as_file().sync_all().map_err(|error| {
+        AppError::TrustStoreError(ErrorDetail::msg(
+            "同步信任存储临时文件失败: {0}",
+            vec![error.to_string()],
+        ))
+    })?;
     temp.persist(file_path).map_err(|error| {
-        AppError::TrustStoreError(format!(
-            "发布信任存储失败: {} ({})，原文件未受影响",
-            file_path.display(),
-            error.error
+        AppError::TrustStoreError(ErrorDetail::msg(
+            "发布信任存储失败: {0} ({1})，原文件未受影响",
+            vec![file_path.display().to_string(), error.error.to_string()],
         ))
     })?;
     Ok(())

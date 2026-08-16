@@ -151,7 +151,7 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
-            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))?
+            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))?
             .command_tx
             .clone();
         command_tx
@@ -168,7 +168,7 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
-            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))?
+            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))?
             .command_tx
             .clone();
         command_tx
@@ -194,7 +194,7 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id)
-            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))?;
+            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))?;
         // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
         self.identity_service.cancel_session(session_id);
         // 通知所有工作线程退出
@@ -253,7 +253,7 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
             .map(|handle| handle.host.clone())
-            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))
+            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))
     }
 }
 

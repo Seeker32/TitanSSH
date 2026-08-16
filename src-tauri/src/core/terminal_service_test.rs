@@ -2,7 +2,7 @@
 mod integration_tests {
     use crate::core::host_identity::{HostIdentityService, HostKeyVerifier, PresentedHostKey};
     use crate::core::terminal_service::*;
-    use crate::errors::app_error::AppError;
+    use crate::errors::app_error::{AppError, ErrorDetail};
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::session::SessionStatus;
     use serde_json::json;
@@ -77,7 +77,11 @@ mod integration_tests {
         assert!(result.is_err(), "缺少 password_ref 时应返回错误");
         match result.unwrap_err() {
             AppError::InvalidHostConfig(msg) => {
-                assert!(msg.contains("密码"), "错误消息应提及密码，实际: {}", msg);
+                assert!(
+                    msg.to_string().contains("密码"),
+                    "错误消息应提及密码，实际: {}",
+                    msg
+                );
             }
             other => panic!("期望 InvalidHostConfig，实际: {:?}", other),
         }
@@ -92,7 +96,7 @@ mod integration_tests {
         match result.unwrap_err() {
             AppError::InvalidHostConfig(msg) => {
                 assert!(
-                    msg.contains("私钥路径"),
+                    msg.to_string().contains("私钥路径"),
                     "错误消息应提及私钥路径，实际: {}",
                     msg
                 );
@@ -117,51 +121,47 @@ mod integration_tests {
     /// 验证认证错误映射：AuthenticationError → SessionStatus::AuthFailed
     #[test]
     fn auth_error_maps_to_auth_failed_status() {
-        let error = AppError::AuthenticationError("wrong password".to_string());
+        let error = AppError::AuthenticationError("wrong password".to_string().into());
         let (status, message) = map_phase_error_to_status(&ConnectionPhase::Authenticating, &error);
         assert_eq!(
             status,
             SessionStatus::AuthFailed,
             "认证错误应映射为 AuthFailed"
         );
-        assert!(
-            message.contains("认证失败"),
-            "消息应包含认证失败，实际: {}",
-            message
+        // 直接转发结构化错误：code 稳定，前端据此本地化“认证失败”摘要
+        assert_eq!(
+            message.unwrap().code,
+            "AuthenticationError",
+            "应转发原错误 code"
         );
     }
 
     /// 验证连接超时错误映射：SshConnectionError("Connection timeout") → SessionStatus::Timeout
     #[test]
     fn connection_timeout_error_maps_to_timeout_status() {
-        let error = AppError::SshConnectionError("Connection timeout after 30s".to_string());
+        let error = AppError::SshConnectionError("Connection timeout after 30s".to_string().into());
         let (status, message) = map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &error);
         assert_eq!(status, SessionStatus::Timeout, "超时错误应映射为 Timeout");
-        assert!(
-            message.contains("超时"),
-            "消息应包含超时，实际: {}",
-            message
-        );
+        // 阶段超时文案作为 detailKey 下发，前端按语言翻译
+        let message = message.unwrap();
+        assert_eq!(message.code, "Timeout");
+        assert_eq!(message.detail_key.as_deref(), Some("建立 TCP 连接超时"));
     }
 
     /// 验证网络连接错误映射：SshConnectionError（非超时）→ SessionStatus::Error
     #[test]
     fn network_error_maps_to_error_status() {
-        let error = AppError::SshConnectionError("Connection refused".to_string());
+        let error = AppError::SshConnectionError("Connection refused".to_string().into());
         let (status, message) = map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &error);
         assert_eq!(status, SessionStatus::Error, "网络错误应映射为 Error");
-        assert!(
-            message.contains("网络连接失败"),
-            "消息应包含网络连接失败，实际: {}",
-            message
-        );
+        assert_eq!(message.unwrap().code, "SshConnectionError");
     }
 
     /// 验证 SSH 协议错误映射为 SessionStatus::Error。
     #[test]
     fn ssh_protocol_error_maps_to_error_status() {
         // 使用 StorageError 模拟其他协议错误的映射路径。
-        let error = AppError::StorageError("handshake failed".to_string());
+        let error = AppError::StorageError("handshake failed".to_string().into());
         let (status, _message) = map_phase_error_to_status(&ConnectionPhase::SshHandshake, &error);
         assert_eq!(status, SessionStatus::Error, "其他错误应映射为 Error");
     }
@@ -169,16 +169,18 @@ mod integration_tests {
     /// 验证不同 SshConnectionError 消息的超时判断边界
     #[test]
     fn connection_timeout_detection_accepts_multiple_message_shapes() {
-        let timeout_err = AppError::SshConnectionError("Connection timeout".to_string());
+        let timeout_err = AppError::SshConnectionError("Connection timeout".to_string().into());
         let (status, _) = map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &timeout_err);
         assert_eq!(status, SessionStatus::Timeout);
 
-        let lower_case_err = AppError::SshConnectionError("connection timed out".to_string());
+        let lower_case_err =
+            AppError::SshConnectionError("connection timed out".to_string().into());
         let (status2, _) =
             map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &lower_case_err);
         assert_eq!(status2, SessionStatus::Timeout);
 
-        let chinese_err = AppError::SshConnectionError("网络连接超时".to_string());
+        let chinese_err =
+            AppError::SshConnectionError(ErrorDetail::msg("网络连接超时", Vec::new()));
         let (status3, _) = map_phase_error_to_status(&ConnectionPhase::ConnectingTcp, &chinese_err);
         assert_eq!(status3, SessionStatus::Timeout);
     }
@@ -224,41 +226,34 @@ mod integration_tests {
     /// 验证凭据不存在错误映射：CredentialNotFound → SessionStatus::Error + 引导提示
     ///
     /// 区别于通用 SecureStoreError，CredentialNotFound 应给出明确的"重新保存"引导，
-    /// 而不是让用户面对无意义的技术错误消息。
+    /// 而不是让用户面对无意义的技术错误消息。引导文案由前端按 code 本地化，
+    /// 后端只转发结构化错误与 key 诊断。
     #[test]
     fn credential_not_found_maps_to_error_with_guidance_message() {
         let key = "titanssh-host-abc-password";
-        let error = AppError::CredentialNotFound(key.to_string());
+        let error = AppError::CredentialNotFound(key.to_string().into());
         let (status, message) =
             map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
 
         assert_eq!(status, SessionStatus::Error, "凭据不存在应映射为 Error");
-        assert!(
-            message.contains("凭据不存在"),
-            "消息应包含凭据不存在，实际: {message}"
-        );
-        assert!(
-            message.contains("重新编辑主机配置"),
-            "消息应引导用户重新保存凭据，实际: {message}"
-        );
-        assert!(
-            message.contains(key),
-            "消息应包含具体的 key 便于诊断，实际: {message}"
+        let message = message.unwrap();
+        assert_eq!(message.code, "CredentialNotFound");
+        assert_eq!(
+            message.detail.as_deref(),
+            Some(key),
+            "应携带具体的 key 便于诊断"
         );
     }
 
     /// 验证 SecureStoreError（非超时）仍映射为通用 Error，不与 CredentialNotFound 混淆
     #[test]
     fn secure_store_error_non_timeout_maps_to_generic_error() {
-        let error = AppError::SecureStoreError("keychain locked".to_string());
+        let error = AppError::SecureStoreError("keychain locked".to_string().into());
         let (status, message) =
             map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
 
         assert_eq!(status, SessionStatus::Error, "安全存储错误应映射为 Error");
-        assert!(
-            message.contains("凭据读取失败"),
-            "消息应包含凭据读取失败，实际: {message}"
-        );
+        assert_eq!(message.unwrap().code, "SecureStoreError");
     }
 
     /// 构建模拟 transport 顺序的连接函数：握手后、认证前调用统一校验器。
@@ -534,26 +529,26 @@ mod integration_tests {
         );
     }
 
-    /// 用户拒绝主机身份映射为 Error 状态并保留结构化语义。
+    /// 用户拒绝主机身份映射为 Error 状态并转发结构化语义。
     #[test]
     fn host_key_rejected_maps_to_error_status() {
         let (status, message) = map_phase_error_to_status(
             &ConnectionPhase::VerifyingHostKey,
-            &AppError::HostKeyRejected("10.0.0.8:22 (SHA256:xxx)".to_string()),
+            &AppError::HostKeyRejected("10.0.0.8:22 (SHA256:xxx)".to_string().into()),
         );
         assert_eq!(status, SessionStatus::Error);
-        assert!(message.contains("已拒绝未知主机身份"));
+        assert_eq!(message.unwrap().code, "HostKeyRejected");
     }
 
-    /// 会话关闭取消的主机身份验证映射为 Error 状态。
+    /// 会话关闭取消的主机身份验证映射为 Error 状态并转发结构化语义。
     #[test]
     fn host_key_cancelled_maps_to_error_status() {
         let (status, message) = map_phase_error_to_status(
             &ConnectionPhase::VerifyingHostKey,
-            &AppError::HostKeyVerificationCancelled("session-1".to_string()),
+            &AppError::HostKeyVerificationCancelled("session-1".to_string().into()),
         );
         assert_eq!(status, SessionStatus::Error);
-        assert!(message.contains("主机身份验证"));
+        assert_eq!(message.unwrap().code, "HostKeyVerificationCancelled");
     }
 
     /// 首次系统授权超过五秒后，成功读取的凭据仍应继续进入 SSH 连接阶段
@@ -585,7 +580,7 @@ mod integration_tests {
             Box::new(|_host, _password, _passphrase, _verifier, on_phase| {
                 on_phase(ConnectPhase::ConnectingTcp);
                 Err(AppError::SshConnectionError(
-                    "connection refused".to_string(),
+                    "connection refused".to_string().into(),
                 ))
             }),
             Duration::from_secs(15),

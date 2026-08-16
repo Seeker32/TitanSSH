@@ -25,9 +25,9 @@ pub fn open_session(
         .get_host(&host_id)
         .map_err(AppErrorInfo::from)?
         .ok_or_else(|| {
-            AppErrorInfo::from(AppError::InvalidHostConfig(format!(
-                "Host not found: {host_id}"
-            )))
+            AppErrorInfo::from(AppError::InvalidHostConfig(
+                format!("Host not found: {host_id}").into(),
+            ))
         })?;
 
     // 路由到 session_manager 协调层，由其启动 terminal_service

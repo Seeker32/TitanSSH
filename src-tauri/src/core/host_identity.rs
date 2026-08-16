@@ -6,7 +6,7 @@
 //! endpoint+指纹后续连接（含重连）直接放行，Session 关闭即清除。
 //! 不把策略复制到各 capability service。
 
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host_identity::TrustedHostInfo;
 use crate::models::session::{HostIdentityChallenge, HostIdentityChallengeKind};
 use crate::storage::trust_store::{TrustRecord, TrustStore};
@@ -210,7 +210,7 @@ impl HostIdentityService {
             // 不再创建无人取消的 challenge
             if state.cancelled.contains(session_id) {
                 return Err(AppError::HostKeyVerificationCancelled(
-                    session_id.to_string(),
+                    session_id.to_string().into(),
                 ));
             }
             if state.trusted.contains(&key) {
@@ -243,7 +243,7 @@ impl HostIdentityService {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.cancelled.contains(session_id) {
                         return Err(AppError::HostKeyVerificationCancelled(
-                            session_id.to_string(),
+                            session_id.to_string().into(),
                         ));
                     }
                     state.trusted.insert(key);
@@ -262,7 +262,7 @@ impl HostIdentityService {
             // 两次状态锁之间会话可能被关闭：再次校验，不得为已关闭会话创建 challenge
             if state.cancelled.contains(session_id) {
                 return Err(AppError::HostKeyVerificationCancelled(
-                    session_id.to_string(),
+                    session_id.to_string().into(),
                 ));
             }
             if state.trusted.contains(&key) {
@@ -359,12 +359,15 @@ impl HostIdentityService {
                 wait.waiting.fetch_sub(1, Ordering::Relaxed);
                 return match decided {
                     Decision::Accepted => Ok(()),
-                    Decision::Rejected => Err(AppError::HostKeyRejected(format!(
-                        "{}:{} ({})",
-                        wait.challenge.host, wait.challenge.port, wait.challenge.fingerprint
-                    ))),
+                    Decision::Rejected => Err(AppError::HostKeyRejected(
+                        format!(
+                            "{}:{} ({})",
+                            wait.challenge.host, wait.challenge.port, wait.challenge.fingerprint
+                        )
+                        .into(),
+                    )),
                     Decision::Cancelled => Err(AppError::HostKeyVerificationCancelled(
-                        session_id.to_string(),
+                        session_id.to_string().into(),
                     )),
                 };
             }
@@ -384,10 +387,9 @@ impl HostIdentityService {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let wait = state
-                .pending
-                .remove(challenge_id)
-                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
+            let wait = state.pending.remove(challenge_id).ok_or_else(|| {
+                AppError::HostKeyChallengeNotFound(challenge_id.to_string().into())
+            })?;
             let key = IdentityKey::from_challenge(&wait.challenge);
             state.pending_index.remove(&key);
             state.trusted.insert(key);
@@ -415,11 +417,9 @@ impl HostIdentityService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // challenge 已被取代/拒绝/重复解决：stale 决定在写盘前安全失败
-            let wait = state
-                .pending
-                .get(challenge_id)
-                .cloned()
-                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
+            let wait = state.pending.get(challenge_id).cloned().ok_or_else(|| {
+                AppError::HostKeyChallengeNotFound(challenge_id.to_string().into())
+            })?;
 
             // 持久化：trust store 内部串行化读写并安全发布，失败不改动旧记录。
             // 写入失败时本 challenge 尚未从 pending 移除，保持未决。
@@ -429,7 +429,10 @@ impl HostIdentityService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
                 .ok_or_else(|| {
-                    AppError::HostKeySaveFailed("信任存储未初始化，无法持久化信任记录".to_string())
+                    AppError::HostKeySaveFailed(ErrorDetail::msg(
+                        "信任存储未初始化，无法持久化信任记录",
+                        Vec::new(),
+                    ))
                 })?;
             store
                 .upsert(TrustRecord {
@@ -438,7 +441,7 @@ impl HostIdentityService {
                     algorithm: wait.challenge.key_algorithm.clone(),
                     blob: wait.presented_blob.clone(),
                 })
-                .map_err(|error| AppError::HostKeySaveFailed(error.to_string()))?;
+                .map_err(|error| AppError::HostKeySaveFailed(error.to_string().into()))?;
 
             // 移除本 challenge + 写入临时信任；同 endpoint + 同 key 的
             // 其他 Session pending challenge 一并移除（其等待者由持久化信任覆盖）
@@ -485,7 +488,10 @@ impl HostIdentityService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .ok_or_else(|| {
-                AppError::TrustStoreError("信任存储未初始化，无法清理信任记录".to_string())
+                AppError::TrustStoreError(ErrorDetail::msg(
+                    "信任存储未初始化，无法清理信任记录",
+                    Vec::new(),
+                ))
             })?;
         store.remove(host, port)
     }
@@ -575,10 +581,9 @@ impl HostIdentityService {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let wait = state
-                .pending
-                .remove(challenge_id)
-                .ok_or_else(|| AppError::HostKeyChallengeNotFound(challenge_id.to_string()))?;
+            let wait = state.pending.remove(challenge_id).ok_or_else(|| {
+                AppError::HostKeyChallengeNotFound(challenge_id.to_string().into())
+            })?;
             state
                 .pending_index
                 .remove(&IdentityKey::from_challenge(&wait.challenge));

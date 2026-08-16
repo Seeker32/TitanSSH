@@ -3,8 +3,7 @@ use crate::core::ssh_transport::{self, SftpTransport};
 use crate::core::transfer_pool::{
     CheckoutError, TRANSFER_IDLE_TIMEOUT, TransferCheckout, TransferClock, TransferPool,
 };
-use crate::errors::app_error::AppError;
-use crate::errors::app_error::AppErrorInfo;
+use crate::errors::app_error::{AppError, AppErrorInfo, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::sftp::{
     ConflictStrategy, RemoteEntry, SftpProgressEvent, SftpTaskStatus, SftpTaskStatusEvent,
@@ -190,10 +189,13 @@ impl SftpConnection {
                 ConnectionState::Failed(message) => {
                     let message = message.clone();
                     *state = ConnectionState::Idle;
-                    return Err(AppError::SftpChannelError(message));
+                    return Err(AppError::SftpChannelError(message.into()));
                 }
                 ConnectionState::Closed => {
-                    return Err(AppError::SftpChannelError("session 已关闭".to_string()));
+                    return Err(AppError::SftpChannelError(ErrorDetail::msg(
+                        "session 已关闭",
+                        Vec::new(),
+                    )));
                 }
                 ConnectionState::Idle => {
                     *state = ConnectionState::Connecting;
@@ -205,7 +207,10 @@ impl SftpConnection {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if matches!(*state, ConnectionState::Closed) {
                         self.ready.notify_all();
-                        return Err(AppError::SftpChannelError("session 已关闭".to_string()));
+                        return Err(AppError::SftpChannelError(ErrorDetail::msg(
+                            "session 已关闭",
+                            Vec::new(),
+                        )));
                     }
                     match result {
                         Ok(transport) => {
@@ -452,7 +457,12 @@ impl SftpService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
             .cloned()
-            .ok_or_else(|| AppError::SftpChannelError(format!("session {} 不存在", session_id)))
+            .ok_or_else(|| {
+                AppError::SftpChannelError(ErrorDetail::msg(
+                    "session {0} 不存在",
+                    vec![session_id.to_string()],
+                ))
+            })
     }
 
     /// 列举远程目录内容，按目录优先、名称排序
@@ -544,19 +554,22 @@ impl SftpService {
         app: AppHandle<R>,
     ) -> Result<TransferTask, AppError> {
         // 验证本地路径父目录可写
-        let parent = Path::new(&local_path)
-            .parent()
-            .ok_or_else(|| AppError::SftpTransferError("本地路径无效".to_string()))?;
+        let parent = Path::new(&local_path).parent().ok_or_else(|| {
+            AppError::SftpTransferError(ErrorDetail::msg("本地路径无效", Vec::new()))
+        })?;
         if !parent.exists() {
-            return Err(AppError::SftpTransferError(format!(
-                "本地目录不存在: {}",
-                parent.display()
+            return Err(AppError::SftpTransferError(ErrorDetail::msg(
+                "本地目录不存在: {0}",
+                vec![parent.display().to_string()],
             )));
         }
         // 最终目标必须包含文件名：临时文件以目标文件名为基、与目标同目录，
         // 无法满足时宁可拒绝也不降级到其他目录
         if Path::new(&local_path).file_name().is_none() {
-            return Err(AppError::SftpTransferError("本地路径无效".to_string()));
+            return Err(AppError::SftpTransferError(ErrorDetail::msg(
+                "本地路径无效",
+                Vec::new(),
+            )));
         }
 
         let handle = self.handle(&session_id)?;
@@ -578,7 +591,7 @@ impl SftpService {
                     && task.local_path == local_path
             });
             if occupied {
-                return Err(AppError::SftpTargetBusy(local_path));
+                return Err(AppError::SftpTargetBusy(local_path.into()));
             }
         }
 
@@ -651,9 +664,9 @@ impl SftpService {
     ) -> Result<TransferTask, AppError> {
         // 验证本地文件存在
         if !Path::new(&local_path).exists() {
-            return Err(AppError::SftpTransferError(format!(
-                "本地文件不存在: {}",
-                local_path
+            return Err(AppError::SftpTransferError(ErrorDetail::msg(
+                "本地文件不存在: {0}",
+                vec![local_path],
             )));
         }
 
@@ -691,7 +704,7 @@ impl SftpService {
                     && task.remote_path == full_remote_path
             });
             if occupied {
-                return Err(AppError::SftpTargetBusy(full_remote_path));
+                return Err(AppError::SftpTargetBusy(full_remote_path.into()));
             }
         }
 
@@ -770,7 +783,7 @@ impl SftpService {
             .cloned();
         match task {
             Some(task) if is_terminal(&task.status) => Ok(()),
-            _ => Err(AppError::SftpTaskNotFound(task_id.to_string())),
+            _ => Err(AppError::SftpTaskNotFound(task_id.to_string().into())),
         }
     }
 
@@ -1026,7 +1039,7 @@ impl SftpService {
                         &session_id,
                         SftpTaskStatus::Failed,
                         Some(AppErrorInfo::from(AppError::SftpTransferError(
-                            join_error.to_string(),
+                            join_error.to_string().into(),
                         ))),
                     );
                     return;
@@ -1054,7 +1067,7 @@ impl SftpService {
                             &session_id,
                             SftpTaskStatus::Failed,
                             Some(AppErrorInfo::from(AppError::SftpTransferError(
-                                "全局传输信号量已关闭".to_string(),
+                                ErrorDetail::msg("全局传输信号量已关闭", Vec::new()),
                             ))),
                         );
                         return;
@@ -1123,7 +1136,9 @@ impl SftpService {
                     (outcome, healthy)
                 }
                 Err(join_error) => (
-                    TransferOutcome::Failed(AppError::SftpTransferError(join_error.to_string())),
+                    TransferOutcome::Failed(AppError::SftpTransferError(
+                        join_error.to_string().into(),
+                    )),
                     false,
                 ),
             };
@@ -1224,7 +1239,7 @@ fn run_op_locked<T>(
 ) -> Result<T, AppError> {
     let mut sftp = transport
         .lock()
-        .map_err(|error| AppError::SftpChannelError(error.to_string()))?;
+        .map_err(|error| AppError::SftpChannelError(error.to_string().into()))?;
     op(&mut sftp)
 }
 
@@ -1236,10 +1251,9 @@ fn connect_sftp_for_host(
 ) -> Result<SftpTransport, AppError> {
     let (password, passphrase) = match host.auth_type {
         AuthType::Password => {
-            let password_ref = host
-                .password_ref
-                .as_deref()
-                .ok_or_else(|| AppError::InvalidHostConfig("密码引用为空".to_string()))?;
+            let password_ref = host.password_ref.as_deref().ok_or_else(|| {
+                AppError::InvalidHostConfig(ErrorDetail::msg("密码引用为空", Vec::new()))
+            })?;
             (Some(secure_store::get_credential(password_ref)?), None)
         }
         AuthType::PrivateKey => {
@@ -1293,7 +1307,7 @@ fn run_transfer_blocking<R: Runtime>(
     let mut sftp = match transport.lock() {
         Ok(sftp) => sftp,
         Err(error) => {
-            return TransferOutcome::Failed(AppError::SftpChannelError(error.to_string()));
+            return TransferOutcome::Failed(AppError::SftpChannelError(error.to_string().into()));
         }
     };
 
@@ -1341,11 +1355,9 @@ fn run_transfer_blocking<R: Runtime>(
             let mut local_file = match std::fs::File::create(&temp_path) {
                 Ok(file) => file,
                 Err(error) => {
-                    return TransferOutcome::Failed(AppError::SftpCreateError(format!(
-                        "{} ({})",
-                        temp_path.display(),
-                        error
-                    )));
+                    return TransferOutcome::Failed(AppError::SftpCreateError(
+                        format!("{} ({})", temp_path.display(), error).into(),
+                    ));
                 }
             };
 
@@ -1365,7 +1377,7 @@ fn run_transfer_blocking<R: Runtime>(
                 let n = match remote_file.read(&mut buf) {
                     Ok(n) => n,
                     Err(error) => {
-                        let primary = AppError::SftpReadError(error.to_string());
+                        let primary = AppError::SftpReadError(error.to_string().into());
                         return TransferOutcome::Failed(merge_cleanup_failure(
                             primary,
                             cleanup_temp!(),
@@ -1376,7 +1388,7 @@ fn run_transfer_blocking<R: Runtime>(
                     break;
                 }
                 if let Err(error) = local_file.write_all(&buf[..n]) {
-                    let primary = AppError::SftpWriteError(error.to_string());
+                    let primary = AppError::SftpWriteError(error.to_string().into());
                     return TransferOutcome::Failed(merge_cleanup_failure(
                         primary,
                         cleanup_temp!(),
@@ -1388,7 +1400,7 @@ fn run_transfer_blocking<R: Runtime>(
 
             // 成功刷新并关闭后才允许发布：任何失败都不得触碰最终目标
             if let Err(error) = local_file.flush().and_then(|_| local_file.sync_all()) {
-                let primary = AppError::SftpWriteError(error.to_string());
+                let primary = AppError::SftpWriteError(error.to_string().into());
                 return TransferOutcome::Failed(merge_cleanup_failure(primary, cleanup_temp!()));
             }
             drop(local_file);
@@ -1418,7 +1430,9 @@ fn run_transfer_blocking<R: Runtime>(
             let mut local_file = match std::fs::File::open(local_path) {
                 Ok(file) => file,
                 Err(error) => {
-                    return TransferOutcome::Failed(AppError::SftpOpenError(error.to_string()));
+                    return TransferOutcome::Failed(AppError::SftpOpenError(
+                        error.to_string().into(),
+                    ));
                 }
             };
             // 与最终目标同目录、包含 taskId 的唯一远端临时文件：发布前旧目标不受影响
@@ -1446,7 +1460,7 @@ fn run_transfer_blocking<R: Runtime>(
                 let n = match local_file.read(&mut buf) {
                     Ok(n) => n,
                     Err(error) => {
-                        let primary = AppError::SftpReadError(error.to_string());
+                        let primary = AppError::SftpReadError(error.to_string().into());
                         return TransferOutcome::Failed(merge_cleanup_failure(
                             primary,
                             cleanup_remote_temp!(),
@@ -1457,7 +1471,7 @@ fn run_transfer_blocking<R: Runtime>(
                     break;
                 }
                 if let Err(error) = remote_file.write_all(&buf[..n]) {
-                    let primary = AppError::SftpWriteError(error.to_string());
+                    let primary = AppError::SftpWriteError(error.to_string().into());
                     return TransferOutcome::Failed(merge_cleanup_failure(
                         primary,
                         cleanup_remote_temp!(),
@@ -1470,7 +1484,7 @@ fn run_transfer_blocking<R: Runtime>(
             // 刷新后关闭远端句柄（FXP_CLOSE 使服务器落定已提交写入）才允许发布：
             // 任何失败都不得触碰远端最终目标
             if let Err(error) = remote_file.flush() {
-                let primary = AppError::SftpWriteError(error.to_string());
+                let primary = AppError::SftpWriteError(error.to_string().into());
                 return TransferOutcome::Failed(merge_cleanup_failure(
                     primary,
                     cleanup_remote_temp!(),
@@ -1545,7 +1559,7 @@ fn publish_upload_file(
         Err(error) => return Err(error),
     };
     if exists && strategy == ConflictStrategy::Reject {
-        return Err(AppError::SftpTargetExists(target_path.to_string()));
+        return Err(AppError::SftpTargetExists(target_path.to_string().into()));
     }
     if !exists {
         // 目标不存在：no-clobber 发布；Overwrite 策略下竞态出现的目标同样被拒，
@@ -1563,9 +1577,9 @@ fn publish_upload_file(
 fn cleanup_upload_temp(sftp: &mut SftpTransport, temp_path: &str) -> Result<(), AppError> {
     match sftp.unlink(temp_path) {
         Ok(()) => Ok(()),
-        Err(error) => Err(AppError::SftpTransferError(format!(
-            "清理临时文件失败: {} ({})",
-            temp_path, error
+        Err(error) => Err(AppError::SftpTransferError(ErrorDetail::msg(
+            "清理临时文件失败: {0} ({1})",
+            vec![temp_path.to_string(), error.to_string()],
         ))),
     }
 }
@@ -1578,10 +1592,9 @@ fn cleanup_download_temp(temp_path: &Path) -> Result<(), AppError> {
         return Ok(());
     }
     std::fs::remove_file(temp_path).map_err(|error| {
-        AppError::SftpTransferError(format!(
-            "清理临时文件失败: {} ({})",
-            temp_path.display(),
-            error
+        AppError::SftpTransferError(ErrorDetail::msg(
+            "清理临时文件失败: {0} ({1})",
+            vec![temp_path.display().to_string(), error.to_string()],
         ))
     })
 }
@@ -1609,21 +1622,19 @@ fn publish_download_file(
 ) -> Result<(), AppError> {
     if strategy == ConflictStrategy::Reject && target_path.exists() {
         return Err(AppError::SftpTargetExists(
-            target_path.display().to_string(),
+            target_path.display().to_string().into(),
         ));
     }
     let file = std::fs::File::open(temp_path).map_err(|error| {
-        AppError::SftpPublishError(format!(
-            "打开临时文件失败: {} ({})",
-            temp_path.display(),
-            error
+        AppError::SftpPublishError(ErrorDetail::msg(
+            "打开临时文件失败: {0} ({1})",
+            vec![temp_path.display().to_string(), error.to_string()],
         ))
     })?;
     let temp_path_owned = TempPath::try_from_path(temp_path.to_path_buf()).map_err(|error| {
-        AppError::SftpPublishError(format!(
-            "登记临时文件失败: {} ({})",
-            temp_path.display(),
-            error
+        AppError::SftpPublishError(ErrorDetail::msg(
+            "登记临时文件失败: {0} ({1})",
+            vec![temp_path.display().to_string(), error.to_string()],
         ))
     })?;
     let named = NamedTempFile::from_parts(file, temp_path_owned);
@@ -1648,13 +1659,15 @@ fn publish_download_file(
             let already_exists = strategy == ConflictStrategy::Reject
                 && error.kind() == std::io::ErrorKind::AlreadyExists;
             let app_error = if already_exists {
-                AppError::SftpTargetExists(target_path.display().to_string())
+                AppError::SftpTargetExists(target_path.display().to_string().into())
             } else {
-                AppError::SftpPublishError(format!(
-                    "发布失败: {} -> {} ({})，目标原文件未受影响",
-                    temp_path.display(),
-                    target_path.display(),
-                    error
+                AppError::SftpPublishError(ErrorDetail::msg(
+                    "发布失败: {0} -> {1} ({2})，目标原文件未受影响",
+                    vec![
+                        temp_path.display().to_string(),
+                        target_path.display().to_string(),
+                        error.to_string(),
+                    ],
                 ))
             };
             match cleanup_failure {

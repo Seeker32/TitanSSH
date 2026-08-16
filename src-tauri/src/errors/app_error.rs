@@ -1,12 +1,74 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
-/// 跨 Tauri 边界的稳定错误 payload；detail 保留底层诊断供前端本地化摘要后展示。
+/// 结构化错误详情，gettext msgid 风格：中文固定文案即翻译 key。
+///
+/// 固定文案与语言无关参数（底层错误文本、路径、endpoint 等）分离：
+/// 中文模板留在后端日志里保持可读，前端按当前语言渲染翻译。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrorDetail {
+    /// 纯机器诊断文本（无固定文案），如底层库错误、文件路径
+    Raw(String),
+    /// 中文固定文案模板 + 语言无关参数；模板用 {0}/{1} 占位参数
+    Msg { key: String, params: Vec<String> },
+}
+
+impl ErrorDetail {
+    /// 中文固定文案模板 + 语言无关参数（gettext msgid 风格 key）。
+    pub fn msg(key: &str, params: Vec<String>) -> Self {
+        Self::Msg {
+            key: key.to_string(),
+            params,
+        }
+    }
+}
+
+impl From<String> for ErrorDetail {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+
+impl fmt::Display for ErrorDetail {
+    /// 后端日志渲染：模板占位按序替换；无占位的参数（with_appended_detail 追加）
+    /// 以「；」连接在末尾。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Raw(text) => write!(f, "{text}"),
+            Self::Msg { key, params } => {
+                let mut rendered = key.clone();
+                for (index, param) in params.iter().enumerate() {
+                    let placeholder = format!("{{{index}}}");
+                    if rendered.contains(&placeholder) {
+                        rendered = rendered.replacen(&placeholder, param, 1);
+                    } else {
+                        rendered.push('；');
+                        rendered.push_str(param);
+                    }
+                }
+                write!(f, "{rendered}")
+            }
+        }
+    }
+}
+
+/// 跨 Tauri 边界的稳定错误 payload；code 为稳定英文代码供前端本地化摘要，
+/// detail 为纯机器诊断（结构化详情时为 None），detailKey/detailParams 承载可翻译
+/// 固定文案模板与参数。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppErrorInfo {
     pub code: String,
+    /// 纯机器诊断文本（Raw 详情）；结构化详情时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// 固定文案翻译 key（gettext msgid，中文源文案）；前端按当前语言渲染
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_key: Option<String>,
+    /// 与 detailKey 模板 {0}/{1} 占位对应的语言无关参数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_params: Option<Vec<String>>,
 }
 
 /// 应用层错误枚举，覆盖 SSH 连接、认证、会话、存储等所有错误场景
@@ -17,23 +79,23 @@ pub struct AppErrorInfo {
 pub enum AppError {
     /// SSH TCP 连接失败（含超时、拒绝连接、网络不可达等）
     #[error("SSH 连接失败: {0}")]
-    SshConnectionError(String),
+    SshConnectionError(ErrorDetail),
 
     /// SSH 认证失败（密码错误、私钥不匹配、权限拒绝等）
     #[error("认证失败: {0}")]
-    AuthenticationError(String),
+    AuthenticationError(ErrorDetail),
 
     /// 指定 session_id 对应的会话不存在
     #[error("会话不存在: {0}")]
-    SessionNotFound(String),
+    SessionNotFound(ErrorDetail),
 
     /// 主机配置不合法（必填字段缺失、格式错误等）
     #[error("主机配置无效: {0}")]
-    InvalidHostConfig(String),
+    InvalidHostConfig(ErrorDetail),
 
     /// 持久化存储读写失败（JSON 序列化、文件 IO 等）
     #[error("存储错误: {0}")]
-    StorageError(String),
+    StorageError(ErrorDetail),
 
     /// 底层 IO 错误，由标准库 std::io::Error 自动转换
     #[error("IO 错误: {0}")]
@@ -41,88 +103,93 @@ pub enum AppError {
 
     /// SSH 协议错误文本；第三方错误类型必须在 transport module 内转换
     #[error("SSH 协议错误: {0}")]
-    SshProtocolError(String),
+    SshProtocolError(ErrorDetail),
 
     /// OS 安全存储访问失败（Keychain / Credential Manager / Secret Service）
     #[error("安全存储错误: {0}")]
-    SecureStoreError(String),
+    SecureStoreError(ErrorDetail),
 
     /// 凭据在安全存储中不存在（主机配置可能已损坏或凭据未写入）
     #[error("凭据不存在: {0}，请重新编辑主机配置以重新保存凭据")]
-    CredentialNotFound(String),
+    CredentialNotFound(ErrorDetail),
 
     /// SFTP 子通道建立失败（含 SSH session 已断开）
     #[error("SFTP 通道错误: {0}")]
-    SftpChannelError(String),
+    SftpChannelError(ErrorDetail),
 
     /// 无权限访问远程路径
     #[error("SFTP 权限拒绝: {0}")]
-    SftpPermissionDenied(String),
+    SftpPermissionDenied(ErrorDetail),
 
     /// 远程路径不存在
     #[error("SFTP 路径不存在: {0}")]
-    SftpPathNotFound(String),
+    SftpPathNotFound(ErrorDetail),
 
     /// 传输中断（含传输中通道断开）
     #[error("SFTP 传输错误: {0}")]
-    SftpTransferError(String),
+    SftpTransferError(ErrorDetail),
 
     /// 本地文件打开失败（上传读取源）
     #[error("SFTP 打开失败: {0}")]
-    SftpOpenError(String),
+    SftpOpenError(ErrorDetail),
 
     /// 传输读取失败（远端读取或本地读取）
     #[error("SFTP 读取失败: {0}")]
-    SftpReadError(String),
+    SftpReadError(ErrorDetail),
 
     /// 传输写入失败（远端写入或本地写入）
     #[error("SFTP 写入失败: {0}")]
-    SftpWriteError(String),
+    SftpWriteError(ErrorDetail),
 
     /// 目标文件创建失败（本地或远端）
     #[error("SFTP 创建失败: {0}")]
-    SftpCreateError(String),
+    SftpCreateError(ErrorDetail),
 
     /// 取消目标任务不存在（未入队或已从 registry 移除）
     #[error("SFTP 任务不存在: {0}")]
-    SftpTaskNotFound(String),
+    SftpTaskNotFound(ErrorDetail),
 
     /// 下载目标已存在且冲突策略为 Reject（前端据此逐文件确认覆盖）
     #[error("SFTP 目标已存在: {0}")]
-    SftpTargetExists(String),
+    SftpTargetExists(ErrorDetail),
 
     /// 同一 Session 已有 Pending/Running 下载占用相同最终目标
     #[error("SFTP 目标正被占用: {0}")]
-    SftpTargetBusy(String),
+    SftpTargetBusy(ErrorDetail),
 
     /// 临时文件发布到最终目标失败（原目标文件不受影响）
     #[error("SFTP 发布失败: {0}")]
-    SftpPublishError(String),
+    SftpPublishError(ErrorDetail),
 
     /// 用户拒绝了未知主机身份；detail 携带 endpoint 与指纹，连接不得进入认证
     #[error("已拒绝未知主机身份: {0}")]
-    HostKeyRejected(String),
+    HostKeyRejected(ErrorDetail),
 
     /// 主机身份确认请求不存在（已解决或从未创建）
     #[error("主机身份确认请求不存在: {0}")]
-    HostKeyChallengeNotFound(String),
+    HostKeyChallengeNotFound(ErrorDetail),
 
     /// 等待主机身份确认期间会话被关闭，验证已取消
     #[error("主机身份验证已取消: {0}")]
-    HostKeyVerificationCancelled(String),
+    HostKeyVerificationCancelled(ErrorDetail),
 
     /// TitanSSH 独立信任存储不可读、不可解析或写入失败；fail-closed，绝不静默视为空
     #[error("信任存储错误: {0}")]
-    TrustStoreError(String),
+    TrustStoreError(ErrorDetail),
 
     /// "接受并保存"持久化失败；challenge 保持未决，不自动降级为临时信任
     #[error("主机信任保存失败: {0}")]
-    HostKeySaveFailed(String),
+    HostKeySaveFailed(ErrorDetail),
 
     /// HostConfig 保存/删除后的 endpoint 信任记录自动清理失败；
     /// 配置变更已生效，但清理未完成的管理动作必须显式报错，不得静默报告为成功
     #[error("主机信任记录清理失败: {0}")]
-    HostTrustCleanupFailed(String),
+    HostTrustCleanupFailed(ErrorDetail),
+
+    /// 日志导出保存对话框选中的文件无法解析为本地路径（云端/虚拟文件系统 URL
+    /// 未落地）；专用 code 供前端按语言本地化摘要，detail 只携带底层诊断
+    #[error("无法解析保存路径: {0}")]
+    LogExportPathResolveFailed(ErrorDetail),
 }
 
 impl AppError {
@@ -156,84 +223,115 @@ impl AppError {
             Self::TrustStoreError(_) => "TrustStoreError",
             Self::HostKeySaveFailed(_) => "HostKeySaveFailed",
             Self::HostTrustCleanupFailed(_) => "HostTrustCleanupFailed",
+            Self::LogExportPathResolveFailed(_) => "LogExportPathResolveFailed",
         }
     }
 
-    /// 保持错误代码不变，把补充说明追加到 detail 末尾。
+    /// 保持错误代码不变，把补充说明追加到详情末尾。
     ///
     /// 用于复合诊断（如传输失败叠加临时文件清理失败）：
-    /// 主错误代码仍是前端判定的稳定依据，detail 拼上清理失败的具体信息。
+    /// 主错误代码仍是前端判定的稳定依据，详情拼上清理失败的具体信息。
+    /// Raw 详情追加文本；Msg 详情把补充说明作为额外参数（模板占位之外的参数
+    /// 由 Display/前端渲染时以「；」连接在末尾）。
     pub fn with_appended_detail(self, extra: &str) -> AppError {
-        let merged = format!("{}；{}", self, extra);
+        fn append(payload: ErrorDetail, extra: &str) -> ErrorDetail {
+            match payload {
+                ErrorDetail::Raw(text) => ErrorDetail::Raw(format!("{text}；{extra}")),
+                ErrorDetail::Msg { key, mut params } => {
+                    params.push(extra.to_string());
+                    ErrorDetail::Msg { key, params }
+                }
+            }
+        }
         match self {
-            Self::SshConnectionError(_) => Self::SshConnectionError(merged),
-            Self::AuthenticationError(_) => Self::AuthenticationError(merged),
-            Self::SessionNotFound(_) => Self::SessionNotFound(merged),
-            Self::InvalidHostConfig(_) => Self::InvalidHostConfig(merged),
-            Self::StorageError(_) => Self::StorageError(merged),
-            Self::IoError(_) => Self::IoError(std::io::Error::other(merged)),
-            Self::SshProtocolError(_) => Self::SshProtocolError(merged),
-            Self::SecureStoreError(_) => Self::SecureStoreError(merged),
-            Self::CredentialNotFound(_) => Self::CredentialNotFound(merged),
-            Self::SftpChannelError(_) => Self::SftpChannelError(merged),
-            Self::SftpPermissionDenied(_) => Self::SftpPermissionDenied(merged),
-            Self::SftpPathNotFound(_) => Self::SftpPathNotFound(merged),
-            Self::SftpTransferError(_) => Self::SftpTransferError(merged),
-            Self::SftpOpenError(_) => Self::SftpOpenError(merged),
-            Self::SftpReadError(_) => Self::SftpReadError(merged),
-            Self::SftpWriteError(_) => Self::SftpWriteError(merged),
-            Self::SftpCreateError(_) => Self::SftpCreateError(merged),
-            Self::SftpTaskNotFound(_) => Self::SftpTaskNotFound(merged),
-            Self::SftpTargetExists(_) => Self::SftpTargetExists(merged),
-            Self::SftpTargetBusy(_) => Self::SftpTargetBusy(merged),
-            Self::SftpPublishError(_) => Self::SftpPublishError(merged),
-            Self::HostKeyRejected(_) => Self::HostKeyRejected(merged),
-            Self::HostKeyChallengeNotFound(_) => Self::HostKeyChallengeNotFound(merged),
-            Self::HostKeyVerificationCancelled(_) => Self::HostKeyVerificationCancelled(merged),
-            Self::TrustStoreError(_) => Self::TrustStoreError(merged),
-            Self::HostKeySaveFailed(_) => Self::HostKeySaveFailed(merged),
-            Self::HostTrustCleanupFailed(_) => Self::HostTrustCleanupFailed(merged),
+            Self::SshConnectionError(p) => Self::SshConnectionError(append(p, extra)),
+            Self::AuthenticationError(p) => Self::AuthenticationError(append(p, extra)),
+            Self::SessionNotFound(p) => Self::SessionNotFound(append(p, extra)),
+            Self::InvalidHostConfig(p) => Self::InvalidHostConfig(append(p, extra)),
+            Self::StorageError(p) => Self::StorageError(append(p, extra)),
+            Self::IoError(io) => Self::IoError(std::io::Error::other(format!("{io}；{extra}"))),
+            Self::SshProtocolError(p) => Self::SshProtocolError(append(p, extra)),
+            Self::SecureStoreError(p) => Self::SecureStoreError(append(p, extra)),
+            Self::CredentialNotFound(p) => Self::CredentialNotFound(append(p, extra)),
+            Self::SftpChannelError(p) => Self::SftpChannelError(append(p, extra)),
+            Self::SftpPermissionDenied(p) => Self::SftpPermissionDenied(append(p, extra)),
+            Self::SftpPathNotFound(p) => Self::SftpPathNotFound(append(p, extra)),
+            Self::SftpTransferError(p) => Self::SftpTransferError(append(p, extra)),
+            Self::SftpOpenError(p) => Self::SftpOpenError(append(p, extra)),
+            Self::SftpReadError(p) => Self::SftpReadError(append(p, extra)),
+            Self::SftpWriteError(p) => Self::SftpWriteError(append(p, extra)),
+            Self::SftpCreateError(p) => Self::SftpCreateError(append(p, extra)),
+            Self::SftpTaskNotFound(p) => Self::SftpTaskNotFound(append(p, extra)),
+            Self::SftpTargetExists(p) => Self::SftpTargetExists(append(p, extra)),
+            Self::SftpTargetBusy(p) => Self::SftpTargetBusy(append(p, extra)),
+            Self::SftpPublishError(p) => Self::SftpPublishError(append(p, extra)),
+            Self::HostKeyRejected(p) => Self::HostKeyRejected(append(p, extra)),
+            Self::HostKeyChallengeNotFound(p) => Self::HostKeyChallengeNotFound(append(p, extra)),
+            Self::HostKeyVerificationCancelled(p) => {
+                Self::HostKeyVerificationCancelled(append(p, extra))
+            }
+            Self::TrustStoreError(p) => Self::TrustStoreError(append(p, extra)),
+            Self::HostKeySaveFailed(p) => Self::HostKeySaveFailed(append(p, extra)),
+            Self::HostTrustCleanupFailed(p) => Self::HostTrustCleanupFailed(append(p, extra)),
+            Self::LogExportPathResolveFailed(p) => {
+                Self::LogExportPathResolveFailed(append(p, extra))
+            }
         }
     }
 }
 
-/// 将内部错误转换为语言无关的 IPC 错误。
-impl From<AppError> for AppErrorInfo {
-    fn from(error: AppError) -> Self {
+/// 将内部错误转换为语言无关的 IPC 错误：Raw 详情走 detail 字段（纯机器文本），
+/// Msg 详情拆成 detailKey（中文模板，前端按语言翻译）+ detailParams。
+impl From<&AppError> for AppErrorInfo {
+    fn from(error: &AppError) -> Self {
         let code = error.code();
-        let detail = match error {
-            AppError::SshConnectionError(detail)
-            | AppError::AuthenticationError(detail)
-            | AppError::SessionNotFound(detail)
-            | AppError::InvalidHostConfig(detail)
-            | AppError::StorageError(detail)
-            | AppError::SshProtocolError(detail)
-            | AppError::SecureStoreError(detail)
-            | AppError::CredentialNotFound(detail)
-            | AppError::SftpChannelError(detail)
-            | AppError::SftpPermissionDenied(detail)
-            | AppError::SftpPathNotFound(detail)
-            | AppError::SftpTransferError(detail)
-            | AppError::SftpOpenError(detail)
-            | AppError::SftpReadError(detail)
-            | AppError::SftpWriteError(detail)
-            | AppError::SftpCreateError(detail)
-            | AppError::SftpTaskNotFound(detail)
-            | AppError::SftpTargetExists(detail)
-            | AppError::SftpTargetBusy(detail)
-            | AppError::SftpPublishError(detail) => detail,
-            AppError::HostKeyRejected(detail)
-            | AppError::HostKeyChallengeNotFound(detail)
-            | AppError::HostKeyVerificationCancelled(detail)
-            | AppError::TrustStoreError(detail)
-            | AppError::HostKeySaveFailed(detail)
-            | AppError::HostTrustCleanupFailed(detail) => detail,
-            AppError::IoError(detail) => detail.to_string(),
+        let payload = match error {
+            AppError::SshConnectionError(p)
+            | AppError::AuthenticationError(p)
+            | AppError::SessionNotFound(p)
+            | AppError::InvalidHostConfig(p)
+            | AppError::StorageError(p)
+            | AppError::SshProtocolError(p)
+            | AppError::SecureStoreError(p)
+            | AppError::CredentialNotFound(p)
+            | AppError::SftpChannelError(p)
+            | AppError::SftpPermissionDenied(p)
+            | AppError::SftpPathNotFound(p)
+            | AppError::SftpTransferError(p)
+            | AppError::SftpOpenError(p)
+            | AppError::SftpReadError(p)
+            | AppError::SftpWriteError(p)
+            | AppError::SftpCreateError(p)
+            | AppError::SftpTaskNotFound(p)
+            | AppError::SftpTargetExists(p)
+            | AppError::SftpTargetBusy(p)
+            | AppError::SftpPublishError(p)
+            | AppError::HostKeyRejected(p)
+            | AppError::HostKeyChallengeNotFound(p)
+            | AppError::HostKeyVerificationCancelled(p)
+            | AppError::TrustStoreError(p)
+            | AppError::HostKeySaveFailed(p)
+            | AppError::HostTrustCleanupFailed(p)
+            | AppError::LogExportPathResolveFailed(p) => Some(p.clone()),
+            AppError::IoError(io) => Some(ErrorDetail::Raw(io.to_string())),
+        };
+        let (detail, detail_key, detail_params) = match payload {
+            Some(ErrorDetail::Raw(text)) => (Some(text), None, None),
+            Some(ErrorDetail::Msg { key, params }) => (None, Some(key), Some(params)),
+            None => (None, None, None),
         };
         Self {
             code: code.to_string(),
-            detail: Some(detail),
+            detail,
+            detail_key,
+            detail_params,
         }
+    }
+}
+
+impl From<AppError> for AppErrorInfo {
+    fn from(error: AppError) -> Self {
+        Self::from(&error)
     }
 }
 

@@ -37,7 +37,7 @@ mod tests {
         let result = manager.host_config("nonexistent");
         assert!(result.is_err(), "不存在的 session_id 应返回错误");
         match result.unwrap_err() {
-            AppError::SessionNotFound(id) => assert_eq!(id, "nonexistent"),
+            AppError::SessionNotFound(id) => assert_eq!(id.to_string(), "nonexistent"),
             other => panic!("期望 SessionNotFound，实际: {:?}", other),
         }
     }
@@ -81,7 +81,7 @@ mod tests {
         let app = mock_app();
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
-                "expected test failure".to_string(),
+                "expected test failure".to_string().into(),
             ))
         });
         let manager = SessionManager::new(
@@ -108,7 +108,7 @@ mod tests {
         let identity = HostIdentityService::new();
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
-                "expected test failure".to_string(),
+                "expected test failure".to_string().into(),
             ))
         });
         let manager = SessionManager::new(MonitorService::new(), sftp_service, identity.clone());
@@ -171,7 +171,7 @@ mod tests {
         let monitor_service = MonitorService::new();
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
-                "expected test failure".to_string(),
+                "expected test failure".to_string().into(),
             ))
         });
         let manager = SessionManager::new(

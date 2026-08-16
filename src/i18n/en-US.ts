@@ -174,7 +174,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.IoError': 'I/O error',
   'error.SshProtocolError': 'SSH protocol error',
   'error.SecureStoreError': 'Secure storage error',
-  'error.CredentialNotFound': 'Credential not found',
+  'error.CredentialNotFound': 'Credential not found; re-edit the host configuration to save the password again',
   'error.SftpChannelError': 'SFTP channel error',
   'error.SftpPermissionDenied': 'SFTP permission denied',
   'error.SftpPathNotFound': 'SFTP path not found',
@@ -193,7 +193,9 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.HostKeyVerificationCancelled': 'Host identity verification cancelled',
   'error.HostKeySaveFailed': 'Failed to save host trust',
   'error.HostTrustCleanupFailed': 'Failed to clean up host trust record',
+  'error.LogExportPathResolveFailed': 'Could not resolve save path',
   'error.TrustStoreError': 'Trust store unavailable',
   'error.Unknown': 'Unknown error',
+  'error.Timeout': 'Connection timed out',
 };
 

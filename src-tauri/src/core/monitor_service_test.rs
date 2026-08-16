@@ -173,7 +173,12 @@ mod service_tests {
             &app.handle(),
             "task-1",
             TaskStatus::Failed,
-            Some("监控采集失败".to_string())
+            Some(AppErrorInfo {
+                code: "MonitorError".to_string(),
+                detail: None,
+                detail_key: Some("监控采集失败: {0}".to_string()),
+                detail_params: Some(vec!["boom".to_string()]),
+            })
         ));
         assert_eq!(emitted.load(Ordering::Relaxed), 1);
 
@@ -243,7 +248,12 @@ mod service_tests {
             &app.handle(),
             "task-1",
             TaskStatus::Failed,
-            Some("不应直接失败".to_string())
+            Some(AppErrorInfo {
+                code: "MonitorError".to_string(),
+                detail: None,
+                detail_key: Some("不应直接失败".to_string()),
+                detail_params: None,
+            })
         ));
         assert_eq!(
             service

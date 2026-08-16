@@ -1,4 +1,4 @@
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::HostConfig;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,12 @@ fn migrate_legacy_hosts(legacy_file: &Path, new_file: &Path) -> Result<(), AppEr
 
     fs::copy(legacy_file, new_file)
         .map(|_| ())
-        .map_err(|error| AppError::StorageError(format!("迁移旧主机配置失败: {error}")))?;
+        .map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "迁移旧主机配置失败: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
     Ok(())
 }
 
@@ -34,14 +39,20 @@ impl HostStore {
     /// # 返回
     /// 成功返回 HostStore 实例，失败返回 StorageError
     pub fn new(app_handle: &AppHandle) -> Result<Self, AppError> {
-        let app_data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .map_err(|error| AppError::StorageError(format!("无法获取应用数据目录: {error}")))?;
+        let app_data_dir = app_handle.path().app_data_dir().map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "无法获取应用数据目录: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
 
         // 确保数据目录存在，首次运行时自动创建
-        fs::create_dir_all(&app_data_dir)
-            .map_err(|error| AppError::StorageError(format!("无法创建应用数据目录: {error}")))?;
+        fs::create_dir_all(&app_data_dir).map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "无法创建应用数据目录: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
 
         let file_path = app_data_dir.join(HOSTS_FILE_NAME);
         if let Some(data_root) = app_data_dir.parent() {
@@ -71,11 +82,19 @@ impl HostStore {
             return Ok(Vec::new());
         }
 
-        let content = fs::read_to_string(&self.file_path)
-            .map_err(|error| AppError::StorageError(format!("读取主机配置文件失败: {error}")))?;
+        let content = fs::read_to_string(&self.file_path).map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "读取主机配置文件失败: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
 
-        let hosts: Vec<HostConfig> = serde_json::from_str(&content)
-            .map_err(|error| AppError::StorageError(format!("解析主机配置文件失败: {error}")))?;
+        let hosts: Vec<HostConfig> = serde_json::from_str(&content).map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "解析主机配置文件失败: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
 
         Ok(hosts)
     }
@@ -88,11 +107,19 @@ impl HostStore {
     /// # 参数
     /// - `hosts`: 要持久化的主机配置切片（不含明文凭据）
     pub fn save(&self, hosts: &[HostConfig]) -> Result<(), AppError> {
-        let content = serde_json::to_string_pretty(hosts)
-            .map_err(|error| AppError::StorageError(format!("序列化主机配置失败: {error}")))?;
+        let content = serde_json::to_string_pretty(hosts).map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "序列化主机配置失败: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
 
-        fs::write(&self.file_path, content)
-            .map_err(|error| AppError::StorageError(format!("写入主机配置文件失败: {error}")))?;
+        fs::write(&self.file_path, content).map_err(|error| {
+            AppError::StorageError(ErrorDetail::msg(
+                "写入主机配置文件失败: {0}",
+                vec![error.to_string()],
+            ))
+        })?;
 
         Ok(())
     }

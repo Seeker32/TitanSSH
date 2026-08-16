@@ -1,7 +1,7 @@
 use crate::core::host_identity::{
     HostKeyVerifier, PresentedHostKey, algorithm_name, fingerprint_sha256,
 };
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig};
 use serde::Serialize;
 use ssh2::{Channel, Session, Sftp};
@@ -295,14 +295,14 @@ impl SftpOps for Ssh2Sftp {
             .map(|file| RemoteFile {
                 inner: Box::new(file),
             })
-            .map_err(|error| AppError::SftpTransferError(error.to_string()))
+            .map_err(|error| AppError::SftpTransferError(error.to_string().into()))
     }
 
     /// 删除 ssh2 远端文件。
     fn unlink(&mut self, path: &str) -> Result<(), AppError> {
         self.sftp
             .unlink(Path::new(path))
-            .map_err(|error| AppError::SftpTransferError(error.to_string()))
+            .map_err(|error| AppError::SftpTransferError(error.to_string().into()))
     }
 
     /// 重命名 ssh2 远端文件：no-clobber（overwrite=false）或覆盖替换（overwrite=true）。
@@ -374,7 +374,7 @@ pub fn connect_sftp(
     let session = connect_session(host, password, passphrase, verifier, &mut |_| {})?;
     let sftp = session
         .sftp()
-        .map_err(|error| AppError::SftpChannelError(error.to_string()))?;
+        .map_err(|error| AppError::SftpChannelError(error.to_string().into()))?;
     Ok(SftpTransport::from_backend(Ssh2Sftp { sftp }))
 }
 
@@ -418,7 +418,10 @@ where
     // 服务器未呈现主机密钥同样不得进入认证（无法验证身份即不发送凭据）。
     on_phase(ConnectPhase::VerifyingHostKey);
     let (blob, key_type) = session.host_key().ok_or_else(|| {
-        AppError::SshProtocolError("服务器未提供主机密钥，无法验证主机身份，已阻止认证".to_string())
+        AppError::SshProtocolError(ErrorDetail::msg(
+            "服务器未提供主机密钥，无法验证主机身份，已阻止认证",
+            Vec::new(),
+        ))
     })?;
     let presented = PresentedHostKey {
         host: host.host.clone(),
@@ -432,32 +435,35 @@ where
     on_phase(ConnectPhase::Authenticating);
     match host.auth_type {
         AuthType::Password => {
-            let password =
-                password.ok_or_else(|| AppError::InvalidHostConfig("密码为必填项".to_string()))?;
+            let password = password.ok_or_else(|| {
+                AppError::InvalidHostConfig(ErrorDetail::msg("密码为必填项", Vec::new()))
+            })?;
             session
                 .userauth_password(&host.username, password)
-                .map_err(|error| AppError::AuthenticationError(error.to_string()))?;
+                .map_err(|error| AppError::AuthenticationError(error.to_string().into()))?;
         }
         AuthType::PrivateKey => {
-            let private_key = host
-                .private_key_path
-                .as_deref()
-                .ok_or_else(|| AppError::InvalidHostConfig("私钥路径为必填项".to_string()))?;
+            let private_key = host.private_key_path.as_deref().ok_or_else(|| {
+                AppError::InvalidHostConfig(ErrorDetail::msg("私钥路径为必填项", Vec::new()))
+            })?;
             session
                 .userauth_pubkey_file(&host.username, None, Path::new(private_key), passphrase)
-                .map_err(|error| AppError::AuthenticationError(error.to_string()))?;
+                .map_err(|error| AppError::AuthenticationError(error.to_string().into()))?;
         }
     }
 
     if !session.authenticated() {
-        return Err(AppError::AuthenticationError("SSH 认证失败".to_string()));
+        return Err(AppError::AuthenticationError(ErrorDetail::msg(
+            "SSH 认证失败",
+            Vec::new(),
+        )));
     }
     Ok(session)
 }
 
 /// 将 ssh2 错误转换为稳定应用错误文本。
 fn protocol_error(error: ssh2::Error) -> AppError {
-    AppError::SshProtocolError(error.to_string())
+    AppError::SshProtocolError(error.to_string().into())
 }
 
 /// 将 ssh2 rename 错误转换为稳定领域错误。
@@ -473,15 +479,18 @@ fn map_sftp_rename_error(dst: &str, overwrite: bool, error: ssh2::Error) -> AppE
         || message.contains("File already exists");
     if already_exists {
         if overwrite {
-            AppError::SftpPublishError(format!(
-                "远端服务器无法保证安全替换，旧目标保留: {} ({})",
-                dst, message
+            AppError::SftpPublishError(ErrorDetail::msg(
+                "远端服务器无法保证安全替换，旧目标保留: {0} ({1})",
+                vec![dst.to_string(), message],
             ))
         } else {
-            AppError::SftpTargetExists(dst.to_string())
+            AppError::SftpTargetExists(dst.to_string().into())
         }
     } else {
-        AppError::SftpPublishError(format!("远端重命名失败: {} ({})", dst, message))
+        AppError::SftpPublishError(ErrorDetail::msg(
+            "远端重命名失败: {0} ({1})",
+            vec![dst.to_string(), message],
+        ))
     }
 }
 
@@ -489,11 +498,11 @@ fn map_sftp_rename_error(dst: &str, overwrite: bool, error: ssh2::Error) -> AppE
 fn map_sftp_path_error(path: &str, error: ssh2::Error) -> AppError {
     let message = error.to_string();
     if message.contains("No such file") || message.contains("does not exist") {
-        AppError::SftpPathNotFound(path.to_string())
+        AppError::SftpPathNotFound(path.to_string().into())
     } else if message.contains("Permission denied") {
-        AppError::SftpPermissionDenied(path.to_string())
+        AppError::SftpPermissionDenied(path.to_string().into())
     } else {
-        AppError::SftpChannelError(message)
+        AppError::SftpChannelError(message.into())
     }
 }
 
@@ -502,8 +511,9 @@ fn resolve_socket_addrs(host: &HostConfig) -> Result<Vec<SocketAddr>, AppError> 
     let address = format!("{}:{}", host.host, host.port);
     let socket_addrs: Vec<SocketAddr> = address.to_socket_addrs()?.collect();
     if socket_addrs.is_empty() {
-        return Err(AppError::SshConnectionError(format!(
-            "连接失败: 未解析到可用地址 {address}"
+        return Err(AppError::SshConnectionError(ErrorDetail::msg(
+            "连接失败: 未解析到可用地址 {0}",
+            vec![address],
         )));
     }
     Ok(socket_addrs)
@@ -543,11 +553,17 @@ fn build_connect_error(
     timeout: Duration,
 ) -> AppError {
     if saw_timeout {
-        AppError::SshConnectionError(format!("Connection timeout after {}s", timeout.as_secs()))
+        AppError::SshConnectionError(
+            format!("Connection timeout after {}s", timeout.as_secs()).into(),
+        )
     } else {
-        AppError::SshConnectionError(format!(
-            "连接失败: {}",
-            last_error.unwrap_or_else(|| io::Error::other("unknown TCP connection error"))
+        AppError::SshConnectionError(ErrorDetail::msg(
+            "连接失败: {0}",
+            vec![
+                last_error
+                    .unwrap_or_else(|| io::Error::other("unknown TCP connection error"))
+                    .to_string(),
+            ],
         ))
     }
 }
@@ -558,7 +574,7 @@ pub(crate) mod test_support {
         ExecOps, ExecTransport, RemoteFile, SftpEntry, SftpOps, SftpTransport, TerminalOps,
         TerminalTransport,
     };
-    use crate::errors::app_error::AppError;
+    use crate::errors::app_error::{AppError, ErrorDetail};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
@@ -578,12 +594,12 @@ pub(crate) mod test_support {
 
         /// 空 adapter 不提供远端读文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 空 adapter 不提供远端写文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 空 adapter 的删除操作直接成功。
@@ -593,7 +609,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -617,12 +633,12 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不打开远端读文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 不创建远端文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 无需清理远端文件。
@@ -632,7 +648,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -699,7 +715,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不创建远端文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 无需删除远端文件。
@@ -709,7 +725,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -730,14 +746,14 @@ pub(crate) mod test_support {
         /// 打开远端文件时返回通道错误。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
             Err(AppError::SftpChannelError(
-                "transfer channel lost".to_string(),
+                "transfer channel lost".to_string().into(),
             ))
         }
 
         /// 创建远端文件时返回通道错误。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
             Err(AppError::SftpChannelError(
-                "transfer channel lost".to_string(),
+                "transfer channel lost".to_string().into(),
             ))
         }
 
@@ -748,7 +764,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -822,12 +838,12 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不打开文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 不创建文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 无需删除文件。
@@ -837,7 +853,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -957,7 +973,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不打开远端读文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 返回在放行门后阻塞写入的远端写句柄。
@@ -1123,7 +1139,7 @@ pub(crate) mod test_support {
         fn file_size(&mut self, path: &str) -> Result<u64, AppError> {
             match self.content(path) {
                 Some(content) => Ok(content.len() as u64),
-                None => Err(AppError::SftpPathNotFound(path.to_string())),
+                None => Err(AppError::SftpPathNotFound(path.to_string().into())),
             }
         }
 
@@ -1131,7 +1147,7 @@ pub(crate) mod test_support {
         fn open_read(&mut self, path: &str) -> Result<RemoteFile, AppError> {
             let content = self
                 .content(path)
-                .ok_or_else(|| AppError::SftpPathNotFound(path.to_string()))?;
+                .ok_or_else(|| AppError::SftpPathNotFound(path.to_string().into()))?;
             Ok(RemoteFile {
                 inner: Box::new(std::io::Cursor::new(content)),
             })
@@ -1157,7 +1173,9 @@ pub(crate) mod test_support {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(path.to_string());
             if self.unlink_denied.load(Ordering::Relaxed) {
-                return Err(AppError::SftpTransferError("permission denied".to_string()));
+                return Err(AppError::SftpTransferError(
+                    "permission denied".to_string().into(),
+                ));
             }
             self.files
                 .lock()
@@ -1174,16 +1192,16 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(content) = files.get(src).cloned() else {
-                return Err(AppError::SftpPathNotFound(src.to_string()));
+                return Err(AppError::SftpPathNotFound(src.to_string().into()));
             };
             let dst_exists = files.contains_key(dst);
             if dst_exists && !overwrite {
-                return Err(AppError::SftpTargetExists(dst.to_string()));
+                return Err(AppError::SftpTargetExists(dst.to_string().into()));
             }
             if dst_exists && !self.overwrite_supported {
-                return Err(AppError::SftpPublishError(format!(
-                    "远端服务器无法保证安全替换，旧目标保留: {}",
-                    dst
+                return Err(AppError::SftpPublishError(ErrorDetail::msg(
+                    "远端服务器无法保证安全替换，旧目标保留: {0}",
+                    vec![dst.to_string()],
                 )));
             }
             files.insert(dst.to_string(), content);
@@ -1302,22 +1320,26 @@ pub(crate) mod test_support {
     impl SftpOps for FailingChannelSftp {
         /// 模拟失效连接：目录列举失败。
         fn list_dir(&mut self, _path: &str) -> Result<Vec<SftpEntry>, AppError> {
-            Err(AppError::SftpChannelError("connection lost".to_string()))
+            Err(AppError::SftpChannelError(
+                "connection lost".to_string().into(),
+            ))
         }
 
         /// 模拟失效连接：元数据查询失败。
         fn file_size(&mut self, _path: &str) -> Result<u64, AppError> {
-            Err(AppError::SftpChannelError("connection lost".to_string()))
+            Err(AppError::SftpChannelError(
+                "connection lost".to_string().into(),
+            ))
         }
 
         /// 本 adapter 不打开远端读文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 不创建远端文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 无需删除远端文件。
@@ -1327,7 +1349,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -1337,22 +1359,22 @@ pub(crate) mod test_support {
     impl SftpOps for PathNotFoundSftp {
         /// 返回稳定的路径不存在域错误，供“域错误不触发重连”测试。
         fn list_dir(&mut self, path: &str) -> Result<Vec<SftpEntry>, AppError> {
-            Err(AppError::SftpPathNotFound(path.to_string()))
+            Err(AppError::SftpPathNotFound(path.to_string().into()))
         }
 
         /// 元数据查询返回同样的域错误。
         fn file_size(&mut self, path: &str) -> Result<u64, AppError> {
-            Err(AppError::SftpPathNotFound(path.to_string()))
+            Err(AppError::SftpPathNotFound(path.to_string().into()))
         }
 
         /// 本 adapter 不打开远端读文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 不创建远端文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本 adapter 无需删除远端文件。
@@ -1362,7 +1384,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -1389,7 +1411,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不创建远端文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 删除操作直接成功。
@@ -1399,7 +1421,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -1419,7 +1441,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不打开远端读文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 创建成功，但写入立即失败。
@@ -1436,7 +1458,7 @@ pub(crate) mod test_support {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 

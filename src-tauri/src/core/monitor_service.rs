@@ -1,7 +1,7 @@
 use crate::core::host_identity::HostKeyVerifier;
 use crate::core::monitor_worker;
-use crate::errors::app_error::AppError;
 use crate::errors::app_error::AppErrorInfo;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::monitor::{MonitorSnapshot, TaskInfo, TaskStatus};
 use crate::models::session::TaskStatusEvent;
@@ -64,10 +64,9 @@ impl MonitorService {
         // 凭据读取必须先于任务注册，确保失败时不留下幽灵任务或事件。
         let (password, passphrase) = match host.auth_type {
             AuthType::Password => {
-                let password_ref = host
-                    .password_ref
-                    .as_deref()
-                    .ok_or_else(|| AppError::InvalidHostConfig("密码引用为空".to_string()))?;
+                let password_ref = host.password_ref.as_deref().ok_or_else(|| {
+                    AppError::InvalidHostConfig(ErrorDetail::msg("密码引用为空", Vec::new()))
+                })?;
                 (Some(secure_store::get_credential(password_ref)?), None)
             }
             AuthType::PrivateKey => {
@@ -150,7 +149,7 @@ impl MonitorService {
                             &app_for_snap,
                             &task_id_for_snap,
                             TaskStatus::Failed,
-                            Some(format!("监控快照推送失败: {err}")),
+                            monitor_status_error("监控快照推送失败: {0}", err.to_string()),
                         );
                     }
                 },
@@ -161,7 +160,7 @@ impl MonitorService {
                         &app_for_error,
                         &task_id_for_error,
                         TaskStatus::Failed,
-                        Some(format!("监控采集失败: {err}")),
+                        monitor_status_error("监控采集失败: {0}", err.to_string()),
                     );
                 },
             );
@@ -231,7 +230,7 @@ fn transition_task_status<R: Runtime>(
     app: &AppHandle<R>,
     task_id: &str,
     status: TaskStatus,
-    message: Option<String>,
+    message: Option<AppErrorInfo>,
 ) -> bool {
     let mut tasks = tasks.lock().unwrap();
     let Some(handle) = tasks.get_mut(task_id) else {
@@ -259,24 +258,32 @@ fn transition_task_status<R: Runtime>(
 /// - `app`: Tauri 应用句柄（泛型，支持真实运行时和测试 MockRuntime）
 /// - `task_id`: 任务 ID
 /// - `status`: 新的任务状态
-/// - `message`: 可选的附加消息（如错误详情）
+/// - `message`: 可选的结构化错误（code 稳定，固定文案可翻译）
 fn emit_task_status<R: Runtime>(
     app: &AppHandle<R>,
     task_id: &str,
     status: TaskStatus,
-    message: Option<String>,
+    message: Option<AppErrorInfo>,
 ) {
     let _ = app.emit(
         "task:status",
         TaskStatusEvent {
             task_id: task_id.to_string(),
             status,
-            error: message.map(|detail| AppErrorInfo {
-                code: "MonitorError".to_string(),
-                detail: Some(detail),
-            }),
+            error: message,
         },
     );
+}
+
+/// 构建监控任务的结构化错误：固定文案为中文源文案（前端按语言翻译），
+/// 参数为语言无关的底层错误文本。
+fn monitor_status_error(key: &str, param: String) -> Option<AppErrorInfo> {
+    Some(AppErrorInfo {
+        code: "MonitorError".to_string(),
+        detail: None,
+        detail_key: Some(key.to_string()),
+        detail_params: Some(vec![param]),
+    })
 }
 
 #[cfg(test)]

@@ -37,12 +37,12 @@ mod tests {
 
         /// 本测试不打开文件。
         fn open_read(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本测试不创建文件。
         fn create(&mut self, _path: &str) -> Result<RemoteFile, AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
 
         /// 本测试无需删除文件。
@@ -52,7 +52,7 @@ mod tests {
 
         /// 本 adapter 不提供远端重命名。
         fn rename(&mut self, _src: &str, _dst: &str, _overwrite: bool) -> Result<(), AppError> {
-            Err(AppError::SftpTransferError("unused".to_string()))
+            Err(AppError::SftpTransferError("unused".to_string().into()))
         }
     }
 
@@ -154,7 +154,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(AppError::SshConnectionError(message)) if message.contains("连接失败")
+            Err(AppError::SshConnectionError(message)) if message.to_string().contains("连接失败")
         ));
     }
 
@@ -169,7 +169,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::SshConnectionError(message) if message.contains("Connection timeout")
+            AppError::SshConnectionError(message) if message.to_string().contains("Connection timeout")
         ));
     }
 
@@ -219,7 +219,7 @@ mod tests {
         let mapped = map_sftp_rename_error("/tmp/dst", false, error);
 
         assert!(
-            matches!(&mapped, AppError::SftpTargetExists(path) if path == "/tmp/dst"),
+            matches!(&mapped, AppError::SftpTargetExists(path) if path.to_string() == "/tmp/dst"),
             "no-clobber 撞目标应映射为 SftpTargetExists，实际: {mapped:?}"
         );
     }
@@ -237,9 +237,9 @@ mod tests {
 
         assert!(
             matches!(&mapped, AppError::SftpPublishError(detail)
-                if detail.contains("无法保证安全替换")
-                    && detail.contains("旧目标保留")
-                    && detail.contains("/tmp/dst")),
+                if detail.to_string().contains("无法保证安全替换")
+                    && detail.to_string().contains("旧目标保留")
+                    && detail.to_string().contains("/tmp/dst")),
             "覆盖失败必须保留旧目标并给出结构化发布错误，实际: {mapped:?}"
         );
     }
@@ -256,7 +256,7 @@ mod tests {
 
         assert!(
             matches!(&mapped, AppError::SftpPublishError(detail)
-                if detail.contains("远端重命名失败") && detail.contains("/tmp/dst")),
+                if detail.to_string().contains("远端重命名失败") && detail.to_string().contains("/tmp/dst")),
             "其他 rename 失败应保留结构化发布错误，实际: {mapped:?}"
         );
     }

@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn run_blocking_op_propagates_structured_error() {
         let task = tauri::async_runtime::spawn(run_blocking_op(move || {
-            Err::<i32, AppError>(AppError::SftpChannelError("remote gone".to_string()))
+            Err::<i32, AppError>(AppError::SftpChannelError("remote gone".to_string().into()))
         }));
         let error = tauri::async_runtime::block_on(task)
             .expect("任务应正常完成")

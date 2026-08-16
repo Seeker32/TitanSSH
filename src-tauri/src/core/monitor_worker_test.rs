@@ -3,7 +3,7 @@ mod loop_tests {
     use crate::core::monitor_worker::*;
     use crate::core::ssh_transport::ExecTransport;
     use crate::core::ssh_transport::test_support::one_shot_exec;
-    use crate::errors::app_error::AppError;
+    use crate::errors::app_error::{AppError, ErrorDetail};
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::monitor::MonitorSnapshot;
     use std::sync::atomic::AtomicBool;
@@ -53,7 +53,7 @@ mod loop_tests {
 
         // 模拟生产 transport 顺序：握手后、认证前调用统一校验器
         let verifier: HostKeyVerifier = Arc::new(|_presented: &PresentedHostKey| {
-            Err(AppError::HostKeyRejected("10.0.0.8:22".to_string()))
+            Err(AppError::HostKeyRejected("10.0.0.8:22".to_string().into()))
         });
         let connect_fn = move |_host: &HostConfig,
                                _pw: Option<&str>,
@@ -94,9 +94,10 @@ mod loop_tests {
         let err_ref = Arc::clone(&errors);
 
         let connect_fn = |_host: &HostConfig, _pw: Option<&str>, _pp: Option<&str>| {
-            Err::<ExecTransport, AppError>(AppError::SshConnectionError(
-                "mock 连接失败".to_string(),
-            ))
+            Err::<ExecTransport, AppError>(AppError::SshConnectionError(ErrorDetail::msg(
+                "mock 连接失败",
+                Vec::new(),
+            )))
         };
 
         run_monitor_loop_with(
@@ -131,7 +132,10 @@ mod loop_tests {
 
         let err_ref = Arc::clone(&errors);
         let connect_fn = |_: &HostConfig, _: Option<&str>, _: Option<&str>| {
-            Err::<ExecTransport, AppError>(AppError::SshConnectionError("不应被调用".to_string()))
+            Err::<ExecTransport, AppError>(AppError::SshConnectionError(ErrorDetail::msg(
+                "不应被调用",
+                Vec::new(),
+            )))
         };
 
         run_monitor_loop_with(

@@ -1,5 +1,5 @@
 use crate::core::host_identity::HostIdentityService;
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig, SaveHostRequest};
 use crate::storage::host_store::HostStore;
 use crate::storage::secure_store;
@@ -282,8 +282,9 @@ impl HostConfigService {
                 self.trust_cleanup
                     .forget_endpoint(&host, port)
                     .map_err(|error| {
-                        AppError::HostTrustCleanupFailed(format!(
-                            "endpoint {host}:{port} 的信任记录清理失败: {error}"
+                        AppError::HostTrustCleanupFailed(ErrorDetail::msg(
+                            "endpoint {0}:{1} 的信任记录清理失败: {2}",
+                            vec![host, port.to_string(), error.to_string()],
                         ))
                     })?;
             }
@@ -333,13 +334,22 @@ type SaveResult = (Vec<HostConfig>, Option<(String, u16)>);
 /// 验证保存主机请求的必填字段，name/host/username 不得为空白
 fn validate_save_request(request: &SaveHostRequest) -> Result<(), AppError> {
     if request.name.trim().is_empty() {
-        return Err(AppError::InvalidHostConfig("主机名称为必填项".to_string()));
+        return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
+            "主机名称为必填项",
+            Vec::new(),
+        )));
     }
     if request.host.trim().is_empty() {
-        return Err(AppError::InvalidHostConfig("主机地址为必填项".to_string()));
+        return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
+            "主机地址为必填项",
+            Vec::new(),
+        )));
     }
     if request.username.trim().is_empty() {
-        return Err(AppError::InvalidHostConfig("用户名为必填项".to_string()));
+        return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
+            "用户名为必填项",
+            Vec::new(),
+        )));
     }
     Ok(())
 }

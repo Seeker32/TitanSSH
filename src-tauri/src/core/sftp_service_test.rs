@@ -356,7 +356,9 @@ mod tests {
         let attempts_for_connector = attempts.clone();
         let service = SftpService::with_connector(move |_, _| {
             if attempts_for_connector.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Err(AppError::SshConnectionError("first failure".to_string()))
+                Err(AppError::SshConnectionError(
+                    "first failure".to_string().into(),
+                ))
             } else {
                 Ok(empty_sftp())
             }
@@ -411,7 +413,7 @@ mod tests {
 
         let error = service.list_dir("session-1", "/").unwrap_err();
         assert!(
-            matches!(&error, AppError::SftpChannelError(message) if message.contains("connection lost")),
+            matches!(&error, AppError::SftpChannelError(message) if message.to_string().contains("connection lost")),
             "第二次失败应保留结构化通道错误，实际: {:?}",
             error
         );
@@ -435,7 +437,7 @@ mod tests {
 
         let error = service.list_dir("session-1", "/ghost").unwrap_err();
         assert!(
-            matches!(error, AppError::SftpPathNotFound(path) if path == "/ghost"),
+            matches!(error, AppError::SftpPathNotFound(path) if path.to_string() == "/ghost"),
             "域错误应原样返回"
         );
         assert_eq!(
@@ -556,7 +558,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            matches!(&error, AppError::SftpChannelError(message) if message.contains("connection lost")),
+            matches!(&error, AppError::SftpChannelError(message) if message.to_string().contains("connection lost")),
             "第二次元数据失败应保留结构化通道错误，实际: {:?}",
             error
         );
@@ -610,7 +612,7 @@ mod tests {
             .expect_err("相同最终目标的第二个下载应被拒绝");
         let expected_target = local_path.to_string_lossy().to_string();
         assert!(
-            matches!(&error, AppError::SftpTargetBusy(path) if *path == expected_target),
+            matches!(&error, AppError::SftpTargetBusy(path) if path.to_string() == expected_target),
             "重复目标应返回结构化 SftpTargetBusy 错误，实际: {:?}",
             error
         );
@@ -648,7 +650,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            matches!(&error, AppError::SftpTransferError(message) if message.contains("本地路径无效")),
+            matches!(&error, AppError::SftpTransferError(message) if message.to_string().contains("本地路径无效")),
             "不含文件名的目标应被拒绝，实际: {:?}",
             error
         );
@@ -1434,7 +1436,7 @@ mod tests {
                         false,
                     ))),
                     1 => Err(AppError::SftpChannelError(
-                        "transfer connect failed".to_string(),
+                        "transfer connect failed".to_string().into(),
                     )),
                     _ => Ok(in_memory_sftp_transport(&fs_for_connector)),
                 }
@@ -2499,7 +2501,7 @@ mod tests {
         let service = SftpService::new();
         let error = service.cancel_task("nonexistent-task-id").unwrap_err();
         assert!(
-            matches!(&error, AppError::SftpTaskNotFound(id) if id == "nonexistent-task-id"),
+            matches!(&error, AppError::SftpTaskNotFound(id) if id.to_string() == "nonexistent-task-id"),
             "未知任务应返回 SftpTaskNotFound，实际: {:?}",
             error
         );
@@ -2527,7 +2529,7 @@ mod tests {
         let result = service.list_dir("nonexistent", "/tmp");
         assert!(result.is_err());
         match result.unwrap_err() {
-            AppError::SftpChannelError(msg) => assert!(msg.contains("nonexistent")),
+            AppError::SftpChannelError(msg) => assert!(msg.to_string().contains("nonexistent")),
             other => panic!("期望 SftpChannelError，实际: {:?}", other),
         }
     }
@@ -3000,6 +3002,8 @@ mod tests {
         let error = AppErrorInfo {
             code: "SftpReadError".to_string(),
             detail: Some("read reset".to_string()),
+            detail_key: None,
+            detail_params: None,
         };
         assert!(service.transition_task(
             app.handle(),
@@ -3205,6 +3209,8 @@ mod tests {
         let expected = Some(AppErrorInfo {
             code: "SftpTransferError".to_string(),
             detail: Some("unused".to_string()),
+            detail_key: None,
+            detail_params: None,
         });
         let registry_task = service
             .tasks
@@ -3266,6 +3272,8 @@ mod tests {
             Some(AppErrorInfo {
                 code: "SftpReadError".to_string(),
                 detail: Some("remote read reset".to_string()),
+                detail_key: None,
+                detail_params: None,
             }),
             "运行时读取失败必须保留 SftpReadError 与底层诊断"
         );
@@ -3322,6 +3330,8 @@ mod tests {
             Some(AppErrorInfo {
                 code: "SftpWriteError".to_string(),
                 detail: Some("remote write reset".to_string()),
+                detail_key: None,
+                detail_params: None,
             }),
             "运行时写入失败必须保留 SftpWriteError 与底层诊断"
         );
@@ -3812,17 +3822,20 @@ mod tests {
             .get(&task.task_id)
             .unwrap()
             .clone();
-        let detail = registry_task
+        let error = registry_task
             .error
             .as_ref()
-            .expect("清理失败时 Cancelled 必须携带错误")
-            .detail
-            .as_deref()
-            .unwrap_or_default();
+            .expect("清理失败时 Cancelled 必须携带错误");
+        assert_eq!(error.code, "SftpTransferError");
+        let detail_key = error.detail_key.as_deref().unwrap_or_default();
+        let params = error.detail_params.clone().unwrap_or_default();
         assert!(
-            detail.contains(&temp_path.to_string_lossy().to_string()),
-            "清理失败错误必须包含临时路径，实际: {}",
-            detail
+            detail_key.contains("清理临时文件失败")
+                && params
+                    .iter()
+                    .any(|param| param.contains(&temp_path.to_string_lossy().to_string())),
+            "清理失败错误必须包含临时路径，实际: {:?}",
+            error
         );
         let _ = std::fs::remove_dir(&temp_path);
     }
@@ -4209,7 +4222,7 @@ mod tests {
         .expect_err("目标已存在 + Reject 必须失败");
 
         assert!(
-            matches!(&error, AppError::SftpTargetExists(path) if path == "/srv/f.txt"),
+            matches!(&error, AppError::SftpTargetExists(path) if path.to_string() == "/srv/f.txt"),
             "应返回结构化 SftpTargetExists，实际: {error:?}"
         );
         assert_eq!(fs.content("/srv/f.txt"), Some(b"old".to_vec()));
@@ -4266,7 +4279,7 @@ mod tests {
 
         assert!(
             matches!(&error, AppError::SftpPublishError(detail)
-                if detail.contains("无法保证安全替换") && detail.contains("旧目标保留")),
+                if detail.to_string().contains("无法保证安全替换") && detail.to_string().contains("旧目标保留")),
             "应保留旧目标并给出结构化发布错误，实际: {error:?}"
         );
         assert_eq!(
@@ -4293,7 +4306,7 @@ mod tests {
         .expect_err("元数据错误应传播");
 
         assert!(
-            matches!(&error, AppError::SftpChannelError(message) if message.contains("connection lost")),
+            matches!(&error, AppError::SftpChannelError(message) if message.to_string().contains("connection lost")),
             "元数据错误应原样返回，实际: {error:?}"
         );
     }
@@ -4559,11 +4572,10 @@ mod tests {
             .as_ref()
             .expect("发布失败必须携带结构化错误");
         assert_eq!(error.code, "SftpPublishError");
+        let detail_key = error.detail_key.as_deref().unwrap_or_default();
         assert!(
-            error.detail.as_deref().is_some_and(
-                |detail| detail.contains("无法保证安全替换") && detail.contains("旧目标保留")
-            ),
-            "发布失败必须说明旧目标保留"
+            detail_key.contains("无法保证安全替换") && detail_key.contains("旧目标保留"),
+            "发布失败必须说明旧目标保留，实际: {detail_key}"
         );
         assert_eq!(
             fs.content("/srv/keep.txt"),
@@ -4749,12 +4761,13 @@ mod tests {
             .clone();
         let error = registry_task.error.as_ref().expect("清理失败必须报告错误");
         assert_eq!(error.code, "SftpTransferError");
+        let detail_key = error.detail_key.as_deref().unwrap_or_default();
+        let params = error.detail_params.clone().unwrap_or_default();
         assert!(
-            error.detail.as_deref().is_some_and(
-                |detail| detail.contains("清理临时文件失败") && detail.contains(&temp_str)
-            ),
+            detail_key.contains("清理临时文件失败")
+                && params.iter().any(|param| param.contains(&temp_str)),
             "清理失败错误必须包含临时路径，实际: {:?}",
-            error.detail
+            error
         );
         assert!(
             fs.has_file(&temp_str),
@@ -4874,7 +4887,7 @@ mod tests {
             )
             .expect_err("相同最终目标的第二个上传应被拒绝");
         assert!(
-            matches!(&error, AppError::SftpTargetBusy(path) if path == "/srv/keep.txt"),
+            matches!(&error, AppError::SftpTargetBusy(path) if path.to_string() == "/srv/keep.txt"),
             "重复目标应返回结构化 SftpTargetBusy，实际: {error:?}"
         );
 

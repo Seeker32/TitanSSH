@@ -25,7 +25,7 @@ mod linux {
     }
 
     fn secure_store_error(error: keyring::Error) -> AppError {
-        AppError::SecureStoreError(error.to_string())
+        AppError::SecureStoreError(error.to_string().into())
     }
 
     /// 构造 Secret Service 主条目（平台默认存储）
@@ -95,7 +95,9 @@ mod linux {
     ) -> Result<String, AppError> {
         match fallback().map_err(secure_store_error)?.get_password() {
             Ok(value) => Ok(value),
-            Err(keyring::Error::NoEntry) => Err(AppError::CredentialNotFound(key.to_string())),
+            Err(keyring::Error::NoEntry) => {
+                Err(AppError::CredentialNotFound(key.to_string().into()))
+            }
             Err(error) => Err(secure_store_error(error)),
         }
     }
@@ -147,11 +149,11 @@ mod linux {
 /// - value: 要存储的明文凭据，存入后调用方应立即清除内存中的明文
 #[cfg(not(target_os = "linux"))]
 pub fn set_credential(key: &str, value: &str) -> Result<(), AppError> {
-    let entry =
-        Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
+    let entry = Entry::new(SERVICE_NAME, key)
+        .map_err(|e| AppError::SecureStoreError(e.to_string().into()))?;
     entry
         .set_password(value)
-        .map_err(|e| AppError::SecureStoreError(e.to_string()))
+        .map_err(|e| AppError::SecureStoreError(e.to_string().into()))
 }
 
 /// Linux 版本：Secret Service 主存储，守护不可用时回退内核 keyring
@@ -171,13 +173,13 @@ pub fn set_credential(key: &str, value: &str) -> Result<(), AppError> {
 /// - 若凭据不存在，返回 CredentialNotFound 而非通用 SecureStoreError，便于上层给出明确提示
 #[cfg(not(target_os = "linux"))]
 pub fn get_credential(key: &str) -> Result<String, AppError> {
-    let entry =
-        Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
+    let entry = Entry::new(SERVICE_NAME, key)
+        .map_err(|e| AppError::SecureStoreError(e.to_string().into()))?;
     entry.get_password().map_err(|error| {
         if matches!(error, keyring::Error::NoEntry) {
-            AppError::CredentialNotFound(key.to_string())
+            AppError::CredentialNotFound(key.to_string().into())
         } else {
-            AppError::SecureStoreError(error.to_string())
+            AppError::SecureStoreError(error.to_string().into())
         }
     })
 }
@@ -211,7 +213,7 @@ fn delete_macos_credential_with(
     match delete(SERVICE_NAME, key) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-        Err(error) => Err(AppError::SecureStoreError(error.to_string())),
+        Err(error) => Err(AppError::SecureStoreError(error.to_string().into())),
     }
 }
 
@@ -234,13 +236,13 @@ fn delete_macos_item(service: &str, account: &str) -> security_framework::base::
 /// 从非 macOS、非 Linux 的 OS 安全存储删除凭据；不存在时静默成功
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 pub fn delete_credential(key: &str) -> Result<(), AppError> {
-    let entry =
-        Entry::new(SERVICE_NAME, key).map_err(|e| AppError::SecureStoreError(e.to_string()))?;
+    let entry = Entry::new(SERVICE_NAME, key)
+        .map_err(|e| AppError::SecureStoreError(e.to_string().into()))?;
     match entry.delete_credential() {
         Ok(_) => Ok(()),
         // 凭据不存在时不视为错误
         Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(AppError::SecureStoreError(e.to_string())),
+        Err(e) => Err(AppError::SecureStoreError(e.to_string().into())),
     }
 }
 
@@ -497,7 +499,7 @@ mod fallback_tests {
         let error = get_with_fallback("key", entry(&primary), entry(&fallback))
             .expect_err("双存储均无记录应返回 CredentialNotFound");
 
-        assert!(matches!(error, AppError::CredentialNotFound(ref key) if key == "key"));
+        assert!(matches!(error, AppError::CredentialNotFound(ref key) if key.to_string() == "key"));
     }
 
     // --- delete 回退链 ---

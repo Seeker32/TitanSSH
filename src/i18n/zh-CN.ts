@@ -171,7 +171,7 @@ export const zhCN = {
   'error.IoError': 'IO 错误',
   'error.SshProtocolError': 'SSH 协议错误',
   'error.SecureStoreError': '安全存储错误',
-  'error.CredentialNotFound': '凭据不存在',
+  'error.CredentialNotFound': '凭据不存在，请重新编辑主机配置以重新保存密码',
   'error.SftpChannelError': 'SFTP 通道错误',
   'error.SftpPermissionDenied': 'SFTP 权限拒绝',
   'error.SftpPathNotFound': 'SFTP 路径不存在',
@@ -190,7 +190,9 @@ export const zhCN = {
   'error.HostKeyVerificationCancelled': '主机身份验证已取消',
   'error.HostKeySaveFailed': '主机信任保存失败',
   'error.HostTrustCleanupFailed': '主机信任记录清理失败',
+  'error.LogExportPathResolveFailed': '无法解析保存路径',
   'error.TrustStoreError': '信任存储不可用',
   'error.Unknown': '未知错误',
+  'error.Timeout': '连接超时',
 } as const;
 

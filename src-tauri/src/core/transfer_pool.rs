@@ -8,7 +8,7 @@
 use crate::core::host_identity::HostKeyVerifier;
 use crate::core::sftp_service::{SftpConnector, SftpRole};
 use crate::core::ssh_transport::SftpTransport;
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::HostConfig;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -211,10 +211,16 @@ impl TransferPool {
             // 优先复用空闲连接：基础连接（最小序号）先被取出
             if let Some(seq) = idle_min_seq(&state) {
                 let slot = state.connections.get_mut(&seq).ok_or_else(|| {
-                    CheckoutError::Connect(AppError::SftpChannelError("传输连接槽丢失".to_string()))
+                    CheckoutError::Connect(AppError::SftpChannelError(ErrorDetail::msg(
+                        "传输连接槽丢失",
+                        Vec::new(),
+                    )))
                 })?;
                 let transport = slot.transport.take().ok_or_else(|| {
-                    CheckoutError::Connect(AppError::SftpChannelError("传输连接槽为空".to_string()))
+                    CheckoutError::Connect(AppError::SftpChannelError(ErrorDetail::msg(
+                        "传输连接槽为空",
+                        Vec::new(),
+                    )))
                 })?;
                 return Ok(TransferCheckout { seq, transport });
             }

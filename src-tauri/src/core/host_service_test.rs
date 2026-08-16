@@ -2,6 +2,7 @@
 mod tests {
     use crate::core::host_identity::PresentedHostKey;
     use crate::core::host_service::*;
+    use crate::errors::app_error::ErrorDetail;
     use crate::models::session::HostIdentityChallenge;
     use crate::storage::trust_store::{TrustRecord, TrustStore};
     use proptest::prelude::*;
@@ -60,7 +61,10 @@ mod tests {
     impl TrustRecordCleanup for Arc<MemoryTrustCleanup> {
         fn forget_endpoint(&self, host: &str, port: u16) -> Result<(), AppError> {
             if *self.fail.lock().unwrap() {
-                return Err(AppError::TrustStoreError("注入的清理失败".to_string()));
+                return Err(AppError::TrustStoreError(ErrorDetail::msg(
+                    "注入的清理失败",
+                    Vec::new(),
+                )));
             }
             self.calls.lock().unwrap().push((host.to_string(), port));
             Ok(())
@@ -92,7 +96,10 @@ mod tests {
         fn set(&self, key: &str, value: &str) -> Result<(), AppError> {
             let fail_key = self.fail_set_key.lock().unwrap();
             if fail_key.as_deref() == Some(key) {
-                return Err(AppError::SecureStoreError("注入的写入失败".to_string()));
+                return Err(AppError::SecureStoreError(ErrorDetail::msg(
+                    "注入的写入失败",
+                    Vec::new(),
+                )));
             }
             self.entries
                 .lock()
@@ -104,7 +111,10 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), AppError> {
             let fail_key = self.fail_delete_key.lock().unwrap();
             if fail_key.as_deref() == Some(key) {
-                return Err(AppError::SecureStoreError("注入的删除失败".to_string()));
+                return Err(AppError::SecureStoreError(ErrorDetail::msg(
+                    "注入的删除失败",
+                    Vec::new(),
+                )));
             }
             self.entries.lock().unwrap().remove(key);
             Ok(())

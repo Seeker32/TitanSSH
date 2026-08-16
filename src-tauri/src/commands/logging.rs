@@ -2,6 +2,7 @@ use crate::commands::run_blocking_op;
 use crate::core::logging::LogStore;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use log::LevelFilter;
+use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 
@@ -21,7 +22,9 @@ fn parse_log_level(level: &str) -> Option<LevelFilter> {
 #[tauri::command]
 pub fn set_log_level(level: String) -> Result<(), AppErrorInfo> {
     let level = parse_log_level(&level).ok_or_else(|| {
-        AppErrorInfo::from(AppError::InvalidHostConfig("Invalid log level".to_string()))
+        AppErrorInfo::from(AppError::InvalidHostConfig(
+            "Invalid log level".to_string().into(),
+        ))
     })?;
     log::set_max_level(level);
     Ok(())
@@ -45,6 +48,23 @@ fn default_export_name() -> String {
     )
 }
 
+/// 解析保存对话框结果。
+///
+/// 用户取消（None）不是错误；但选中文件无法解析为本地路径（如云端/虚拟文件系统
+/// 的 URL 未落地）必须报错，绝不静默当作取消——否则命令报告成功却没有任何日志文件
+/// 被写出，用户会误以为导出成功。
+fn resolve_export_target(
+    file: Option<tauri_plugin_dialog::FilePath>,
+) -> Result<Option<PathBuf>, AppError> {
+    match file {
+        None => Ok(None),
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|error| AppError::LogExportPathResolveFailed(error.to_string().into())),
+    }
+}
+
 /// 弹出保存对话框并把日志文件复制到用户选择的目标路径。
 ///
 /// 目标路径由后端对话框解析，绝不经过 IPC 边界：webview 内任意脚本（含渲染远端
@@ -55,13 +75,12 @@ fn default_export_name() -> String {
 pub async fn export_logs(app: AppHandle) -> Result<(), AppErrorInfo> {
     let store = LogStore::new(&app).map_err(AppErrorInfo::from)?;
     run_blocking_op(move || {
-        let Some(target) = app
+        let picked = app
             .dialog()
             .file()
             .set_file_name(default_export_name())
-            .blocking_save_file()
-            .and_then(|file| file.into_path().ok())
-        else {
+            .blocking_save_file();
+        let Some(target) = resolve_export_target(picked)? else {
             return Ok(());
         };
         store.export_to(&target)

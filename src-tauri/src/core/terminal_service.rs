@@ -1,8 +1,8 @@
 use crate::core::host_identity::HostKeyVerifier;
 use crate::core::ssh_transport;
 use crate::core::ssh_transport::{ConnectPhase, TerminalTransport};
-use crate::errors::app_error::AppError;
 use crate::errors::app_error::AppErrorInfo;
+use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig};
 use crate::models::session::{SessionStatus, SessionStatusEvent, TerminalDataEvent};
 use crate::storage::secure_store;
@@ -145,7 +145,7 @@ fn start_terminal_session_with_parts<R, F>(
                 );
                 let (status, message) =
                     map_phase_error_to_status(&ConnectionPhase::LoadingCredentials, &error);
-                emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
+                emit_session_status(&app, &session_id, &runtime_status, status, message);
                 return;
             }
         };
@@ -198,7 +198,7 @@ fn start_terminal_session_with_parts<R, F>(
                 Ok(Ok(terminal)) => break terminal,
                 Ok(Err(error)) => {
                     let (status, message) = map_phase_error_to_status(&active_phase, &error);
-                    emit_session_status(&app, &session_id, &runtime_status, status, Some(message));
+                    emit_session_status(&app, &session_id, &runtime_status, status, message);
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -217,7 +217,7 @@ fn start_terminal_session_with_parts<R, F>(
                             &session_id,
                             &runtime_status,
                             SessionStatus::Timeout,
-                            Some(phase_timeout_message(&active_phase)),
+                            Some(timeout_status_detail(&active_phase)),
                         );
                         return;
                     }
@@ -228,7 +228,12 @@ fn start_terminal_session_with_parts<R, F>(
                         &session_id,
                         &runtime_status,
                         SessionStatus::Error,
-                        Some("连接线程异常退出".to_string()),
+                        Some(AppErrorInfo {
+                            code: "Unknown".to_string(),
+                            detail: None,
+                            detail_key: Some("连接线程异常退出".to_string()),
+                            detail_params: None,
+                        }),
                     );
                     return;
                 }
@@ -266,13 +271,15 @@ fn start_terminal_session_with_parts<R, F>(
                 // WouldBlock 表示当前无数据可读，继续循环
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => {
-                    // 非 WouldBlock 的 IO 错误视为连接断开
+                    // 非 WouldBlock 的 IO 错误视为连接断开；前端 Disconnected 展示
+                    // 本地化文案（session.disconnected），无需携带原始错误
+                    let _ = error.to_string();
                     emit_session_status(
                         &app,
                         &session_id,
                         &runtime_status,
                         SessionStatus::Disconnected,
-                        Some(error.to_string()),
+                        None,
                     );
                     break;
                 }
@@ -288,7 +295,7 @@ fn start_terminal_session_with_parts<R, F>(
                                 &session_id,
                                 &runtime_status,
                                 SessionStatus::Error,
-                                Some(error.to_string()),
+                                Some(raw_status_error(error.to_string())),
                             );
                         }
                     }
@@ -299,7 +306,7 @@ fn start_terminal_session_with_parts<R, F>(
                                 &session_id,
                                 &runtime_status,
                                 SessionStatus::Error,
-                                Some(error.to_string()),
+                                Some(raw_status_error(error.to_string())),
                             );
                         }
                     }
@@ -318,14 +325,14 @@ fn start_terminal_session_with_parts<R, F>(
                 }
             }
 
-            // 检测 EOF（远程端主动断开连接），派发"连接已断开"消息
+            // 检测 EOF（远程端主动断开连接），派发断开状态（前端展示本地化文案）
             if terminal.eof() {
                 emit_session_status(
                     &app,
                     &session_id,
                     &runtime_status,
                     SessionStatus::Disconnected,
-                    Some("连接已断开".to_string()),
+                    None,
                 );
                 break;
             }
@@ -358,10 +365,9 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
     match host.auth_type {
         AuthType::Password => {
             // 密码认证：必须存在密码引用键
-            let password_ref = host
-                .password_ref
-                .as_deref()
-                .ok_or_else(|| AppError::InvalidHostConfig("密码为必填项".to_string()))?;
+            let password_ref = host.password_ref.as_deref().ok_or_else(|| {
+                AppError::InvalidHostConfig(ErrorDetail::msg("密码为必填项", Vec::new()))
+            })?;
             debug!("[diagnostic] Loading password credential");
 
             let password = secure_store::get_credential(password_ref).map_err(|e| {
@@ -378,7 +384,10 @@ fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>
         AuthType::PrivateKey => {
             // 私钥认证：私钥路径必须存在
             if host.private_key_path.is_none() {
-                return Err(AppError::InvalidHostConfig("私钥路径为必填项".to_string()));
+                return Err(AppError::InvalidHostConfig(ErrorDetail::msg(
+                    "私钥路径为必填项",
+                    Vec::new(),
+                )));
             }
             // 私钥口令为可选项，若有引用键则读取
             let passphrase = if let Some(ref passphrase_ref) = host.passphrase_ref {
@@ -429,78 +438,77 @@ fn current_phase_value(state: &Arc<Mutex<ConnectionPhase>>) -> ConnectionPhase {
 /// 返回连接阶段的默认中文进度文案
 ///
 /// 该文案用于前端状态栏。
-fn phase_message(phase: &ConnectionPhase) -> &'static str {
-    match phase {
-        ConnectionPhase::LoadingCredentials => "正在读取凭据...",
-        ConnectionPhase::ConnectingTcp => "正在建立 TCP 连接...",
-        ConnectionPhase::SshHandshake => "正在进行 SSH 握手...",
-        ConnectionPhase::VerifyingHostKey => "正在验证主机身份...",
-        ConnectionPhase::Authenticating => "正在进行 SSH 认证...",
-        ConnectionPhase::OpeningChannel => "正在打开终端通道...",
-        ConnectionPhase::RequestingPty => "正在请求终端 PTY...",
-        ConnectionPhase::StartingShell => "正在启动 Shell...",
-    }
-}
-
-/// 返回连接阶段的超时提示文本
+/// 返回连接阶段的超时提示文本（中文源文案，兼作前端翻译 key，gettext msgid 风格）。
 ///
 /// 不同阶段使用明确文案，便于用户和开发者快速判断阻塞点。
 /// 主机身份确认（VerifyingHostKey）不设独立自动超时，永不进入此函数。
-fn phase_timeout_message(phase: &ConnectionPhase) -> String {
+fn phase_timeout_message(phase: &ConnectionPhase) -> &'static str {
     match phase {
-        ConnectionPhase::LoadingCredentials => "读取系统凭据超时".to_string(),
-        ConnectionPhase::ConnectingTcp => "建立 TCP 连接超时".to_string(),
-        ConnectionPhase::SshHandshake => "SSH 握手超时".to_string(),
-        ConnectionPhase::Authenticating => "SSH 认证超时".to_string(),
-        ConnectionPhase::OpeningChannel => "打开终端通道超时".to_string(),
-        ConnectionPhase::RequestingPty => "请求终端 PTY 超时".to_string(),
-        ConnectionPhase::StartingShell => "启动 Shell 超时".to_string(),
+        ConnectionPhase::LoadingCredentials => "读取系统凭据超时",
+        ConnectionPhase::ConnectingTcp => "建立 TCP 连接超时",
+        ConnectionPhase::SshHandshake => "SSH 握手超时",
+        ConnectionPhase::Authenticating => "SSH 认证超时",
+        ConnectionPhase::OpeningChannel => "打开终端通道超时",
+        ConnectionPhase::RequestingPty => "请求终端 PTY 超时",
+        ConnectionPhase::StartingShell => "启动 Shell 超时",
         // 防御性分支：验证阶段无自动超时，deadline 判定不会进入此函数；
         // 若协议层超时错误在阶段回读时仍显示为验证阶段，返回通用文案而非 panic
-        ConnectionPhase::VerifyingHostKey => "连接超时".to_string(),
+        ConnectionPhase::VerifyingHostKey => "连接超时",
     }
 }
 
-/// 将指定阶段中的错误映射为前端可消费的结构化状态
+/// 将指定阶段中的错误映射为前端可消费的结构化状态。
 ///
-/// 该函数统一处理认证失败、连接超时、网络错误、SSH 协议错误和安全存储错误，
-/// 保证不同阶段的错误提示具有明确的“卡点”上下文。
-fn map_phase_error_to_status(phase: &ConnectionPhase, error: &AppError) -> (SessionStatus, String) {
+/// 直接转发原 AppError 的结构化 payload（code + 可翻译详情），前端按当前语言
+/// 渲染完整文案；超时映射为 SessionStatus::Timeout 并携带该阶段的超时文案 key。
+fn map_phase_error_to_status(
+    phase: &ConnectionPhase,
+    error: &AppError,
+) -> (SessionStatus, Option<AppErrorInfo>) {
+    let forward = || Some(AppErrorInfo::from(error));
     match error {
-        AppError::AuthenticationError(msg) => {
-            (SessionStatus::AuthFailed, format!("认证失败: {msg}"))
+        AppError::AuthenticationError(_) => (SessionStatus::AuthFailed, forward()),
+        AppError::SshConnectionError(msg) if is_timeout_message(&msg.to_string()) => {
+            (SessionStatus::Timeout, Some(timeout_status_detail(phase)))
         }
-        AppError::SshConnectionError(msg) if is_timeout_message(msg) => {
-            (SessionStatus::Timeout, phase_timeout_message(phase))
-        }
-        AppError::SshConnectionError(msg) => (SessionStatus::Error, format!("网络连接失败: {msg}")),
+        AppError::SshConnectionError(_) => (SessionStatus::Error, forward()),
         AppError::SshProtocolError(err) if is_timeout_message(&err.to_string()) => {
-            (SessionStatus::Timeout, phase_timeout_message(phase))
+            (SessionStatus::Timeout, Some(timeout_status_detail(phase)))
         }
-        AppError::SshProtocolError(err) => (
-            SessionStatus::Error,
-            format!("{}: {err}", phase_message(phase)),
-        ),
-        AppError::SecureStoreError(msg) if is_timeout_message(msg) => {
-            (SessionStatus::Timeout, phase_timeout_message(phase))
+        AppError::SshProtocolError(_) => (SessionStatus::Error, forward()),
+        AppError::SecureStoreError(msg) if is_timeout_message(&msg.to_string()) => {
+            (SessionStatus::Timeout, Some(timeout_status_detail(phase)))
         }
-        AppError::SecureStoreError(msg) => (SessionStatus::Error, format!("凭据读取失败: {msg}")),
+        AppError::SecureStoreError(_) => (SessionStatus::Error, forward()),
         // 用户拒绝未知主机身份：不进入认证，展示结构化错误供所属标签渲染
-        AppError::HostKeyRejected(detail) => (
-            SessionStatus::Error,
-            format!("已拒绝未知主机身份: {detail}"),
-        ),
+        AppError::HostKeyRejected(_) => (SessionStatus::Error, forward()),
         // 会话关闭取消了等待中的主机身份验证
-        AppError::HostKeyVerificationCancelled(_) => (
-            SessionStatus::Error,
-            "主机身份验证已随会话关闭取消".to_string(),
-        ),
+        AppError::HostKeyVerificationCancelled(_) => (SessionStatus::Error, forward()),
         // 凭据不存在：引导用户重新保存主机配置，而非显示通用错误
-        AppError::CredentialNotFound(key) => (
-            SessionStatus::Error,
-            format!("凭据不存在（{key}），请重新编辑主机配置以重新保存密码"),
-        ),
-        _ => (SessionStatus::Error, error.to_string()),
+        AppError::CredentialNotFound(_) => (SessionStatus::Error, forward()),
+        _ => (SessionStatus::Error, forward()),
+    }
+}
+
+/// 构建阶段超时状态的结构化错误：code 为稳定 Timeout，摘要由前端本地化，
+/// detailKey 携带该阶段的超时文案（中文源文案，前端按语言翻译）。
+fn timeout_status_detail(phase: &ConnectionPhase) -> AppErrorInfo {
+    AppErrorInfo {
+        code: "Timeout".to_string(),
+        detail: None,
+        detail_key: Some(phase_timeout_message(phase).to_string()),
+        detail_params: None,
+    }
+}
+
+/// 构建纯机器诊断的状态错误（无固定文案）：摘要由前端按 code 本地化，
+/// detail 原样保留底层错误文本。
+fn raw_status_error(detail: String) -> AppErrorInfo {
+    AppErrorInfo {
+        code: "Unknown".to_string(),
+        detail: Some(detail),
+        detail_key: None,
+        detail_params: None,
     }
 }
 
@@ -547,7 +555,7 @@ fn emit_session_status<R: tauri::Runtime>(
     session_id: &str,
     runtime_status: &Arc<Mutex<SessionStatus>>,
     status: SessionStatus,
-    message: Option<String>,
+    message: Option<AppErrorInfo>,
 ) {
     debug!(
         "[session:{}][diagnostic] Emitting session status: {:?}, has_message={}",
@@ -563,10 +571,7 @@ fn emit_session_status<R: tauri::Runtime>(
         SessionStatusEvent {
             session_id: session_id.to_string(),
             status,
-            error: message.map(|detail| AppErrorInfo {
-                code: "Unknown".to_string(),
-                detail: Some(detail),
-            }),
+            error: message,
         },
     );
     if result.is_err() {

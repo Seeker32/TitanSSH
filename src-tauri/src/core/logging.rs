@@ -14,7 +14,7 @@ use chrono::Local;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use tauri::{AppHandle, Manager};
 
-use crate::errors::app_error::AppError;
+use crate::errors::app_error::{AppError, ErrorDetail};
 
 /// 日志文件名（位于 OS 应用日志目录）。
 const LOG_FILE_NAME: &str = "titanssh.log";
@@ -32,10 +32,12 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 /// 解析应用日志目录下 titanssh.log 的完整路径（安装与 LogStore 共用）。
 pub fn resolve_log_file_path(app_handle: &AppHandle) -> Result<PathBuf, AppError> {
-    let log_dir = app_handle
-        .path()
-        .app_log_dir()
-        .map_err(|error| AppError::StorageError(format!("无法获取应用日志目录: {error}")))?;
+    let log_dir = app_handle.path().app_log_dir().map_err(|error| {
+        AppError::StorageError(ErrorDetail::msg(
+            "无法获取应用日志目录: {0}",
+            vec![error.to_string()],
+        ))
+    })?;
     Ok(log_dir.join(LOG_FILE_NAME))
 }
 
