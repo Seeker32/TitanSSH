@@ -37,6 +37,7 @@ mod tests {
     struct MemoryCredentialStore {
         entries: Mutex<HashMap<String, String>>,
         fail_set_key: Mutex<Option<String>>,
+        fail_get_key: Mutex<Option<String>>,
         fail_delete_key: Mutex<Option<String>>,
     }
 
@@ -87,6 +88,11 @@ mod tests {
             *self.fail_set_key.lock().unwrap() = Some(key.to_string());
         }
 
+        /// 注入对该 key 的读取失败
+        fn fail_get_for(&self, key: &str) {
+            *self.fail_get_key.lock().unwrap() = Some(key.to_string());
+        }
+
         /// 注入对该 key 的删除失败
         fn fail_delete_for(&self, key: &str) {
             *self.fail_delete_key.lock().unwrap() = Some(key.to_string());
@@ -94,6 +100,24 @@ mod tests {
     }
 
     impl CredentialStore for Arc<MemoryCredentialStore> {
+        fn get(&self, key: &str) -> Result<String, AppError> {
+            let fail_key = self.fail_get_key.lock().unwrap();
+            if fail_key.as_deref() == Some(key) {
+                return Err(AppError::SecureStoreError(ErrorDetail::msg(
+                    "注入的读取失败",
+                    Vec::new(),
+                )));
+            }
+            self.entries
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::CredentialNotFound(ErrorDetail::msg("凭据不存在", Vec::new()))
+                })
+        }
+
         fn set(&self, key: &str, value: &str) -> Result<(), AppError> {
             let fail_key = self.fail_set_key.lock().unwrap();
             if fail_key.as_deref() == Some(key) {
@@ -507,21 +531,172 @@ mod tests {
         );
     }
 
+    /// 覆盖保存已有主机的密码后落盘失败:补偿必须还原被覆盖的旧凭据而非删除,
+    /// 否则未修改的 hosts.json 仍引用该 key,旧凭据永久丢失。
+    #[cfg(unix)]
     #[test]
-    fn second_credential_write_failure_compensates_first() {
-        // 请求同时携带密码与口令(非前端常规路径);第二个写入失败时补偿第一个
+    fn save_commit_failure_restores_overwritten_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let (creds, service, file_path, _cleanup) = test_service_with_path_and_cleanup();
+        service.save(&request_with_password("id1", "s1")).unwrap();
+        // 文件置为只读:load 成功而 commit 写入必然失败
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let result = service.save(&request_with_password("id1", "s2"));
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(result.is_err(), "落盘失败必须返回错误");
+        assert_eq!(
+            creds
+                .entries()
+                .get("titanssh-id1-password")
+                .map(String::as_str),
+            Some("s1"),
+            "落盘失败时被覆盖的旧凭据必须还原,不得删除"
+        );
+    }
+
+    /// 认证切换 Password→PrivateKey 且请求携带无关新密码:无关凭据不写入、
+    /// 引用置 None,切换后的陈旧清理不会误删本次写入的 key(修复落盘引用悬空)。
+    #[test]
+    fn auth_switch_with_leftover_password_does_not_dangle_ref() {
+        let (creds, service) = test_service();
+        service
+            .save(&request_with_password("host-1", "secret123"))
+            .unwrap();
+        let req = SaveHostRequest {
+            auth_type: AuthType::PrivateKey,
+            private_key_path: Some("~/.ssh/id_rsa".to_string()),
+            password: Some("leftover-pwd".to_string()),
+            ..sample_request("host-1", "prod")
+        };
+        let hosts = service.save(&req).unwrap();
+        assert!(
+            hosts[0].password_ref.is_none(),
+            "切换后与 auth 无关的密码引用必须为 None"
+        );
+        assert!(hosts[0].passphrase_ref.is_none());
+        let entries = creds.entries();
+        assert!(
+            !entries.contains_key("titanssh-host-1-password"),
+            "旧密码凭据已清理,且无关新密码不得写入"
+        );
+    }
+
+    /// 认证切换 PrivateKey→Password 且请求携带无关新口令:口令不写入、引用置 None,
+    /// 切换后的陈旧清理不会误删本次写入的 key。
+    #[test]
+    fn auth_switch_with_leftover_passphrase_does_not_dangle_ref() {
+        let (creds, service) = test_service();
+        let privkey_req = SaveHostRequest {
+            auth_type: AuthType::PrivateKey,
+            private_key_path: Some("~/.ssh/id_rsa".to_string()),
+            passphrase: Some("pp-123".to_string()),
+            ..sample_request("host-2", "prod")
+        };
+        service.save(&privkey_req).unwrap();
+        let req = SaveHostRequest {
+            passphrase: Some("leftover-pp".to_string()),
+            ..request_with_password("host-2", "pwd-456")
+        };
+        let hosts = service.save(&req).unwrap();
+        assert!(
+            hosts[0].passphrase_ref.is_none(),
+            "切换后与 auth 无关的口令引用必须为 None"
+        );
+        assert_eq!(
+            hosts[0].password_ref.as_deref(),
+            Some("titanssh-host-2-password")
+        );
+        let entries = creds.entries();
+        assert!(
+            !entries.contains_key("titanssh-host-2-passphrase"),
+            "旧口令凭据已清理,且无关新口令不得写入"
+        );
+        assert_eq!(
+            entries.get("titanssh-host-2-password").map(String::as_str),
+            Some("pwd-456")
+        );
+    }
+
+    /// 覆盖前快照读取失败:中止保存,不写新凭据、不改文件,避免盲覆盖破坏旧凭据
+    #[test]
+    fn credential_snapshot_failure_aborts_save_without_writing() {
+        let (creds, service) = test_service();
+        service
+            .save(&request_with_password("host-1", "secret123"))
+            .unwrap();
+        creds.fail_get_for("titanssh-host-1-password");
+        let result = service.save(&request_with_password("host-1", "new-secret"));
+        assert!(result.is_err(), "快照失败必须中止保存");
+        assert_eq!(
+            creds
+                .entries()
+                .get("titanssh-host-1-password")
+                .map(String::as_str),
+            Some("secret123"),
+            "快照失败不得写入新凭据"
+        );
+        assert_eq!(
+            service.list_hosts().unwrap()[0].password_ref.as_deref(),
+            Some("titanssh-host-1-password")
+        );
+    }
+
+    /// auth=Password 时忽略与 auth 无关的口令:不写入安全存储、引用置 None
+    #[test]
+    fn password_auth_ignores_passphrase_credential() {
         let (creds, service) = test_service();
         let req = SaveHostRequest {
             private_key_path: Some("~/.ssh/id_rsa".to_string()),
             passphrase: Some("pp-123".to_string()),
-            ..request_with_password("host-both", "pwd-123")
+            ..request_with_password("host-1", "pwd-1")
         };
-        creds.fail_set_for("titanssh-host-both-passphrase");
-        let result = service.save(&req);
-        assert!(result.is_err());
+        let hosts = service.save(&req).unwrap();
         assert!(
-            creds.entries().is_empty(),
-            "第二个凭据写入失败后,已写入的第一个凭据必须补偿删除"
+            hosts[0].passphrase_ref.is_none(),
+            "与 auth 无关的口令引用必须为 None"
+        );
+        assert_eq!(
+            hosts[0].password_ref.as_deref(),
+            Some("titanssh-host-1-password")
+        );
+        let entries = creds.entries();
+        assert_eq!(entries.len(), 1, "无关口令不得写入安全存储");
+        assert_eq!(
+            entries.get("titanssh-host-1-password").map(String::as_str),
+            Some("pwd-1")
+        );
+    }
+
+    /// auth=PrivateKey 时忽略与 auth 无关的密码:不写入安全存储、引用置 None
+    #[test]
+    fn private_key_auth_ignores_password_credential() {
+        let (creds, service) = test_service();
+        let req = SaveHostRequest {
+            password: Some("pwd-1".to_string()),
+            ..SaveHostRequest {
+                auth_type: AuthType::PrivateKey,
+                private_key_path: Some("~/.ssh/id_rsa".to_string()),
+                passphrase: Some("pp-123".to_string()),
+                ..sample_request("host-1", "prod")
+            }
+        };
+        let hosts = service.save(&req).unwrap();
+        assert!(
+            hosts[0].password_ref.is_none(),
+            "与 auth 无关的密码引用必须为 None"
+        );
+        assert_eq!(
+            hosts[0].passphrase_ref.as_deref(),
+            Some("titanssh-host-1-passphrase")
+        );
+        let entries = creds.entries();
+        assert_eq!(entries.len(), 1, "无关密码不得写入安全存储");
+        assert_eq!(
+            entries
+                .get("titanssh-host-1-passphrase")
+                .map(String::as_str),
+            Some("pp-123")
         );
     }
 
@@ -775,7 +950,14 @@ mod tests {
             cleanup.calls().is_empty(),
             "commit 未成功不得尝试清理信任记录"
         );
-        assert!(creds.entries().is_empty(), "落盘失败时补偿删除写入的凭据");
+        assert_eq!(
+            creds
+                .entries()
+                .get("titanssh-id1-password")
+                .map(String::as_str),
+            Some("s1"),
+            "落盘失败时补偿还原被覆盖的旧凭据"
+        );
     }
 
     // --- 集成：HostConfig 生命周期 × 真实信任存储与身份服务 ---
@@ -1283,6 +1465,10 @@ mod tests {
     }
 
     impl CredentialStore for Arc<GatedCredentialStore> {
+        fn get(&self, key: &str) -> Result<String, AppError> {
+            self.inner.get(key)
+        }
+
         fn set(&self, key: &str, value: &str) -> Result<(), AppError> {
             self.arrivals.fetch_add(1, Ordering::SeqCst);
             let deadline = Instant::now() + Duration::from_millis(500);

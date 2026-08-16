@@ -11,6 +11,9 @@ use tauri::{AppHandle, Manager};
 /// 真实实现包装 secure_store(Keychain / Credential Manager / Secret Service);
 /// 内存实现仅用于测试,可注入失败以覆盖错误路径。
 pub trait CredentialStore {
+    /// 读取凭据;不存在的 key 返回 CredentialNotFound
+    fn get(&self, key: &str) -> Result<String, AppError>;
+
     /// 写入凭据;写入失败时上层负责补偿
     fn set(&self, key: &str, value: &str) -> Result<(), AppError>;
 
@@ -22,6 +25,10 @@ pub trait CredentialStore {
 pub struct SecureCredentialStore;
 
 impl CredentialStore for SecureCredentialStore {
+    fn get(&self, key: &str) -> Result<String, AppError> {
+        secure_store::get_credential(key)
+    }
+
     fn set(&self, key: &str, value: &str) -> Result<(), AppError> {
         secure_store::set_credential(key, value)
     }
@@ -119,24 +126,26 @@ impl HostConfigService {
 
     /// 保存主机配置，返回更新后的完整列表
     ///
-    /// 流程：校验 → 加载现有列表 → 写入新凭据并解析引用（留空/缺省且 auth type
-    /// 未变时保留旧引用）→ 构造 HostConfig → upsert → 落盘（commit 点）→
+    /// 流程：校验 → 加载现有列表 → 写入与 auth type 相关的凭据并解析引用
+    /// （无关凭据不写入、引用置 None；相关凭据留空/缺省且 auth type 未变时
+    /// 保留旧引用）→ 构造 HostConfig → upsert → 落盘（commit 点）→
     /// auth type 切换时尽力删除陈旧凭据 → endpoint 变化时清理旧信任记录。
     ///
     /// # 一致性保证
-    /// 任一失败（凭据写入或落盘）时，补偿删除本次调用已写入的凭据，保持
-    /// 安全存储与 hosts.json 一致；陈旧凭据清理只发生在 commit 之后，
-    /// 失败时旧凭据保持可用。信任记录清理同样只发生在 commit 之后：
-    /// 仅当更新后的配置集合不再引用旧 endpoint 时才删除其记录；清理失败
-    /// 以 HostTrustCleanupFailed 显式返回（commit 已生效，不补偿已写入凭据）。
+    /// 任一失败（凭据写入或落盘）时，补偿将本次调用已写入的凭据还原到写入前状态：
+    /// 覆盖写入的还原旧值、新增的删除，保持安全存储与 hosts.json 一致——
+    /// 已存主机覆盖保存失败时旧凭据仍被未修改的 hosts.json 引用，必须还原而非删除；
+    /// 陈旧凭据清理只发生在 commit 之后，失败时旧凭据保持可用。信任记录清理同样
+    /// 只发生在 commit 之后：仅当更新后的配置集合不再引用旧 endpoint 时才删除其记录；
+    /// 清理失败以 HostTrustCleanupFailed 显式返回（commit 已生效，不补偿已写入凭据）。
     ///
     /// # 参数
     /// - `request`: 含明文凭据的保存请求，处理完毕后明文不持久化
     pub fn save(&self, request: &SaveHostRequest) -> Result<Vec<HostConfig>, AppError> {
         validate_save_request(request)?;
 
-        // 本次调用已写入的凭据 key；任一失败时用于补偿删除，保持安全存储与文件一致
-        let mut written_keys: Vec<String> = Vec::new();
+        // 本次调用已写入的凭据及其写入前快照；任一失败时用于补偿还原，保持安全存储与文件一致
+        let mut written: Vec<CredentialWrite> = Vec::new();
 
         let result = (|| -> Result<SaveResult, AppError> {
             let existing_hosts = self.host_store.load()?;
@@ -152,23 +161,30 @@ impl HostConfigService {
                 .filter(|host| host.host != request.host || host.port != request.port)
                 .map(|host| (host.host.clone(), host.port));
 
-            let password_ref = self.resolve_credential_ref(
-                &request.id,
-                &request.password,
-                secure_store::password_key,
-                existing.and_then(|host| host.password_ref.as_deref()),
-                auth_type_changed,
-                &mut written_keys,
-            )?;
-
-            let passphrase_ref = self.resolve_credential_ref(
-                &request.id,
-                &request.passphrase,
-                secure_store::passphrase_key,
-                existing.and_then(|host| host.passphrase_ref.as_deref()),
-                auth_type_changed,
-                &mut written_keys,
-            )?;
+            // 仅解析与 auth type 相关的凭据：无关凭据不写入安全存储、引用置 None。
+            // 若两种都写，auth 切换后的陈旧清理会误删本次调用刚写入的 key，
+            // 使落盘引用悬空；只写相关的那一个则被清理的必非本次写入。
+            let (password_ref, passphrase_ref) = if request.auth_type == AuthType::Password {
+                let password_ref = self.resolve_credential_ref(
+                    &request.id,
+                    &request.password,
+                    secure_store::password_key,
+                    existing.and_then(|host| host.password_ref.as_deref()),
+                    auth_type_changed,
+                    &mut written,
+                )?;
+                (password_ref, None)
+            } else {
+                let passphrase_ref = self.resolve_credential_ref(
+                    &request.id,
+                    &request.passphrase,
+                    secure_store::passphrase_key,
+                    existing.and_then(|host| host.passphrase_ref.as_deref()),
+                    auth_type_changed,
+                    &mut written,
+                )?;
+                (None, passphrase_ref)
+            };
 
             // 构建不含明文的 HostConfig 用于落盘
             let host_config = HostConfig {
@@ -193,7 +209,9 @@ impl HostConfigService {
                 hosts.push(host_config);
             }
 
-            // 落盘是 commit 点：文件更新成功后，才清理切换遗留的陈旧凭据
+            // 落盘是 commit 点：文件更新成功后，才清理切换遗留的陈旧凭据。
+            // 被清理的是与旧 auth type 相关、本次未写入的 key（本调用只写与新
+            // auth type 相关的凭据），不存在误删本次写入导致落盘引用悬空。
             self.host_store.save(&hosts)?;
             if auth_type_changed {
                 if request.auth_type == AuthType::PrivateKey {
@@ -218,9 +236,17 @@ impl HostConfigService {
                 Ok(hosts)
             }
             Err(error) => {
-                // 失败补偿：删除本次调用写入的凭据，避免孤儿条目与悬空引用
-                for key in &written_keys {
-                    let _ = self.credential_store.delete(key);
+                // 失败补偿：还原被覆盖的旧凭据、删除本次新增的凭据，避免孤儿条目与悬空引用。
+                // 覆盖保存已有主机时 key 与旧 hosts.json 引用相同，直接删除会永久丢失旧凭据。
+                for write in &written {
+                    match &write.prev {
+                        Some(prev) => {
+                            let _ = self.credential_store.set(&write.key, prev);
+                        }
+                        None => {
+                            let _ = self.credential_store.delete(&write.key);
+                        }
+                    }
                 }
                 Err(error)
             }
@@ -293,8 +319,9 @@ impl HostConfigService {
         Ok(())
     }
 
-    /// 解析单个凭据引用:非空明文写入安全存储并返回新引用 key;
-    /// 空/缺省时,认证方式未切换则保留旧引用,切换则置 None
+    /// 解析与 auth type 相关的单个凭据引用（调用方只对相关凭据调用本方法）:
+    /// 非空明文写入安全存储并返回新引用 key; 空/缺省时,认证方式未切换则
+    /// 保留旧引用,切换则置 None
     ///
     /// # 参数
     /// - `host_id`: 主机 ID,用于派生引用 key
@@ -302,7 +329,7 @@ impl HostConfigService {
     /// - `key_fn`: 引用 key 生成函数(password_key / passphrase_key)
     /// - `existing_ref`: 旧引用
     /// - `auth_type_changed`: 认证方式是否已切换
-    /// - `written_keys`: 本次调用已写入的 key 列表,供失败补偿
+    /// - `written`: 本次调用已写入的凭据及写入前快照,供失败补偿还原
     fn resolve_credential_ref(
         &self,
         host_id: &str,
@@ -310,13 +337,23 @@ impl HostConfigService {
         key_fn: fn(&str) -> String,
         existing_ref: Option<&str>,
         auth_type_changed: bool,
-        written_keys: &mut Vec<String>,
+        written: &mut Vec<CredentialWrite>,
     ) -> Result<Option<String>, AppError> {
         if let Some(value) = provided {
             if !value.is_empty() {
                 let key = key_fn(host_id);
+                // 覆盖前快照旧值：key 由 host_id 派生，与旧 hosts.json 引用相同，
+                // 失败补偿时需还原旧值而非删除；快照失败立即中止，避免盲覆盖破坏旧凭据
+                let prev = match self.credential_store.get(&key) {
+                    Ok(value) => Some(value),
+                    Err(AppError::CredentialNotFound(_)) => None,
+                    Err(error) => return Err(error),
+                };
                 self.credential_store.set(&key, value)?;
-                written_keys.push(key.clone());
+                written.push(CredentialWrite {
+                    key: key.clone(),
+                    prev,
+                });
                 return Ok(Some(key));
             }
         }
@@ -331,6 +368,13 @@ impl HostConfigService {
 
 /// save 内部流程结果：commit 后的配置列表 + 本次发生变化的旧 endpoint。
 type SaveResult = (Vec<HostConfig>, Option<(String, u16)>);
+
+/// 本次调用写入凭据的补偿信息：key + 覆盖前的旧值快照。
+/// prev 为 None 表示写入前该 key 不存在，补偿时删除；Some 则补偿时还原旧值。
+struct CredentialWrite {
+    key: String,
+    prev: Option<String>,
+}
 
 /// 应用级共享服务：单一实例持有 Mutex，串行化 hosts.json 的读-改-写周期
 ///
