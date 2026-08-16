@@ -179,4 +179,28 @@ mod loop_tests {
         assert_eq!(snapshots[0].session_id, "session-1");
         assert_eq!(snapshots[0].disk_usage, Some(25.0));
     }
+
+    /// 采集输出不含任何指标键（脚本被受限 shell 拦截、awk/df 缺失等）时
+    /// 必须触发 on_error 终止循环，而不是每 2 秒发布一个全 None 的退化快照。
+    #[test]
+    fn empty_collection_output_fires_error_and_stops_loop() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let snapshots_for_callback = snapshots.clone();
+        let errors_for_callback = errors.clone();
+        let shutdown_for_transport = shutdown.clone();
+
+        run_monitor_loop_with(
+            move |_, _, _| Ok(one_shot_exec(String::new(), shutdown_for_transport)),
+            make_params(shutdown),
+            move |snapshot| snapshots_for_callback.lock().unwrap().push(snapshot),
+            move |err| errors_for_callback.lock().unwrap().push(err),
+        );
+
+        assert_eq!(snapshots.lock().unwrap().len(), 0, "空输出不得发布快照");
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1, "空输出应触发一次 on_error");
+        assert_eq!(errors[0].code(), "MonitorCollectionError");
+    }
 }

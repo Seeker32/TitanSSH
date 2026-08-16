@@ -160,6 +160,12 @@ pub enum AppError {
     #[error("监控快照尚不可用: {0}")]
     MonitorSnapshotUnavailable(ErrorDetail),
 
+    /// 监控采集输出不含任何指标键（脚本未执行、awk/df 缺失、shell 受限等）；
+    /// 与个别字段缺失的未知语义不同，零指标键说明采集管线整体损坏，
+    /// 必须终止任务而非每 2 秒发布一个全 None 的退化快照
+    #[error("监控采集输出无效: {0}")]
+    MonitorCollectionError(ErrorDetail),
+
     /// 下载目标已存在且冲突策略为 Reject（前端据此逐文件确认覆盖）
     #[error("SFTP 目标已存在: {0}")]
     SftpTargetExists(ErrorDetail),
@@ -231,6 +237,7 @@ impl AppError {
             Self::SftpTaskNotFound(_) => "SftpTaskNotFound",
             Self::MonitorTaskNotFound(_) => "MonitorTaskNotFound",
             Self::MonitorSnapshotUnavailable(_) => "MonitorSnapshotUnavailable",
+            Self::MonitorCollectionError(_) => "MonitorCollectionError",
             Self::SftpTargetExists(_) => "SftpTargetExists",
             Self::SftpTargetBusy(_) => "SftpTargetBusy",
             Self::SftpPublishError(_) => "SftpPublishError",
@@ -284,6 +291,7 @@ impl AppError {
             Self::MonitorSnapshotUnavailable(p) => {
                 Self::MonitorSnapshotUnavailable(append(p, extra))
             }
+            Self::MonitorCollectionError(p) => Self::MonitorCollectionError(append(p, extra)),
             Self::SftpTargetExists(p) => Self::SftpTargetExists(append(p, extra)),
             Self::SftpTargetBusy(p) => Self::SftpTargetBusy(append(p, extra)),
             Self::SftpPublishError(p) => Self::SftpPublishError(append(p, extra)),
@@ -328,6 +336,7 @@ impl From<&AppError> for AppErrorInfo {
             | AppError::SftpTaskNotFound(p)
             | AppError::MonitorTaskNotFound(p)
             | AppError::MonitorSnapshotUnavailable(p)
+            | AppError::MonitorCollectionError(p)
             | AppError::SftpTargetExists(p)
             | AppError::SftpTargetBusy(p)
             | AppError::SftpPublishError(p)

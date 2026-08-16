@@ -4,12 +4,17 @@ use crate::core::ssh_transport::ExecTransport;
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, NetworkInterface, NetworkSnapshot};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 /// 采集脚本：通过 SSH 执行并返回服务器关键指标
+///
+/// 末行用 if 块收尾：条件不成立时 POSIX 规定退出码为 0，保证网络源
+/// 不可用的主机不因退出码非零被未来的退出码校验误判为采集失败。
 const STATUS_SCRIPT: &str = r#"MEMINFO_LINE=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {available=$2} END {printf "MEM_TOTAL_KB=%s\nMEM_AVAILABLE_KB=%s\n", total, available}' /proc/meminfo 2>/dev/null)
 CPU_LINE=$(awk '/^cpu / {printf "CPU_TOTAL=%s\nCPU_IDLE=%s\n", ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6)}' /proc/stat 2>/dev/null)
 DISK_LINE=$(df -B1 / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); printf "DISK=%s\nDISK_AVAIL=%s\nDISK_TOTAL=%s\n", $5, $4, $2}')
@@ -21,7 +26,9 @@ echo "$CPU_LINE"
 echo "$MEMINFO_LINE"
 echo "$DISK_LINE"
 echo "NETWORK_STATUS=$NETWORK_STATUS"
-[ "$NETWORK_STATUS" = available ] && echo "$NETWORK_LINE""#;
+if [ "$NETWORK_STATUS" = available ]; then
+  echo "$NETWORK_LINE"
+fi"#;
 
 /// CPU 原始计数快照，来自 /proc/stat 第一行累计值
 type CpuSample = (u64, u64);
@@ -178,7 +185,7 @@ fn collect_once(
     previous_cpu_sample: Option<CpuSample>,
     previous_network_sample: Option<NetworkSample>,
 ) -> Result<(MonitorSnapshot, Option<CpuSample>, Option<NetworkSample>), AppError> {
-    let output = transport.execute(&format!("sh -c '{}'", STATUS_SCRIPT.replace('\'', "'\\''")))?;
+    let output = transport.execute(&build_collect_command(STATUS_SCRIPT))?;
 
     parse_snapshot_at(
         session_id,
@@ -189,9 +196,21 @@ fn collect_once(
     )
 }
 
+/// 将采集脚本编码为可被任意登录 shell（sh/csh/fish）解析的远端命令。
+///
+/// sshd 用账户登录 shell 的 `-c` 执行 exec 命令，POSIX `'\''` 转义在
+/// csh/tcsh/fish 中不成立。改为 `echo <base64> | base64 -d | sh`：base64
+/// 字符集不含 shell 元字符，命令无引号无转义，任何 shell 解析结果一致；
+/// 脚本原文经 stdin 交给 POSIX sh 执行。目标主机需可用 base64 -d
+/// （coreutils/busybox）。
+fn build_collect_command(script: &str) -> String {
+    format!("echo {} | base64 -d | sh", STANDARD.encode(script))
+}
+
 /// 解析单次采集输出并按给定采样时刻计算网卡速率。
 ///
-/// 网络字段缺失或格式错误时只将网络标记为不可用，不影响其他指标。
+/// 畸形 NET 行只丢弃该接口（同 lo 跳过），不影响其他指标；仅当
+/// NETWORK_STATUS 缺失/不可用时网络区域才整体降级为不可用并重置基线。
 /// `previous_network_sample` 仅由监控 worker 传入，用于保留首次采样的未知速率。
 fn parse_snapshot_at(
     session_id: &str,
@@ -208,8 +227,33 @@ fn parse_snapshot_at(
     let mut cpu_total = None;
     let mut cpu_idle = None;
     let mut network_available = false;
-    let mut network_parse_failed = false;
     let mut network_interfaces = vec![];
+
+    // 零指标键的输出说明采集管线本身已损坏（脚本未执行、awk/df 缺失、
+    // shell 受限等）：必须报错终止循环，而不是每 2 秒发布一个全 None 的
+    // 退化快照。前缀列表与下方解析分支一一对应，新增指标键时需同步。
+    const METRIC_KEY_PREFIXES: [&str; 8] = [
+        "CPU_TOTAL=",
+        "CPU_IDLE=",
+        "MEM_TOTAL_KB=",
+        "MEM_AVAILABLE_KB=",
+        "DISK=",
+        "DISK_AVAIL=",
+        "DISK_TOTAL=",
+        "NET=",
+    ];
+    let has_any_metric_key = output.lines().any(|line| {
+        METRIC_KEY_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    });
+    if !has_any_metric_key {
+        return Err(AppError::MonitorCollectionError(
+            "远端脚本输出未包含任何指标键，采集管线可能已损坏"
+                .to_string()
+                .into(),
+        ));
+    }
 
     for line in output.lines() {
         if let Some(v) = line.strip_prefix("CPU_TOTAL=") {
@@ -229,12 +273,14 @@ fn parse_snapshot_at(
         } else if line == "NETWORK_STATUS=available" {
             network_available = true;
         } else if let Some(v) = line.strip_prefix("NET=") {
+            // 畸形行与 lo 一样只丢弃该接口，不降级整个网络区域：
+            // 接口名异常/输出撕裂只应损失该接口的速率，
+            // 只有 NETWORK_STATUS=unavailable 才整体降级并重置基线。
             if v.split(',').next().is_some_and(|name| name.trim() == "lo") {
                 continue;
             }
-            match parse_network_counter(v) {
-                Some(counter) => network_interfaces.push(counter),
-                None => network_parse_failed = true,
+            if let Some(counter) = parse_network_counter(v) {
+                network_interfaces.push(counter);
             }
         }
     }
@@ -246,21 +292,17 @@ fn parse_snapshot_at(
         timestamp,
         interfaces: network_interfaces,
     });
-    let (network, current_network_sample) = match current_network_sample {
-        Some(sample) if !network_parse_failed => (
-            NetworkSnapshot {
-                available: true,
-                interfaces: compute_network_rates(previous_network_sample.as_ref(), &sample),
-            },
-            Some(sample),
-        ),
-        _ => (
-            NetworkSnapshot {
-                available: false,
-                interfaces: vec![],
-            },
-            None,
-        ),
+    // 基线仅在网络源缺失（NETWORK_STATUS != available）时重置；
+    // 个别畸形行已被丢弃，本轮累计计数仍进入基线供下轮计算速率。
+    let network = match current_network_sample.as_ref() {
+        Some(sample) => NetworkSnapshot {
+            available: true,
+            interfaces: compute_network_rates(previous_network_sample.as_ref(), sample),
+        },
+        None => NetworkSnapshot {
+            available: false,
+            interfaces: vec![],
+        },
     };
 
     Ok((
@@ -385,7 +427,10 @@ fn resolve_memory_usage(total_kb: Option<f64>, available_kb: Option<f64>) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkSample, STATUS_SCRIPT, compute_cpu_usage, parse_snapshot_at};
+    use super::{
+        NetworkSample, STATUS_SCRIPT, build_collect_command, compute_cpu_usage, parse_snapshot_at,
+    };
+    use crate::errors::app_error::AppError;
 
     /// 验证 parse_snapshot 能正确解析原始脚本输出，并由 Rust 计算内存与磁盘指标
     #[test]
@@ -403,17 +448,25 @@ mod tests {
         assert_eq!(cpu_sample, None);
     }
 
-    /// 验证 parse_snapshot 在脚本输出为空时不报错，各指标为未知（None）
+    /// 验证 parse_snapshot 在输出不含任何指标键时返回错误而非全 None 快照：
+    /// 零指标键说明采集管线本身已损坏（脚本未执行、awk/df 缺失等），
+    /// 必须 surface 为错误终止监控循环；个别字段缺失仍走未知语义。
     #[test]
-    fn parse_snapshot_defaults_on_missing_fields() {
-        let (snap, cpu_sample, _) =
-            parse_snapshot_at("session-2", "", None, None, 2_000).expect("空输出不应返回错误");
-        assert_eq!(snap.cpu_usage, None);
-        assert_eq!(snap.memory_usage, None);
-        assert_eq!(snap.disk_usage, None);
-        assert_eq!(snap.disk_available_bytes, None);
-        assert_eq!(snap.disk_total_bytes, None);
-        assert_eq!(cpu_sample, None);
+    fn parse_snapshot_rejects_output_without_any_metric_key() {
+        let error =
+            parse_snapshot_at("session-2", "", None, None, 2_000).expect_err("空输出应返回错误");
+        assert_eq!(error.code(), "MonitorCollectionError");
+
+        // 脚本总会回显 NETWORK_STATUS marker，只有 marker 而无指标键同样是管线损坏
+        let error = parse_snapshot_at(
+            "session-2",
+            "NETWORK_STATUS=unavailable\n",
+            None,
+            None,
+            2_000,
+        )
+        .expect_err("仅有 marker 的输出应返回错误");
+        assert_eq!(error.code(), "MonitorCollectionError");
     }
 
     /// 验证 MemAvailable 缺失（旧内核）时内存使用率为未知而非误报 100%。
@@ -473,6 +526,72 @@ mod tests {
             Some(0.0)
         );
         assert_eq!(compute_cpu_usage(Some((200, 50)), None), None);
+    }
+
+    /// 验证远端命令把脚本编码为 base64 管道形式，解码后与脚本原文一致。
+    #[test]
+    fn collect_command_decodes_to_status_script() {
+        use base64::Engine;
+        let command = build_collect_command(STATUS_SCRIPT);
+        let encoded = command
+            .strip_prefix("echo ")
+            .and_then(|rest| rest.strip_suffix(" | base64 -d | sh"))
+            .expect("命令应为 `echo <b64> | base64 -d | sh` 形式");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("编码段应为合法 base64");
+        assert_eq!(decoded, STATUS_SCRIPT.as_bytes());
+    }
+
+    /// 验证命令不含任何引号或 shell 元字符：sshd 用账户登录 shell 执行命令，
+    /// csh/tcsh/fish 对 POSIX `'\''` 转义的解析与 sh 不同；base64 字符集
+    /// 不含元字符，任何登录 shell 解析结果一致。
+    #[test]
+    fn collect_command_is_shell_agnostic() {
+        let command = build_collect_command(STATUS_SCRIPT);
+        assert!(
+            !command.contains('\'') && !command.contains('"'),
+            "命令不得依赖任何 shell 的引号语义: {command}"
+        );
+        let encoded = command
+            .strip_prefix("echo ")
+            .and_then(|rest| rest.strip_suffix(" | base64 -d | sh"))
+            .expect("命令应为 `echo <b64> | base64 -d | sh` 形式");
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='),
+            "base64 段不得含 shell 元字符: {encoded}"
+        );
+    }
+
+    /// 验证脚本在网络源不可用时仍以成功状态退出：末行若以失败的
+    /// `[ ... ] &&` 结尾，任何校验退出码的调用方都会把无网络的主机
+    /// 误判为采集失败（if 块在条件不成立时按 POSIX 以 0 退出）。
+    #[test]
+    fn status_script_exits_zero_when_network_unavailable() {
+        use std::process::Command;
+
+        // 末行 if 块为多行结构，取从最后一个 if 起到结尾的完整语句执行
+        let lines: Vec<&str> = STATUS_SCRIPT.lines().collect();
+        let start = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("if "))
+            .expect("脚本应以 if 块收尾");
+        let final_stmt = lines[start..].join("\n");
+        for network_status in ["available", "unavailable"] {
+            let status = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("NETWORK_STATUS={network_status}\n{final_stmt}"),
+                ])
+                .status()
+                .expect("应能执行脚本末行");
+            assert!(
+                status.success(),
+                "NETWORK_STATUS={network_status} 时脚本必须以 0 退出: {final_stmt}"
+            );
+        }
     }
 
     /// 验证采集脚本的 CPU 累计不包含 guest 字段：
@@ -597,20 +716,58 @@ mod tests {
         assert_eq!(snapshot.disk_usage, Some(65.0));
     }
 
-    /// 验证畸形网卡记录只让网络区域不可用，其他指标仍正常返回。
+    /// 验证畸形网卡记录只丢弃该行（与 lo 跳过一致），不降级整个网络区域。
     #[test]
-    fn parse_snapshot_treats_malformed_network_records_as_unavailable() {
-        let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nNETWORK_STATUS=available\nNET=eth0,not-a-number,200";
-        let (snapshot, _, network_sample) =
-            parse_snapshot_at("session-1", raw, Some((100, 20)), None, 2_000)
-                .expect("畸形网络记录不应使整个快照失败");
+    fn parse_snapshot_drops_malformed_network_lines_only() {
+        let raw = "CPU_TOTAL=160\nCPU_IDLE=30\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=65\nNETWORK_STATUS=available\nNET=eth0,not-a-number,200\nNET=eth1,300,400";
+        let previous_network =
+            NetworkSample::new(1_000, vec![("eth0", 50, 100), ("eth1", 150, 200)]);
 
-        assert!(!snapshot.network.available);
-        assert!(snapshot.network.interfaces.is_empty());
-        assert_eq!(network_sample, None);
+        let (snapshot, _, network_sample) = parse_snapshot_at(
+            "session-1",
+            raw,
+            Some((100, 20)),
+            Some(previous_network),
+            2_000,
+        )
+        .expect("畸形网卡记录不应使整个快照失败");
+
+        // 网络区域保持可用：畸形行被丢弃，合法接口照常计算速率
+        assert!(snapshot.network.available);
+        assert_eq!(snapshot.network.interfaces.len(), 1);
+        let eth1 = &snapshot.network.interfaces[0];
+        assert_eq!(eth1.name, "eth1");
+        assert_eq!(eth1.receive_bytes_per_second, Some(150));
+        assert_eq!(eth1.transmit_bytes_per_second, Some(200));
+        // 基线必须保留（只含合法接口），供下一轮继续计算速率
+        let sample = network_sample.expect("畸形行不得重置网络基线");
+        assert_eq!(sample.interfaces.len(), 1);
+        assert_eq!(sample.interfaces[0].name, "eth1");
         assert!((snapshot.cpu_usage.unwrap() - 83.3).abs() < 0.01);
         assert!((snapshot.memory_usage.unwrap() - 50.0).abs() < 0.01);
         assert_eq!(snapshot.disk_usage, Some(65.0));
+    }
+
+    /// 验证畸形行出现的轮次不重置网络基线：故障消失后的下一轮仍能
+    /// 基于上一轮累计计数计算速率，而不是全部退化为 None。
+    #[test]
+    fn malformed_line_does_not_reset_network_baseline() {
+        // 第一轮：eth0 出现畸形行，但合法行必须仍进入基线
+        let glitchy = "NETWORK_STATUS=available\nNET=eth0,100,200\nNET=eth0,oops,300";
+        let (snapshot, _, baseline) = parse_snapshot_at("session-1", glitchy, None, None, 1_000)
+            .expect("畸形行不应使快照失败");
+        assert!(snapshot.network.available);
+        let baseline = baseline.expect("基线必须保留");
+        assert_eq!(baseline.interfaces.len(), 1);
+        assert_eq!(baseline.interfaces[0].name, "eth0");
+
+        // 第二轮：故障消失，速率应基于第一轮基线计算
+        let clean = "NETWORK_STATUS=available\nNET=eth0,300,600";
+        let (snapshot, _, _) = parse_snapshot_at("session-1", clean, None, Some(baseline), 2_000)
+            .expect("第二轮应能解析");
+        let eth0 = &snapshot.network.interfaces[0];
+        assert_eq!(eth0.receive_bytes_per_second, Some(200));
+        assert_eq!(eth0.transmit_bytes_per_second, Some(400));
     }
 
     /// 验证网络采集成功但只有 lo 时仍返回可用的空候选列表。
