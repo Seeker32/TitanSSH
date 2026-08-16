@@ -65,6 +65,10 @@ impl LogStore {
     /// seek 尾读：只读取文件末尾 LOG_TAIL_BYTES 窗口并跳过窗口首行的不完整前缀，
     /// 使每 2 秒轮询的 IO 与分配和文件大小解耦（日志文件只增不减，全文件读取
     /// 会随日志增长线性变慢）。
+    ///
+    /// 按字节读取 + 有损转换：窗口起点是任意字节偏移，落在多字节 UTF-8 字符
+    /// 中间（中文日志超过 64 KiB 后必然发生）时 read_to_string 会以 InvalidData
+    /// 失败；损失仅发生在随后被丢弃的首行前缀，完整行不受影响。
     pub fn read_recent(&self) -> Result<Vec<String>, AppError> {
         if !self.file_path.exists() {
             return Ok(Vec::new());
@@ -73,13 +77,14 @@ impl LogStore {
         let len = file.metadata()?.len();
         let start = len.saturating_sub(LOG_TAIL_BYTES);
         file.seek(SeekFrom::Start(start))?;
-        let mut chunk = String::new();
-        file.read_to_string(&mut chunk)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let chunk = String::from_utf8_lossy(&bytes);
         // seek 可能落在行中间：丢弃窗口首行的不完整前缀（start == 0 时首行完整，保留）
         let tail = if start > 0 {
             chunk.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
         } else {
-            chunk.as_str()
+            chunk.as_ref()
         };
         let lines: Vec<&str> = tail.lines().collect();
         let keep = if lines.len() > LOG_VIEW_MAX_LINES {
@@ -110,7 +115,12 @@ fn ensure_log_file(file_path: &Path) -> Result<File, std::io::Error> {
 }
 
 /// 将一条日志记录格式化为单行纯文本：`2025-06-01 14:30:00.123 [INFO] target: message`。
+///
+/// 消息内的换行符转义为字面 `\\n` / `\\r`：多行消息（嵌套错误 Debug、
+/// 命令输出）不得破坏单行格式，否则查看器出现无归属行、可伪造 [INFO]/[ERROR]
+/// 记录（日志注入），且 500 行上限被碎片占满。
 fn format_entry(level: Level, target: &str, message: &str, timestamp: &str) -> String {
+    let message = message.replace('\n', "\\n").replace('\r', "\\r");
     format!("{timestamp} [{level}] {target}: {message}")
 }
 

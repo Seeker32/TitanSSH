@@ -25,6 +25,27 @@ mod tests {
         );
     }
 
+    /// 回归：消息内的换行必须转义为单行，否则多行消息（嵌套错误 Debug、
+    /// 命令输出）会破坏单行格式——查看器出现无归属行，且消息可伪造
+    /// 形如真实记录的 [INFO]/[ERROR] 行（日志注入/溯源污染）。
+    #[test]
+    fn format_entry_escapes_newlines_in_message() {
+        let line = format_entry(
+            Level::Error,
+            "core::ssh",
+            "第一行\n第二行\r\n[INFO] fake-target: pwned",
+            "2025-06-01 14:30:00.123",
+        );
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "格式化结果必须保持单行: {line:?}"
+        );
+        assert_eq!(
+            line,
+            "2025-06-01 14:30:00.123 [ERROR] core::ssh: 第一行\\n第二行\\r\\n[INFO] fake-target: pwned"
+        );
+    }
+
     /// 行数低于查看上限时按顺序完整返回。
     #[test]
     fn read_recent_returns_full_content_when_under_limit() {
@@ -73,6 +94,31 @@ mod tests {
 
         let lines = LogStore::from_file_path(path).read_recent().unwrap();
         assert_eq!(lines, vec!["tail-1", "tail-2", "tail-3"]);
+    }
+
+    /// 回归：尾读窗口起点落在多字节 UTF-8 字符中间时，按字节 seek 后
+    /// read_to_string 会以 InvalidData 失败（中文日志超过 64 KiB 后必然触发）；
+    /// 必须按字节读取 + 有损转换，完整行不受影响、损坏的首行前缀被丢弃。
+    #[test]
+    fn read_recent_tail_window_starts_mid_utf8_char() {
+        use crate::core::logging::LOG_TAIL_BYTES;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        // "测" 为 3 字节字符，每行 200 个字符 + 换行 = 601 字节（601 ≡ 1 mod 3）；
+        // 110 行共 66110 字节，窗口起点 66110 - 65536 = 574 = 3*191+1，
+        // 恰好落在某个字符的中间字节上
+        assert_eq!(LOG_TAIL_BYTES % 3, 1, "测试依赖 64 KiB 窗口的模 3 余数");
+        let line = format!("{}\n", "测".repeat(200));
+        let content = line.repeat(110);
+        fs::write(&path, &content).unwrap();
+
+        let lines = LogStore::from_file_path(path).read_recent().unwrap();
+        // 首行前缀被丢弃，剩余 109 个完整行无损返回
+        assert_eq!(lines.len(), 109);
+        assert!(
+            lines.iter().all(|line| *line == "测".repeat(200)),
+            "多字节边界不得损坏或泄漏替换字符"
+        );
     }
 
     /// 导出复制内容并可覆盖已存在的目标文件。
