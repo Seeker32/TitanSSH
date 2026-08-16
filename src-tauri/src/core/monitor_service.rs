@@ -96,7 +96,7 @@ impl MonitorService {
 
         // 将任务句柄注册到 HashMap
         {
-            let mut tasks = self.tasks.lock().unwrap();
+            let mut tasks = lock_unpoisoned(&self.tasks);
             tasks.insert(
                 task_id.clone(),
                 MonitorTaskHandle {
@@ -125,48 +125,44 @@ impl MonitorService {
             let tasks_for_snap = Arc::clone(&tasks_ref);
             let app_for_snap = app.clone();
             let task_id_for_snap = task_id.clone();
-            let session_id_for_snap = session_id.clone();
+            // 供快照回调在推送失败时终止循环；主句柄随后移入 MonitorLoopParams
+            let shutdown_for_snap = shutdown.clone();
 
-            monitor_worker::run_monitor_loop(
-                verifier,
-                monitor_worker::MonitorLoopParams {
-                    host,
-                    password,
-                    passphrase,
-                    session_id,
-                    shutdown,
-                },
-                move |snapshot| {
-                    // 更新快照缓存
-                    {
-                        let mut snapshots = snapshots_ref.lock().unwrap();
-                        snapshots.insert(session_id_for_snap.clone(), snapshot.clone());
-                    }
-                    // 推送事件到前端，失败则迁移任务为 Failed（Failed 为终态，只迁移一次）
-                    if let Err(err) = app_for_snap.emit("monitor:snapshot", &snapshot) {
-                        transition_task_status(
+            // panic 防护：worker 或任一回调 panic 时迁移 Failed，
+            // 任务不得卡死在 Running 的幽灵状态（见 run_loop_with_panic_guard）
+            run_loop_with_panic_guard(&tasks_ref, &app, &task_id, move || {
+                monitor_worker::run_monitor_loop(
+                    verifier,
+                    monitor_worker::MonitorLoopParams {
+                        host,
+                        password,
+                        passphrase,
+                        session_id,
+                        shutdown,
+                    },
+                    move |snapshot| {
+                        // 任务已被 stop 移除时丢弃迟到快照（见 apply_snapshot_if_task_alive）
+                        apply_snapshot_if_task_alive(
                             &tasks_for_snap,
+                            &snapshots_ref,
                             &app_for_snap,
+                            &shutdown_for_snap,
                             &task_id_for_snap,
-                            TaskStatus::Failed,
-                            monitor_status_error("监控快照推送失败: {0}", err.to_string()),
+                            &snapshot,
                         );
-                    }
-                },
-                move |err| {
-                    // 采集失败：迁移任务为 Failed（终态，worker 返回后的 Done 会被拒绝）
-                    transition_task_status(
-                        &tasks_for_error,
-                        &app_for_error,
-                        &task_id_for_error,
-                        TaskStatus::Failed,
-                        monitor_status_error("监控采集失败: {0}", err.to_string()),
-                    );
-                },
-            );
-
-            // 循环退出时迁移为 Done；若已 Failed 或已被 stop 移除，迁移被拒绝且不发事件
-            transition_task_status(&tasks_ref, &app, &task_id, TaskStatus::Done, None);
+                    },
+                    move |err| {
+                        // 采集失败：迁移任务为 Failed（终态，worker 返回后的 Done 会被拒绝）
+                        transition_task_status(
+                            &tasks_for_error,
+                            &app_for_error,
+                            &task_id_for_error,
+                            TaskStatus::Failed,
+                            monitor_status_error("监控采集失败: {0}", err.to_string()),
+                        );
+                    },
+                );
+            });
         });
 
         Ok(task_info)
@@ -175,19 +171,31 @@ impl MonitorService {
     /// 停止指定任务 ID 对应的监控任务
     ///
     /// 设置关闭标志，通知工作线程退出，并从任务 HashMap 中移除句柄。
+    /// 移除后 worker 的迟到终态迁移会被拒绝且不发事件，因此终态 Done 事件
+    /// 由本方法直接补发：前端不得停留在 Running 显示幽灵任务。
+    /// 任务已处终态（Done/Failed，事件已播发过）时不重复补发。
     ///
     /// # 参数
+    /// - `app`: Tauri 应用句柄，用于补发终态事件
     /// - `task_id`: 要停止的监控任务 ID
     ///
     /// # 返回
     /// true 表示句柄确实存在并已移除；false 表示任务不存在（从未创建、
     /// 已停止或已过期），调用方可据此区分「已停止」与「早已消失」
-    pub fn stop_monitoring(&self, task_id: &str) -> bool {
-        let mut tasks = self.tasks.lock().unwrap();
+    pub fn stop_monitoring<R: Runtime>(&self, app: &AppHandle<R>, task_id: &str) -> bool {
+        let mut tasks = lock_unpoisoned(&self.tasks);
         match tasks.remove(task_id) {
             Some(handle) => {
                 // 通知工作线程退出
                 handle.shutdown.store(true, Ordering::Release);
+                let already_terminal = matches!(
+                    handle.task_info.status,
+                    TaskStatus::Done | TaskStatus::Failed
+                );
+                drop(tasks);
+                if !already_terminal {
+                    emit_task_status(app, task_id, TaskStatus::Done, None);
+                }
                 true
             }
             None => false,
@@ -195,15 +203,30 @@ impl MonitorService {
     }
 
     /// 停止指定会话的全部监控任务；用于后端统一执行 Session teardown。
-    pub fn stop_session(&self, session_id: &str) {
-        self.tasks.lock().unwrap().retain(|_, handle| {
+    ///
+    /// 每个被停止且尚未终态的任务补发 Done 终态事件（理由同 stop_monitoring）。
+    pub fn stop_session<R: Runtime>(&self, app: &AppHandle<R>, session_id: &str) {
+        let mut tasks = lock_unpoisoned(&self.tasks);
+        let mut pending_terminal_events: Vec<String> = Vec::new();
+        tasks.retain(|task_id, handle| {
             let keep = handle.task_info.session_id.as_deref() != Some(session_id);
             if !keep {
                 handle.shutdown.store(true, Ordering::Release);
+                let already_terminal = matches!(
+                    handle.task_info.status,
+                    TaskStatus::Done | TaskStatus::Failed
+                );
+                if !already_terminal {
+                    pending_terminal_events.push(task_id.clone());
+                }
             }
             keep
         });
-        self.snapshots.lock().unwrap().remove(session_id);
+        drop(tasks);
+        lock_unpoisoned(&self.snapshots).remove(session_id);
+        for task_id in pending_terminal_events {
+            emit_task_status(app, &task_id, TaskStatus::Done, None);
+        }
     }
 
     /// 获取指定会话的最新监控快照
@@ -214,17 +237,119 @@ impl MonitorService {
     /// # 返回
     /// 若存在缓存快照则返回 Some(MonitorSnapshot)，否则返回 None
     pub fn get_monitor_status(&self, session_id: &str) -> Option<MonitorSnapshot> {
-        let snapshots = self.snapshots.lock().unwrap();
+        let snapshots = lock_unpoisoned(&self.snapshots);
         snapshots.get(session_id).cloned()
     }
 
     /// 测试构造：直接注入快照，供命令层测试有数据路径。
     #[cfg(test)]
     pub(crate) fn insert_snapshot_for_test(&self, snapshot: MonitorSnapshot) {
-        self.snapshots
-            .lock()
-            .unwrap()
-            .insert(snapshot.session_id.clone(), snapshot);
+        lock_unpoisoned(&self.snapshots).insert(snapshot.session_id.clone(), snapshot);
+    }
+}
+
+/// 应用采集快照：仅当任务仍在 registry（未被 stop 移除）时落缓存并推送事件。
+///
+/// 持 tasks 锁完成存在性检查与快照写入，与 stop_session 的
+/// 「先移除任务、后清理快照」顺序串行化：stop 先持锁则此处检查失败直接
+/// 丢弃；本函数先持锁则 stop 的后续清理必然移除本次写入。
+/// 在途 collect_once 的迟到快照因此不可能复活已清理的会话数据。
+///
+/// # 返回
+/// true 表示快照已应用（任务存活）；false 表示任务已停止，快照被丢弃
+fn apply_snapshot_if_task_alive<R: Runtime>(
+    tasks: &Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
+    snapshots: &Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    app: &AppHandle<R>,
+    shutdown: &AtomicBool,
+    task_id: &str,
+    snapshot: &MonitorSnapshot,
+) -> bool {
+    {
+        let tasks_guard = lock_unpoisoned(tasks);
+        if !tasks_guard.contains_key(task_id) {
+            return false;
+        }
+        // 持 tasks 锁写入快照（锁在事件推送前释放，避免与事件回调互相等待）
+        lock_unpoisoned(snapshots).insert(snapshot.session_id.clone(), snapshot.clone());
+    }
+    // 推送事件到前端；失败则任务进入 Failed 终态并终止采集循环
+    if let Err(err) = app.emit("monitor:snapshot", snapshot) {
+        handle_snapshot_emit_failure(shutdown, tasks, app, task_id, err);
+    }
+    true
+}
+
+/// 处理 monitor:snapshot 推送失败：先设置关闭标志终止采集循环，再把任务
+/// 迁移为 Failed（终态事件只发一次）。
+///
+/// 仅迁移失败而不设关闭标志时，run_monitor_loop 每 2 秒继续采集并重复
+/// 失败推送（SSH 连接、远端脚本执行、缓存写入永不停止），直到外部 stop。
+fn handle_snapshot_emit_failure<R: Runtime>(
+    shutdown: &AtomicBool,
+    tasks: &Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
+    app: &AppHandle<R>,
+    task_id: &str,
+    err: impl std::fmt::Display,
+) {
+    shutdown.store(true, Ordering::Release);
+    transition_task_status(
+        tasks,
+        app,
+        task_id,
+        TaskStatus::Failed,
+        monitor_status_error("监控快照推送失败: {0}", err.to_string()),
+    );
+}
+
+/// 毒化容忍锁：持锁线程 panic 后恢复内部值继续服务。
+///
+/// 任务注册表与快照缓存都是自洽的可替换状态，无跨调用不变量；
+/// 一次 panic 后让全部会话的后续监控调用跟着 panic（不可恢复）比
+/// 继续服务更糟。
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 运行监控循环的 panic 防护：正常退出迁移 Done；worker 或任一回调 panic
+/// 时迁移 Failed（结构化 MonitorError，携带 panic 文本）。
+///
+/// 无防护时线程随 panic 死亡，任务永远卡在 Running：无人再发终态事件，
+/// 句柄留在 registry，快照缓存停止更新（幽灵任务）。
+/// 任务已被 stop 移除时两种迁移都会被拒绝且不发事件（终态事件已由停止方补发）。
+fn run_loop_with_panic_guard<R: Runtime>(
+    tasks: &Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
+    app: &AppHandle<R>,
+    task_id: &str,
+    body: impl FnOnce(),
+) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(()) => {
+            // 循环退出时迁移为 Done；若已 Failed 或已被 stop 移除，迁移被拒绝且不发事件
+            transition_task_status(tasks, app, task_id, TaskStatus::Done, None);
+        }
+        Err(payload) => {
+            transition_task_status(
+                tasks,
+                app,
+                task_id,
+                TaskStatus::Failed,
+                monitor_status_error("监控工作线程异常退出: {0}", panic_message(&*payload)),
+            );
+        }
+    }
+}
+
+/// 从 catch_unwind 的 payload 提取 panic 信息文本。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -249,7 +374,7 @@ fn transition_task_status<R: Runtime>(
     status: TaskStatus,
     message: Option<AppErrorInfo>,
 ) -> bool {
-    let mut tasks = tasks.lock().unwrap();
+    let mut tasks = lock_unpoisoned(tasks);
     let Some(handle) = tasks.get_mut(task_id) else {
         return false;
     };

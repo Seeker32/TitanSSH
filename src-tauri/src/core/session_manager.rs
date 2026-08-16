@@ -201,8 +201,9 @@ impl SessionManager {
         handle.shutdown.store(true, Ordering::Relaxed);
         // 发送关闭命令到终端工作线程
         let _ = handle.command_tx.send(TerminalCommand::Close);
-        // 停止该会话的全部监控任务，teardown 不再依赖前端调用顺序
-        self.monitor_service.stop_session(session_id);
+        // 停止该会话的全部监控任务（每个任务补发 Done 终态事件），
+        // teardown 不再依赖前端调用顺序
+        self.monitor_service.stop_session(app, session_id);
         // 清理 SFTP 状态，取消所有 Pending/Running 任务并推送 sftp:task_status = Cancelled
         self.sftp_service.cleanup_session(session_id, app);
         Ok(())

@@ -34,16 +34,18 @@ pub async fn start_monitoring<R: Runtime>(
 
 /// 停止指定 task_id 对应的监控任务
 ///
-/// 委托给 monitor_service 设置关闭标志并清理任务句柄。
+/// 委托给 monitor_service 设置关闭标志并清理任务句柄；终态 Done 事件由
+/// monitor_service 直接补发（worker 移除后不再能广播）。
 /// 任务不存在（从未创建、已停止或已过期）时返回结构化错误
 /// MonitorTaskNotFound，前端可据此区分「已停止」与「早已消失」，
 /// 暴露陈旧/重复的任务状态。
 #[tauri::command]
-pub fn stop_monitoring(
+pub fn stop_monitoring<R: Runtime>(
+    app: AppHandle<R>,
     task_id: String,
     monitor_service: State<'_, MonitorService>,
 ) -> Result<(), AppErrorInfo> {
-    if monitor_service.stop_monitoring(&task_id) {
+    if monitor_service.stop_monitoring(&app, &task_id) {
         Ok(())
     } else {
         Err(AppErrorInfo::from(AppError::MonitorTaskNotFound(
