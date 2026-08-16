@@ -1,8 +1,8 @@
-use crate::core::host_service::HostConfigService;
+use crate::core::host_service::SharedHostConfigService;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use crate::models::session::SessionInfo;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 /// 打开新的 SSH 会话
 ///
@@ -19,10 +19,10 @@ pub fn open_session(
     host_id: String,
     session_manager: State<'_, SessionManager>,
 ) -> Result<SessionInfo, AppErrorInfo> {
-    // 从持久化存储查询主机配置
-    let service = HostConfigService::new(&app).map_err(AppErrorInfo::from)?;
-    let host = service
-        .get_host(&host_id)
+    // 从受管共享服务持锁查询主机配置（与 save/delete 串行化，避免读到半写入文件）
+    let host = app
+        .state::<SharedHostConfigService>()
+        .with_locked(|service| service.get_host(&host_id))
         .map_err(AppErrorInfo::from)?
         .ok_or_else(|| {
             AppErrorInfo::from(AppError::InvalidHostConfig(

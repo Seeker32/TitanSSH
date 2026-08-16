@@ -9,7 +9,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -1268,5 +1269,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 并发门控凭据存储：第 N 个并发 set 到达前阻塞当前 set（带超时）。
+    ///
+    /// 强制两个并发 save 在各自完成旧列表加载后、写入 hosts.json 前互相等待：
+    /// 无锁实现两者都基于旧列表落盘，后写者丢弃先写者的更新（确定性失败）；
+    /// 有锁实现先到者超时后独立完成，后到者加载到最新列表（确定性通过）。
+    struct GatedCredentialStore {
+        inner: Arc<MemoryCredentialStore>,
+        arrivals: AtomicUsize,
+        parties: usize,
+    }
+
+    impl CredentialStore for Arc<GatedCredentialStore> {
+        fn set(&self, key: &str, value: &str) -> Result<(), AppError> {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while self.arrivals.load(Ordering::SeqCst) < self.parties && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.inner.set(key, value)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), AppError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// 回归：两个并发 save 经共享服务持锁串行执行，不得丢失任一更新。
+    ///
+    /// 修复前（每次命令构造独立服务、无锁 load-modify-write）两个 save
+    /// 都基于旧列表落盘，后写者覆盖先写者：一个主机会凭空消失。
+    #[test]
+    fn shared_service_serializes_concurrent_save_without_lost_update() {
+        let store = HostStore::from_file_path(temp_hosts_file());
+        let credentials = Arc::new(MemoryCredentialStore::new());
+        let gates = Arc::new(GatedCredentialStore {
+            inner: credentials.clone(),
+            arrivals: AtomicUsize::new(0),
+            parties: 2,
+        });
+        let cleanup = Arc::new(MemoryTrustCleanup::default());
+        let service = HostConfigService::with_stores(store, Box::new(gates), Box::new(cleanup));
+        let shared = Arc::new(SharedHostConfigService::from_service(service));
+        let start = Arc::new(Barrier::new(2));
+
+        let spawn_save = |request: SaveHostRequest| {
+            let shared = shared.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                shared.with_locked(|service| service.save(&request))
+            })
+        };
+
+        let handle_a = spawn_save(request_with_password("host-a", "secret-a"));
+        let handle_b = spawn_save(request_with_password("host-b", "secret-b"));
+        handle_a
+            .join()
+            .expect("线程 A 应正常结束")
+            .expect("save A 应成功");
+        handle_b
+            .join()
+            .expect("线程 B 应正常结束")
+            .expect("save B 应成功");
+
+        let final_list = shared
+            .with_locked(|service| service.list_hosts())
+            .expect("读取最终列表应成功");
+        let ids: Vec<&str> = final_list.iter().map(|host| host.id.as_str()).collect();
+        assert!(
+            ids.contains(&"host-a") && ids.contains(&"host-b"),
+            "并发 save 不得互相覆盖（丢失更新）: {ids:?}"
+        );
     }
 }

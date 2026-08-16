@@ -5,6 +5,7 @@ mod models;
 mod storage;
 
 use crate::core::host_identity::HostIdentityService;
+use crate::core::host_service::SharedHostConfigService;
 use crate::core::logging;
 use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
@@ -31,6 +32,9 @@ pub fn run() {
             // 不读取系统 ~/.ssh/known_hosts，也不使用 keyring
             app.state::<HostIdentityService>()
                 .init_trust_store(app.handle())?;
+            // 受管共享主机服务：所有 host 命令复用同一实例并持锁串行化
+            // hosts.json 的 load-modify-write 周期，防止并发 invoke 互相覆盖
+            app.manage(SharedHostConfigService::new(app.handle())?);
             Ok(())
         })
         .manage(SessionManager::new(

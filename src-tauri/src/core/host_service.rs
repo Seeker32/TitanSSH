@@ -3,6 +3,7 @@ use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig, SaveHostRequest};
 use crate::storage::host_store::HostStore;
 use crate::storage::secure_store;
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 /// 凭据存储 adapter seam:HostConfig 持久化 module 只依赖此 trait 访问 OS 安全存储
@@ -63,8 +64,8 @@ impl TrustRecordCleanup for IdentityTrustCleanup {
 /// 信任记录清理（TrustRecordCleanup）是内部 adapter，不向 command 层泄漏。
 pub struct HostConfigService {
     host_store: HostStore,
-    credential_store: Box<dyn CredentialStore>,
-    trust_cleanup: Box<dyn TrustRecordCleanup>,
+    credential_store: Box<dyn CredentialStore + Send + Sync>,
+    trust_cleanup: Box<dyn TrustRecordCleanup + Send + Sync>,
 }
 
 impl HostConfigService {
@@ -92,8 +93,8 @@ impl HostConfigService {
     #[cfg(test)]
     fn with_stores(
         host_store: HostStore,
-        credential_store: Box<dyn CredentialStore>,
-        trust_cleanup: Box<dyn TrustRecordCleanup>,
+        credential_store: Box<dyn CredentialStore + Send + Sync>,
+        trust_cleanup: Box<dyn TrustRecordCleanup + Send + Sync>,
     ) -> Self {
         Self {
             host_store,
@@ -330,6 +331,46 @@ impl HostConfigService {
 
 /// save 内部流程结果：commit 后的配置列表 + 本次发生变化的旧 endpoint。
 type SaveResult = (Vec<HostConfig>, Option<(String, u16)>);
+
+/// 应用级共享服务：单一实例持有 Mutex，串行化 hosts.json 的读-改-写周期
+///
+/// 命令在 spawn_blocking 线程池并发执行时，list/save/delete 必须全部经过
+/// 同一实例持锁操作；否则并发 load-modify-write 互相覆盖，后写者丢弃先写者
+/// 的更新（已删主机会重现、已存主机会消失、keyring 凭据会被孤儿化）。
+/// 锁中毒时恢复内部状态继续：服务本身无跨调用不变量，后续操作重新从文件加载。
+pub struct SharedHostConfigService {
+    inner: Mutex<HostConfigService>,
+}
+
+impl SharedHostConfigService {
+    /// 生产构造：复用应用级 HostIdentityService，与连接校验共享同一 TrustStore 实例
+    pub fn new(app: &AppHandle) -> Result<Self, AppError> {
+        Ok(Self {
+            inner: Mutex::new(HostConfigService::new(app)?),
+        })
+    }
+
+    /// 持锁执行一次完整业务操作（load-modify-write 全程在锁内）；
+    /// 锁中毒时恢复内部状态继续，避免一次 panic 永久阻断主机管理
+    pub fn with_locked<T>(
+        &self,
+        func: impl FnOnce(&HostConfigService) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        func(&guard)
+    }
+
+    /// 测试构造：包装已注入 adapter 的服务
+    #[cfg(test)]
+    fn from_service(service: HostConfigService) -> Self {
+        Self {
+            inner: Mutex::new(service),
+        }
+    }
+}
 
 /// 验证保存主机请求的必填字段，name/host/username 不得为空白
 fn validate_save_request(request: &SaveHostRequest) -> Result<(), AppError> {
