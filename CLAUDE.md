@@ -37,6 +37,7 @@ JSON-serializable, camelCase, timestamps in ms. Models: HostConfig, SessionInfo,
 - Every method: Chinese comment (purpose, key params, side effects)
 - Dependencies: enable only the features used by the code; do not use umbrella features such as `full` unless every included feature is required and the reason is documented.
 - Use `cargo fmt` to format rust files
+- Commit messages must be written in English
 
 ## Performance
 
@@ -45,7 +46,7 @@ Terminal streaming, bounded chart buffers, no redundant invoke, no unnecessary r
 ## AI rules
 
 Must: follow architecture, respect service boundaries, complete code + tests
-Must not: demo code, mix layers, skip TDD, break the event model
+Must not: demo code, mix layers, skip TDD
 
 > Final rule: if it isn't tested, it doesn't exist.
 
