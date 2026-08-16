@@ -19,12 +19,14 @@ fn parse_log_level(level: &str) -> Option<LevelFilter> {
 }
 
 /// 设置运行中日志器的最大输出等级。
+///
+/// 无效输入返回专用 InvalidLogLevel 错误（含输入值供诊断），不得伪装成
+/// 主机配置错误。
 #[tauri::command]
 pub fn set_log_level(level: String) -> Result<(), AppErrorInfo> {
     let level = parse_log_level(&level).ok_or_else(|| {
-        AppErrorInfo::from(AppError::InvalidHostConfig(
-            "Invalid log level".to_string().into(),
-        ))
+        // 输入值本身即诊断（语言无关），作为 raw detail 下发；摘要由 code 本地化
+        AppErrorInfo::from(AppError::InvalidLogLevel(level.clone().into()))
     })?;
     log::set_max_level(level);
     Ok(())

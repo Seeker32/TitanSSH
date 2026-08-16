@@ -31,6 +31,12 @@ describe('i18n', () => {
     expect(formatAppError('en-US', error)).toBe('Could not resolve save path: URL is not a valid path');
   });
 
+  it('无效日志等级：专用 code 本地化摘要，详情携带输入值供诊断', () => {
+    const error = { code: 'InvalidLogLevel', detail: 'verbose' };
+    expect(formatAppError('zh-CN', error)).toBe('无效的日志等级: verbose');
+    expect(formatAppError('en-US', error)).toBe('Invalid log level: verbose');
+  });
+
   it('结构化详情按语言渲染模板，参数按占位顺序替换', () => {
     const error = {
       code: 'StorageError',

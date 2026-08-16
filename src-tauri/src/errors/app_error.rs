@@ -190,6 +190,10 @@ pub enum AppError {
     /// 未落地）；专用 code 供前端按语言本地化摘要，detail 只携带底层诊断
     #[error("无法解析保存路径: {0}")]
     LogExportPathResolveFailed(ErrorDetail),
+
+    /// 前端传入的日志等级不在支持列表内；携带输入值供诊断，不得伪装成主机配置错误
+    #[error("无效的日志等级: {0}")]
+    InvalidLogLevel(ErrorDetail),
 }
 
 impl AppError {
@@ -224,6 +228,7 @@ impl AppError {
             Self::HostKeySaveFailed(_) => "HostKeySaveFailed",
             Self::HostTrustCleanupFailed(_) => "HostTrustCleanupFailed",
             Self::LogExportPathResolveFailed(_) => "LogExportPathResolveFailed",
+            Self::InvalidLogLevel(_) => "InvalidLogLevel",
         }
     }
 
@@ -276,6 +281,7 @@ impl AppError {
             Self::LogExportPathResolveFailed(p) => {
                 Self::LogExportPathResolveFailed(append(p, extra))
             }
+            Self::InvalidLogLevel(p) => Self::InvalidLogLevel(append(p, extra)),
         }
     }
 }
@@ -312,7 +318,8 @@ impl From<&AppError> for AppErrorInfo {
             | AppError::TrustStoreError(p)
             | AppError::HostKeySaveFailed(p)
             | AppError::HostTrustCleanupFailed(p)
-            | AppError::LogExportPathResolveFailed(p) => Some(p.clone()),
+            | AppError::LogExportPathResolveFailed(p)
+            | AppError::InvalidLogLevel(p) => Some(p.clone()),
             AppError::IoError(io) => Some(ErrorDetail::Raw(io.to_string())),
         };
         let (detail, detail_key, detail_params) = match payload {

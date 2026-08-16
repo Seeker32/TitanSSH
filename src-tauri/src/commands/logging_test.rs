@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::commands::logging::{parse_log_level, resolve_export_target};
+    use crate::commands::logging::{parse_log_level, resolve_export_target, set_log_level};
     use crate::errors::app_error::AppError;
     use log::LevelFilter;
     use std::path::PathBuf;
@@ -11,6 +11,19 @@ mod tests {
     fn parses_supported_log_levels_and_rejects_invalid_values() {
         assert_eq!(parse_log_level("debug"), Some(LevelFilter::Debug));
         assert_eq!(parse_log_level("verbose"), None);
+    }
+
+    /// 无效日志等级必须返回专用错误 code（供前端本地化），并携带输入值供诊断；
+    /// 不得伪装成主机配置错误。
+    #[test]
+    fn set_log_level_rejects_invalid_input_with_dedicated_error() {
+        let error = set_log_level("verbose".to_string()).unwrap_err();
+        assert_eq!(error.code, "InvalidLogLevel");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("verbose"),
+            "错误应携带输入值便于诊断"
+        );
     }
 
     /// 取消（None）→ Ok(None)；本地路径 → Some；无法解析为本地路径的 URL 必须报错，

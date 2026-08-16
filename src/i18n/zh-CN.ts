@@ -191,6 +191,7 @@ export const zhCN = {
   'error.HostKeySaveFailed': '主机信任保存失败',
   'error.HostTrustCleanupFailed': '主机信任记录清理失败',
   'error.LogExportPathResolveFailed': '无法解析保存路径',
+  'error.InvalidLogLevel': '无效的日志等级',
   'error.TrustStoreError': '信任存储不可用',
   'error.Unknown': '未知错误',
   'error.Timeout': '连接超时',

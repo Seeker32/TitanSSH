@@ -194,6 +194,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.HostKeySaveFailed': 'Failed to save host trust',
   'error.HostTrustCleanupFailed': 'Failed to clean up host trust record',
   'error.LogExportPathResolveFailed': 'Could not resolve save path',
+  'error.InvalidLogLevel': 'Invalid log level',
   'error.TrustStoreError': 'Trust store unavailable',
   'error.Unknown': 'Unknown error',
   'error.Timeout': 'Connection timed out',
