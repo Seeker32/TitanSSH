@@ -52,7 +52,7 @@ trait TerminalOps: Send {
     /// 读取一批终端输出字节。
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
     /// 写入终端输入并刷新。
-    fn write(&mut self, data: &str) -> Result<(), AppError>;
+    fn write(&mut self, data: &[u8]) -> Result<(), AppError>;
     /// 调整远端 PTY 尺寸。
     fn resize(&mut self, cols: u32, rows: u32) -> Result<(), AppError>;
     /// 判断远端是否已结束输出。
@@ -80,7 +80,7 @@ impl TerminalTransport {
     }
 
     /// 写入终端输入并刷新。
-    pub fn write(&mut self, data: &str) -> Result<(), AppError> {
+    pub fn write(&mut self, data: &[u8]) -> Result<(), AppError> {
         self.inner.write(data)
     }
 
@@ -236,8 +236,8 @@ impl TerminalOps for Ssh2Terminal {
     }
 
     /// 写入 ssh2 Channel 并刷新。
-    fn write(&mut self, data: &str) -> Result<(), AppError> {
-        write_terminal_input(&mut self.channel, data.as_bytes())?;
+    fn write(&mut self, data: &[u8]) -> Result<(), AppError> {
+        write_terminal_input(&mut self.channel, data)?;
         Ok(())
     }
 
@@ -1765,7 +1765,7 @@ pub(crate) mod test_support {
                 Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "idle"))
             }
             /// 丢弃写入。
-            fn write(&mut self, _data: &str) -> Result<(), AppError> {
+            fn write(&mut self, _data: &[u8]) -> Result<(), AppError> {
                 Ok(())
             }
             /// 忽略尺寸调整。
@@ -1795,7 +1795,7 @@ pub(crate) mod test_support {
             }
 
             /// 模拟失效 SSH channel 的写入错误。
-            fn write(&mut self, _data: &str) -> Result<(), AppError> {
+            fn write(&mut self, _data: &[u8]) -> Result<(), AppError> {
                 Err(AppError::SshConnectionError(
                     "terminal write failed".to_string().into(),
                 ))
@@ -1837,7 +1837,7 @@ pub(crate) mod test_support {
             }
 
             /// 测试 capability 不保留终端输入。
-            fn write(&mut self, _data: &str) -> Result<(), AppError> {
+            fn write(&mut self, _data: &[u8]) -> Result<(), AppError> {
                 Ok(())
             }
 

@@ -20,7 +20,7 @@ interface SessionState {
   hostKeySaveErrors: Map<string, AppErrorInfo>;
   openSession: (hostId: string) => Promise<SessionInfo>;
   closeSession: (sessionId: string) => Promise<void>;
-  writeTerminal: (sessionId: string, data: string) => Promise<void>;
+  writeTerminal: (sessionId: string, data: Uint8Array) => Promise<void>;
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
   setActiveView: (viewId: string | null) => void;
   applySessionStatus: (payload: SessionStatusEvent) => void;
@@ -133,9 +133,11 @@ export const useSessionStore = create<SessionState>((set, get) => {
       get().removeSessionProjection(sessionId);
     },
 
-    /** 将用户输入写入指定终端会话。 */
+    /** 将原始终端输入作为 Tauri raw IPC payload 发送，避免 JSON 字符串编码。 */
     async writeTerminal(sessionId, data) {
-      await invoke('write_terminal', { sessionId, data });
+      await invoke('write_terminal', data, {
+        headers: { 'x-titanssh-session-id': sessionId },
+      });
     },
 
     /** 将终端尺寸同步给后端 PTY。 */

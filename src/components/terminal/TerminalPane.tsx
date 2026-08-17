@@ -16,7 +16,7 @@ interface Props {
   challenges: Map<string, HostIdentityChallenge>;
   /** 按 sessionId 存储的"接受并保存"结构化失败；显示在所属标签的确认卡内。 */
   saveErrors: Map<string, AppErrorInfo>;
-  onInput: (event: { sessionId: string; data: string }) => void;
+  onInput: (event: { sessionId: string; data: Uint8Array }) => void;
   onResize: (event: { sessionId: string; cols: number; rows: number }) => void;
   onCreateHost: () => void;
   onCloseTab: (sessionId: string) => void;

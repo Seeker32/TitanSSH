@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::core::session_manager::*;
+    use crate::core::terminal_service::TerminalCommand;
     use crate::models::host::{AuthType, HostConfig};
 
     /// 创建共享运行时状态一致的 SessionManager。
@@ -42,6 +43,25 @@ mod tests {
         }
     }
 
+    /// 会话管理器必须原样保留非 UTF-8 终端输入字节，直到 TerminalCommand 队列。
+    #[test]
+    fn terminal_input_preserves_non_utf8_bytes() {
+        let manager = make_manager();
+        let session_id = "session-terminal-bytes";
+        let receiver =
+            manager.insert_session_for_test_with_receiver(session_id, make_host("host-1"));
+        let input = vec![0x00, 0xff, 0x1b, b'[', b'A'];
+
+        manager
+            .write_terminal(session_id, input.clone())
+            .expect("终端输入应成功入队");
+
+        match receiver.recv().expect("应收到终端写入命令") {
+            TerminalCommand::Write(data) => assert_eq!(data, input),
+            _ => panic!("期望 Write 命令"),
+        }
+    }
+
     /// 终端工作线程已退出并释放命令接收端后，写入与调整尺寸必须报告会话不可用，
     /// 不得将 channel SendError 伪装为底层 IO 故障。
     #[test]
@@ -51,7 +71,7 @@ mod tests {
         manager.insert_session_for_test(session_id, make_host("host-1"));
 
         for result in [
-            manager.write_terminal(session_id, "echo test".to_string()),
+            manager.write_terminal(session_id, b"echo test".to_vec()),
             manager.resize_terminal(session_id, 120, 40),
         ] {
             match result.unwrap_err() {

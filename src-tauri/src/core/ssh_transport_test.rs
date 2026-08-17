@@ -17,7 +17,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     struct RecordingTerminal {
-        writes: Arc<Mutex<Vec<String>>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     struct BlockingSftp {
@@ -66,8 +66,8 @@ mod tests {
         }
 
         /// 测试 adapter 记录写入内容。
-        fn write(&mut self, data: &str) -> Result<(), AppError> {
-            self.writes.lock().unwrap().push(data.to_string());
+        fn write(&mut self, data: &[u8]) -> Result<(), AppError> {
+            self.writes.lock().unwrap().push(data.to_vec());
             Ok(())
         }
 
@@ -95,9 +95,25 @@ mod tests {
             writes: writes.clone(),
         });
 
-        terminal.write("uptime\n").unwrap();
+        terminal.write(b"uptime\n").unwrap();
 
-        assert_eq!(*writes.lock().unwrap(), vec!["uptime\n"]);
+        assert_eq!(*writes.lock().unwrap(), vec![b"uptime\n".to_vec()]);
+    }
+
+    /// 终端 capability 必须原样转发非 UTF-8 输入字节，不得先转换为 Rust String。
+    #[test]
+    fn terminal_capability_preserves_non_utf8_input() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = TerminalTransport::from_backend(RecordingTerminal {
+            writes: writes.clone(),
+        });
+
+        terminal.write(&[0x00, 0xff, 0x1b, b'[', b'A']).unwrap();
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![vec![0x00, 0xff, 0x1b, b'[', b'A']]
+        );
     }
 
     /// 非阻塞终端在 SSH window 暂满时必须重试，并在发生部分写入后继续发送余下
@@ -263,12 +279,12 @@ mod tests {
         let transfer = std::thread::spawn(move || sftp.list_dir("/"));
         started.wait();
         let before = Instant::now();
-        terminal.write("echo responsive\n").unwrap();
+        terminal.write(b"echo responsive\n").unwrap();
         let elapsed = before.elapsed();
         release.wait();
 
         assert!(elapsed < Duration::from_millis(100));
-        assert_eq!(*writes.lock().unwrap(), vec!["echo responsive\n"]);
+        assert_eq!(*writes.lock().unwrap(), vec![b"echo responsive\n".to_vec()]);
         assert!(transfer.join().unwrap().is_ok());
     }
 
@@ -653,7 +669,7 @@ mod tests {
 
         transfer_started.wait();
         terminal
-            .write("sleep 1; echo TITAN_CONCURRENT_MARKER\n")
+            .write(b"sleep 1; echo TITAN_CONCURRENT_MARKER\n")
             .expect("Terminal 写入应成功");
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut output = String::new();
@@ -754,7 +770,7 @@ mod tests {
         )
         .expect("Terminal 应连接成功");
         terminal
-            .write("echo TITAN_TRUSTED_TERMINAL_MARKER\n")
+            .write(b"echo TITAN_TRUSTED_TERMINAL_MARKER\n")
             .expect("Terminal 写入应成功");
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut output = String::new();

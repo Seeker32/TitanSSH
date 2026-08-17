@@ -159,10 +159,10 @@ impl SessionManager {
         Ok(session_info)
     }
 
-    /// 向指定会话的终端写入数据
+    /// 向指定会话的终端写入原始字节
     ///
     /// 将写入命令路由到对应会话的 terminal_service 工作线程。
-    pub fn write_terminal(&self, session_id: &str, data: String) -> Result<(), AppError> {
+    pub fn write_terminal(&self, session_id: &str, data: Vec<u8>) -> Result<(), AppError> {
         let command_tx = self
             .sessions
             .lock()
@@ -298,7 +298,17 @@ impl SessionManager {
     /// 会话存在性判定。
     #[cfg(test)]
     pub(crate) fn insert_session_for_test(&self, session_id: &str, host: HostConfig) {
-        let (command_tx, _command_rx) = mpsc::channel();
+        let _ = self.insert_session_for_test_with_receiver(session_id, host);
+    }
+
+    /// 测试构造：注册会话并保留终端命令接收端，验证输入字节未被改写。
+    #[cfg(test)]
+    pub(crate) fn insert_session_for_test_with_receiver(
+        &self,
+        session_id: &str,
+        host: HostConfig,
+    ) -> mpsc::Receiver<TerminalCommand> {
+        let (command_tx, command_rx) = mpsc::channel();
         self.sessions.lock().unwrap().insert(
             session_id.to_string(),
             SessionHandle {
@@ -317,6 +327,7 @@ impl SessionManager {
                 host,
             },
         );
+        command_rx
     }
 }
 

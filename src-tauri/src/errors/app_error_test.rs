@@ -19,6 +19,25 @@ mod tests {
         );
     }
 
+    /// 主机不存在错误使用独立稳定代码，并支持统一详情追加与 IPC 映射。
+    #[test]
+    fn host_not_found_has_stable_code_and_detail() {
+        let error = AppError::HostNotFound("stale-host-id".to_string().into());
+        assert_eq!(error.code(), "HostNotFound");
+        assert_eq!(
+            AppError::HostNotFound("stale-host-id".to_string().into())
+                .with_appended_detail("the host was deleted")
+                .to_string(),
+            "主机不存在: stale-host-id；the host was deleted"
+        );
+
+        let value = serde_json::to_value(AppErrorInfo::from(error)).expect("错误 payload 应序列化");
+        assert_eq!(
+            value,
+            serde_json::json!({ "code": "HostNotFound", "detail": "stale-host-id" })
+        );
+    }
+
     /// IPC 错误使用稳定代码与 camelCase detail，不携带已本地化 UI 文案。
     #[test]
     fn app_error_info_serializes_raw_detail_as_plain_string() {

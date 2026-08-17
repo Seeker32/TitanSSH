@@ -1,9 +1,13 @@
 use crate::commands::run_blocking_op;
 use crate::core::host_service::SharedHostConfigService;
 use crate::core::session_manager::SessionManager;
-use crate::errors::app_error::{AppError, AppErrorInfo};
+use crate::errors::app_error::{AppError, AppErrorInfo, ErrorDetail};
 use crate::models::session::SessionInfo;
+use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Manager, State};
+
+/// 终端原始输入通过请求头关联所属 Runtime Session，避免把会话标识混入字节流。
+const TERMINAL_SESSION_ID_HEADER: &str = "x-titanssh-session-id";
 
 /// 在阻塞线程池读取打开会话所需的主机配置。
 ///
@@ -42,11 +46,7 @@ pub async fn open_session(
             .with_locked(|service| service.get_host(&lookup_host_id))
     })
     .await?
-        .ok_or_else(|| {
-            AppErrorInfo::from(AppError::InvalidHostConfig(
-                format!("Host not found: {host_id}").into(),
-            ))
-        })?;
+    .ok_or_else(|| AppErrorInfo::from(AppError::HostNotFound(host_id.into())))?;
 
     // 路由到 session_manager 协调层，由其启动 terminal_service
     session_manager
@@ -73,17 +73,37 @@ pub fn close_session(
         .map_err(AppErrorInfo::from)
 }
 
-/// 向指定会话的终端写入数据
+/// 向指定会话的终端写入原始字节
 ///
-/// 将输入数据路由到对应会话的 terminal_service 工作线程。
+/// 请求体使用 Tauri raw IPC payload，session id 通过固定请求头传递；
+/// 字节不经过 UTF-8 解码，直接路由到 terminal_service 工作线程。
 #[tauri::command]
 pub fn write_terminal(
-    session_id: String,
-    data: String,
+    request: Request<'_>,
     session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
+    let session_id = request
+        .headers()
+        .get(TERMINAL_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppErrorInfo::from(AppError::InvalidTerminalInput(ErrorDetail::msg(
+                "终端输入请求缺少会话标识",
+                Vec::new(),
+            )))
+        })?;
+    let data = match request.body() {
+        InvokeBody::Raw(data) => data.clone(),
+        InvokeBody::Json(_) => {
+            return Err(AppErrorInfo::from(AppError::InvalidTerminalInput(
+                ErrorDetail::msg("终端输入请求必须使用原始字节 payload", Vec::new()),
+            )));
+        }
+    };
+
     session_manager
-        .write_terminal(&session_id, data)
+        .write_terminal(session_id, data)
         .map_err(AppErrorInfo::from)
 }
 

@@ -44,8 +44,8 @@ pub struct ConnectionProgressEvent {
 /// 终端会话命令枚举，用于协调层向终端工作线程发送指令
 #[derive(Clone)]
 pub enum TerminalCommand {
-    /// 向终端写入数据
-    Write(String),
+    /// 向终端写入原始字节
+    Write(Vec<u8>),
     /// 调整终端大小（列数、行数）
     Resize { cols: u32, rows: u32 },
     /// 关闭终端会话

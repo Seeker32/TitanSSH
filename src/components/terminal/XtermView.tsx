@@ -8,12 +8,23 @@ import { useTerminalThemeStore } from '@/stores/terminal-theme';
 
 export { terminalThemes, TERMINAL_THEME_NAMES } from './terminalThemes';
 
+const terminalTextEncoder = new TextEncoder();
+
+/** 将 xterm 的 binary 字符串按单字节编码还原为 PTY 输入字节。 */
+function binaryStringToBytes(data: string): Uint8Array {
+  const bytes = new Uint8Array(data.length);
+  for (let index = 0; index < data.length; index += 1) {
+    bytes[index] = data.charCodeAt(index) & 0xff;
+  }
+  return bytes;
+}
+
 interface Props {
   sessionId: string;
   active: boolean;
   /** 仅 Connected 后允许用户输入；连接完成前 xterm 不接受键盘输入。必填以强制调用方显式决定。 */
   interactive: boolean;
-  onInput: (event: { sessionId: string; data: string }) => void;
+  onInput: (event: { sessionId: string; data: Uint8Array }) => void;
   onResize: (event: { sessionId: string; cols: number; rows: number }) => void;
 }
 
@@ -82,11 +93,13 @@ export default function XtermView({ sessionId, active, interactive, onInput, onR
     const screen = container.querySelector('.xterm-screen');
     const mutationObserver = new MutationObserver(updateThumb);
     if (screen) mutationObserver.observe(screen, { childList: true, subtree: true, attributes: true });
-    const inputDisposable = terminal.onData((data) => {
-      // Connected 前不接收用户输入，防止连接未完成时向 PTY 写入指令
+    /** 仅 Connected 后向 PTY 上送字节，避免连接未完成时发送输入。 */
+    function emitInput(data: Uint8Array) {
       if (!interactiveRef.current) return;
       inputRef.current({ sessionId, data });
-    });
+    }
+    const inputDisposable = terminal.onData((data) => emitInput(terminalTextEncoder.encode(data)));
+    const binaryInputDisposable = terminal.onBinary((data) => emitInput(binaryStringToBytes(data)));
     const resizeObserver = new ResizeObserver(() => { fit(); updateThumb(); });
     resizeObserver.observe(container);
     let disposed = false;
@@ -107,6 +120,7 @@ export default function XtermView({ sessionId, active, interactive, onInput, onR
       mutationObserver.disconnect();
       viewport?.removeEventListener('scroll', updateThumb);
       inputDisposable.dispose();
+      binaryInputDisposable.dispose();
       terminal.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;

@@ -445,7 +445,7 @@ mod integration_tests {
         );
 
         command_tx
-            .send(TerminalCommand::Write("echo test\n".to_string()))
+            .send(TerminalCommand::Write(b"echo test\n".to_vec()))
             .expect("写入命令应可发送到终端工作线程");
         exit_rx
             .recv_timeout(Duration::from_secs(1))
@@ -467,7 +467,7 @@ mod integration_tests {
         );
         assert!(
             command_tx
-                .send(TerminalCommand::Write("ignored\n".to_string()))
+                .send(TerminalCommand::Write(b"ignored\n".to_vec()))
                 .is_err(),
             "工作线程退出后不应继续接收写入命令"
         );

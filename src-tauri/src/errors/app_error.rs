@@ -93,9 +93,17 @@ pub enum AppError {
     #[error("会话不存在: {0}")]
     SessionNotFound(ErrorDetail),
 
+    /// 指定 host_id 对应的主机配置不存在（可能是删除主机后的过期前端引用）
+    #[error("主机不存在: {0}")]
+    HostNotFound(ErrorDetail),
+
     /// 主机配置不合法（必填字段缺失、格式错误等）
     #[error("主机配置无效: {0}")]
     InvalidHostConfig(ErrorDetail),
+
+    /// 终端输入 IPC 请求缺少会话标识或未携带原始字节 payload
+    #[error("终端输入无效: {0}")]
+    InvalidTerminalInput(ErrorDetail),
 
     /// 持久化存储读写失败（JSON 序列化、文件 IO 等）
     #[error("存储错误: {0}")]
@@ -224,7 +232,9 @@ impl AppError {
             Self::SshConnectionError(_) => "SshConnectionError",
             Self::AuthenticationError(_) => "AuthenticationError",
             Self::SessionNotFound(_) => "SessionNotFound",
+            Self::HostNotFound(_) => "HostNotFound",
             Self::InvalidHostConfig(_) => "InvalidHostConfig",
+            Self::InvalidTerminalInput(_) => "InvalidTerminalInput",
             Self::StorageError(_) => "StorageError",
             Self::IoError(_) => "IoError",
             Self::SshProtocolError(_) => "SshProtocolError",
@@ -276,7 +286,9 @@ impl AppError {
             Self::SshConnectionError(p) => Self::SshConnectionError(append(p, extra)),
             Self::AuthenticationError(p) => Self::AuthenticationError(append(p, extra)),
             Self::SessionNotFound(p) => Self::SessionNotFound(append(p, extra)),
+            Self::HostNotFound(p) => Self::HostNotFound(append(p, extra)),
             Self::InvalidHostConfig(p) => Self::InvalidHostConfig(append(p, extra)),
+            Self::InvalidTerminalInput(p) => Self::InvalidTerminalInput(append(p, extra)),
             Self::StorageError(p) => Self::StorageError(append(p, extra)),
             Self::IoError(io) => Self::IoError(std::io::Error::other(format!("{io}；{extra}"))),
             Self::SshProtocolError(p) => Self::SshProtocolError(append(p, extra)),
@@ -430,7 +442,9 @@ impl From<&AppError> for AppErrorInfo {
             AppError::SshConnectionError(p)
             | AppError::AuthenticationError(p)
             | AppError::SessionNotFound(p)
+            | AppError::HostNotFound(p)
             | AppError::InvalidHostConfig(p)
+            | AppError::InvalidTerminalInput(p)
             | AppError::StorageError(p)
             | AppError::SshProtocolError(p)
             | AppError::SecureStoreError(p)

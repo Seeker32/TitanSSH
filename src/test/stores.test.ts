@@ -185,6 +185,17 @@ describe('Zustand stores', () => {
     expect(useLayoutStore.getState().sidebarWidth).toBe(760 - MIN_MAIN_PANEL_WIDTH);
   });
 
+  it('终端输入通过原始字节 payload 与 session header 发送', async () => {
+    const data = Uint8Array.from([0x00, 0xff, 0x1b, 0x5b, 0x41]);
+    await useSessionStore.getState().writeTerminal('session-1', data);
+
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'write_terminal',
+      data,
+      { headers: { 'x-titanssh-session-id': 'session-1' } },
+    );
+  });
+
   it('打开会话后设为激活并启动监控', async () => {
     const session = makeSession();
     const task = makeTaskInfo();
