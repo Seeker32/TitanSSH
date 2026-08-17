@@ -228,34 +228,50 @@ pub fn delete_credential(key: &str) -> Result<(), AppError> {
     delete_macos_credential_with(key, delete_macos_item)
 }
 
-/// 执行 macOS Keychain 直接删除查询；回调参数依次为 service 与 account
+/// macOS Keychain 删除范围；必须与 keyring apple-native 的读取范围保持一致。
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosKeychainScope {
+    /// 不指定 kSecMatchSearchList，让 Security Framework 查询用户完整搜索列表。
+    UserSearchList,
+}
+
+/// 执行 macOS Keychain 直接删除查询；回调参数依次为 service、account 与搜索范围。
 #[cfg(target_os = "macos")]
 fn delete_macos_credential_with(
     key: &str,
-    delete: impl FnOnce(&str, &str) -> security_framework::base::Result<()>,
+    delete: impl FnOnce(&str, &str, MacosKeychainScope) -> security_framework::base::Result<()>,
 ) -> Result<(), AppError> {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
-    match delete(SERVICE_NAME, key) {
+    match delete(SERVICE_NAME, key, MacosKeychainScope::UserSearchList) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
         Err(error) => Err(AppError::SecureStoreError(error.to_string().into())),
     }
 }
 
-/// 从用户默认 Keychain 直接删除匹配项，不读取其中的密码数据
+/// 从用户完整 Keychain 搜索列表直接删除匹配项，不读取其中的密码数据。
+///
+/// 不得设置 ItemSearchOptions::keychains：该字段会把查询限制为给定钥匙串；省略后
+/// SecItemDelete 使用系统搜索列表，与 keyring apple-native 的 SecItemCopyMatching 查询一致。
 #[cfg(target_os = "macos")]
-fn delete_macos_item(service: &str, account: &str) -> security_framework::base::Result<()> {
+fn delete_macos_item(
+    service: &str,
+    account: &str,
+    scope: MacosKeychainScope,
+) -> security_framework::base::Result<()> {
     use security_framework::item::{ItemClass, ItemSearchOptions};
-    use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
 
-    let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)?;
     let mut query = ItemSearchOptions::new();
-    query
-        .keychains(&[keychain])
-        .class(ItemClass::generic_password())
-        .service(service)
-        .account(account);
+    match scope {
+        MacosKeychainScope::UserSearchList => {
+            query
+                .class(ItemClass::generic_password())
+                .service(service)
+                .account(account);
+        }
+    }
     query.delete()
 }
 

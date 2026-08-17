@@ -201,6 +201,11 @@ mod tests {
             ("#comment", "ssh-ed25519", b"blob"),
             ("host[", "ssh-ed25519", b"blob"),
             ("host]", "ssh-ed25519", b"blob"),
+            ("*.example.com", "ssh-ed25519", b"blob"),
+            ("host?.example.com", "ssh-ed25519", b"blob"),
+            ("!blocked.example.com", "ssh-ed25519", b"blob"),
+            ("a.example.com,b.example.com", "ssh-ed25519", b"blob"),
+            ("@revoked.example.com", "ssh-ed25519", b"blob"),
             ("server.example.com", "ssh-ed25519 cert", b"blob"),
             ("server.example.com", "ssh-ed25519", b""),
         ] {

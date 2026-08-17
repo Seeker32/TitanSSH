@@ -8,6 +8,8 @@
 //! - 文件缺失 = 空信任存储（首次运行场景）；
 //! - 文件不可读 / 无法解析 = fail-closed 错误，绝不静默视为空；
 //! - endpoint 不做小写、尾点、别名或解析 IP 合并，保留配置中的精确拼写。
+//! - 仅保存精确 host；拒绝 OpenSSH pattern / marker 元字符，避免本应用写出的记录被
+//!   其他 known_hosts 读取器解释为通配、否定匹配或 marker。
 
 use crate::errors::app_error::{AppError, ErrorDetail};
 use base64::Engine;
@@ -27,6 +29,7 @@ const KNOWN_HOSTS_FILE_NAME: &str = "known_hosts";
 /// 单条 endpoint 信任记录：精确 host + port → 当前算法 + 完整公钥。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustRecord {
+    /// 精确 endpoint 的 host；不得包含 OpenSSH pattern 元字符或以 `@` 开头。
     pub host: String,
     pub port: u16,
     /// OpenSSH 风格算法名（如 ssh-ed25519）
@@ -329,7 +332,8 @@ fn parse_host_pattern(pattern: &str) -> Result<(String, u16), String> {
 /// 将 endpoint 序列化为标准 OpenSSH known_hosts 主机段。
 ///
 /// 非 22 端口或含冒号的 IPv6 地址使用 `[host]:port`，其余保持原拼写（不进行
-/// 小写、尾点、别名或解析 IP 归一化）。
+/// 小写、尾点、别名或解析 IP 归一化）。调用前必须经 validate_record 确认 host 不含
+/// OpenSSH pattern / marker 元字符。
 fn format_host_pattern(host: &str, port: u16) -> String {
     if port != 22 || host.contains(':') {
         format!("[{host}]:{port}")
@@ -350,6 +354,13 @@ fn validate_record(record: &TrustRecord) -> Result<(), AppError> {
         .any(|character| character.is_whitespace() || matches!(character, '[' | ']'))
     {
         Some("主机不能包含空白或方括号")
+    } else if record.host.starts_with('@')
+        || record
+            .host
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '!' | ','))
+    {
+        Some("主机不能包含 OpenSSH 模式元字符或以 @ 开头")
     } else if record.algorithm.is_empty() || record.algorithm.chars().any(char::is_whitespace) {
         Some("算法名不能为空或包含空白")
     } else if record.blob.is_empty() {

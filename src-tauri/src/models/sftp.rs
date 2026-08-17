@@ -2,12 +2,15 @@ use crate::errors::app_error::AppErrorInfo;
 use serde::{Deserialize, Serialize};
 
 /// 远程文件系统条目（文件或目录）
+///
+/// name 与 path 来自不可信的 SFTP 服务器。仅当 is_valid_entry 为 true 时，调用方才可
+/// 将 file_name 用作本地文件系统路径的单个组件；不得直接把服务端字符串拼接到本地路径。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteEntry {
-    /// 文件或目录名称（不含路径）
+    /// 服务端声明的文件或目录名称；必须与 path 的 basename 相同且不含路径分隔符
     pub name: String,
-    /// 完整绝对路径
+    /// 服务端声明的规范绝对 POSIX 路径；不得含空段、`.`、`..` 或反斜杠
     pub path: String,
     /// 是否为目录
     pub is_dir: bool,
@@ -17,6 +20,45 @@ pub struct RemoteEntry {
     pub modified_at: i64,
     /// 权限字符串，如 "rwxr-xr-x"
     pub permissions: String,
+}
+
+impl RemoteEntry {
+    /// 判断服务端条目是否满足可安全派生本地文件名的规范路径不变量。
+    pub fn is_valid_entry(&self) -> bool {
+        self.file_name().is_some()
+    }
+
+    /// 返回已验证的单段文件名；无效服务端输入返回 None，调用方不得继续构建本地路径。
+    pub fn file_name(&self) -> Option<&str> {
+        if self.name.is_empty()
+            || matches!(self.name.as_str(), "." | "..")
+            || self.name.contains('/')
+            || self.name.contains('\\')
+            || self.name.chars().any(char::is_control)
+            || !self.path.starts_with('/')
+            || self.path.contains('\\')
+        {
+            return None;
+        }
+
+        let mut components = self.path.split('/');
+        if components.next() != Some("") {
+            return None;
+        }
+        let path_file_name = components.next_back()?;
+        if path_file_name != self.name
+            || path_file_name.is_empty()
+            || components.any(|component| {
+                component.is_empty()
+                    || matches!(component, "." | "..")
+                    || component.chars().any(char::is_control)
+            })
+        {
+            return None;
+        }
+
+        Some(path_file_name)
+    }
 }
 
 /// 传输方向

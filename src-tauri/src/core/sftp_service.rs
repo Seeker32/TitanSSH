@@ -466,7 +466,8 @@ impl SftpService {
             })
     }
 
-    /// 列举远程目录内容，按目录优先、名称排序
+    /// 列举远程目录内容，按目录优先、名称排序；服务端条目不可信，畸形路径不得跨 IPC
+    /// 进入前端或参与本地下载路径派生。
     ///
     /// 操作发现 Ready 控制连接失效时自动淘汰并重连一次；第二次失败原样返回结构化错误。
     ///
@@ -481,10 +482,7 @@ impl SftpService {
         let mut entries: Vec<RemoteEntry> = entries
             .into_iter()
             .map(|entry| {
-                let name = Path::new(&entry.path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                let name = entry.path.rsplit('/').next().unwrap_or_default().to_string();
                 RemoteEntry {
                     name,
                     path: entry.path,
@@ -497,6 +495,7 @@ impl SftpService {
                         .unwrap_or_default(),
                 }
             })
+            .filter(RemoteEntry::is_valid_entry)
             .collect();
 
         // 目录优先，同类按名称排序

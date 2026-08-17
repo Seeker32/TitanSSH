@@ -48,21 +48,26 @@ mod tests {
         assert_ne!(passphrase_key("host-1"), passphrase_key("host-2"));
     }
 
-    /// 验证 macOS 删除只提交 service/account 查询，不预读密码数据
+    /// 验证 macOS 删除使用与读取一致的用户 Keychain 搜索列表，不预读密码数据
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_delete_uses_direct_query_without_reading_password() {
-        // macOS 删除必须直接按 service/account 查询，不能先读取密码触发系统授权弹窗
+    fn macos_delete_uses_search_list_direct_query_without_reading_password() {
+        // macOS 删除必须直接按 service/account 查询，不能先读取密码触发系统授权弹窗；
+        // 不能钉死单个 default keychain，否则会遗漏 keyring 读取路径可见的迁移条目。
         let mut calls = Vec::new();
-        let result = delete_macos_credential_with("host-key", |service, account| {
-            calls.push((service.to_string(), account.to_string()));
+        let result = delete_macos_credential_with("host-key", |service, account, scope| {
+            calls.push((service.to_string(), account.to_string(), scope));
             Ok(())
         });
 
         assert!(result.is_ok());
         assert_eq!(
             calls,
-            vec![(SERVICE_NAME.to_string(), "host-key".to_string())]
+            vec![(
+                SERVICE_NAME.to_string(),
+                "host-key".to_string(),
+                MacosKeychainScope::UserSearchList,
+            )]
         );
     }
 
@@ -71,10 +76,10 @@ mod tests {
     #[test]
     fn macos_delete_only_ignores_missing_item_error() {
         // 不存在条目应幂等成功，其他 Keychain 错误必须保留供上层诊断
-        let missing = delete_macos_credential_with("missing", |_, _| {
+        let missing = delete_macos_credential_with("missing", |_, _, _| {
             Err(security_framework::base::Error::from_code(-25300))
         });
-        let invalid = delete_macos_credential_with("invalid", |_, _| {
+        let invalid = delete_macos_credential_with("invalid", |_, _, _| {
             Err(security_framework::base::Error::from_code(-50))
         });
 
