@@ -51,6 +51,58 @@ mod tests {
         assert!(found.matches("10.0.0.8", 22, "ssh-ed25519", &blob));
     }
 
+    /// 已加载缓存必须发现外部删除和恢复，避免同一实例持续使用过期信任决策。
+    #[test]
+    fn lookup_reloads_after_external_file_removal_and_restore() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        store
+            .upsert(record("removed.example.com", 22, "ssh-ed25519", b"old-key"))
+            .expect("预置记录应成功");
+        assert!(
+            store
+                .lookup("removed.example.com", 22)
+                .expect("首次查询应加载缓存")
+                .is_some()
+        );
+
+        fs::remove_file(&path).expect("模拟外部删除应成功");
+        assert_eq!(
+            store
+                .lookup("removed.example.com", 22)
+                .expect("外部删除后查询应成功"),
+            None,
+            "外部删除后的记录不得继续被信任"
+        );
+
+        fs::write(&path, "restored.example.com ssh-ed25519 bmV3LWtleQ\n")
+            .expect("模拟外部恢复应成功");
+        let restored = store
+            .lookup("restored.example.com", 22)
+            .expect("外部恢复后查询应成功")
+            .expect("外部恢复的记录应被加载");
+        assert_eq!(restored.blob, b"new-key");
+    }
+
+    /// 清单读取同样必须发现外部替换，不能只在 lookup 时刷新缓存。
+    #[test]
+    fn list_reloads_after_external_file_replacement() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        store
+            .upsert(record("old.example.com", 22, "ssh-ed25519", b"old-key"))
+            .expect("预置记录应成功");
+        assert_eq!(store.list().expect("首次清单应加载缓存").len(), 1);
+
+        fs::write(&path, "restored-new.example.com ssh-ed25519 bmV3LWtleQ\n")
+            .expect("模拟外部替换应成功");
+        let records = store.list().expect("外部替换后清单应成功");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].host, "restored-new.example.com");
+        assert_eq!(records[0].blob, b"new-key");
+    }
+
     /// 端口 22 的主机不带括号；磁盘内容为标准 OpenSSH 表示。
     #[test]
     fn default_port_uses_plain_host_pattern() {
@@ -134,6 +186,45 @@ mod tests {
         );
     }
 
+    /// 不可序列化的记录必须在写入前拒绝，不能污染已有的可解析信任文件。
+    #[test]
+    fn upsert_rejects_unserializable_records_without_poisoning_store() {
+        let path = temp_store_path();
+        let store = store_at(&path);
+        store
+            .upsert(record("trusted.example.com", 22, "ssh-ed25519", b"trusted"))
+            .expect("预置合法记录应成功");
+        let original_content = fs::read_to_string(&path).expect("应能读取预置记录");
+
+        for (host, algorithm, blob) in [
+            ("host with whitespace", "ssh-ed25519", b"blob" as &[u8]),
+            ("#comment", "ssh-ed25519", b"blob"),
+            ("host[", "ssh-ed25519", b"blob"),
+            ("host]", "ssh-ed25519", b"blob"),
+            ("server.example.com", "ssh-ed25519 cert", b"blob"),
+            ("server.example.com", "ssh-ed25519", b""),
+        ] {
+            let error = store
+                .upsert(record(host, 22, algorithm, blob))
+                .expect_err("不可序列化的记录必须被拒绝");
+
+            assert_eq!(error.code(), "TrustStoreError");
+            assert_eq!(
+                fs::read_to_string(&path).expect("拒绝写入后原文件应可读取"),
+                original_content,
+                "拒绝写入不得修改已有信任文件"
+            );
+            assert_eq!(
+                store
+                    .lookup("trusted.example.com", 22)
+                    .expect("拒绝写入不得破坏已有缓存")
+                    .expect("预置记录应保持存在")
+                    .blob,
+                b"trusted"
+            );
+        }
+    }
+
     /// 不可解析文件 fail-closed：load 返回 TrustStoreError，绝不静默视为空。
     #[test]
     fn corrupt_file_fails_closed() {
@@ -162,6 +253,27 @@ mod tests {
         );
     }
 
+    /// 外部文件中同一 endpoint 出现多个记录时 fail-closed，不能按文件顺序任选一个密钥。
+    #[test]
+    fn duplicate_endpoint_records_fail_closed() {
+        let path = temp_store_path();
+        fs::write(
+            &path,
+            "duplicate.example.com ssh-ed25519 b2xk\nduplicate.example.com ssh-ed25519 bmV3\n",
+        )
+        .expect("写入外部重复记录应成功");
+        let store = store_at(&path);
+
+        assert_eq!(
+            store
+                .lookup("duplicate.example.com", 22)
+                .unwrap_err()
+                .code(),
+            "TrustStoreError"
+        );
+        assert_eq!(store.list().unwrap_err().code(), "TrustStoreError");
+    }
+
     /// 不可读文件（路径为目录）fail-closed。
     #[test]
     fn unreadable_file_fails_closed() {
@@ -172,10 +284,9 @@ mod tests {
         assert_eq!(error.code(), "TrustStoreError");
     }
 
-    /// 写入失败（目标为目录）返回错误，且缓存保持原状：失败的记录不会
-    /// 被误认为已持久化，原有记录仍可读取。
+    /// 外部将信任文件替换为目录后，写入与后续读取均 fail-closed，不能继续使用旧缓存。
     #[test]
-    fn write_failure_reports_error_and_keeps_cache_unchanged() {
+    fn external_unreadable_replacement_fails_closed_after_upsert_error() {
         let path = temp_store_path();
         let store = store_at(&path);
         store
@@ -188,8 +299,11 @@ mod tests {
             .upsert(record("10.0.0.8", 22, "ssh-ed25519", b"new"))
             .unwrap_err();
         assert_eq!(error.code(), "TrustStoreError");
-        // 缓存不被失败写入污染：仍返回旧记录（与磁盘最后一次成功发布一致）
-        assert_eq!(store.lookup("10.0.0.8", 22).unwrap().unwrap().blob, b"old");
+        assert_eq!(
+            store.lookup("10.0.0.8", 22).unwrap_err().code(),
+            "TrustStoreError",
+            "外部替换后不得继续使用旧缓存"
+        );
     }
 
     /// 空行与注释行跳过，其余行正常解析。
@@ -333,10 +447,9 @@ mod tests {
         assert_eq!(store.reload().unwrap().len(), 1);
     }
 
-    /// 移除失败（目标为目录）返回错误，缓存与磁盘保持原状：失败的清理不得
-    /// 让调用方误以为记录已删除。
+    /// 外部将信任文件替换为目录后，移除与后续读取均 fail-closed，不能继续使用旧缓存。
     #[test]
-    fn remove_write_failure_reports_error_and_keeps_record() {
+    fn external_unreadable_replacement_fails_closed_after_remove_error() {
         let path = temp_store_path();
         let store = store_at(&path);
         store
@@ -349,9 +462,9 @@ mod tests {
         let error = store.remove("10.0.0.8", 22).unwrap_err();
         assert_eq!(error.code(), "TrustStoreError");
         assert_eq!(
-            store.lookup("10.0.0.8", 22).unwrap().unwrap().blob,
-            b"blob-a",
-            "失败的移除不得污染缓存"
+            store.lookup("10.0.0.8", 22).unwrap_err().code(),
+            "TrustStoreError",
+            "外部替换后不得继续使用旧缓存"
         );
     }
 

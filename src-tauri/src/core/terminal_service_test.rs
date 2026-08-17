@@ -778,9 +778,11 @@ mod integration_tests {
             SessionStatus::Error,
             "会话关闭取消等待中的主机身份验证，终端以 Error 退出"
         );
-        assert!(identity
-            .pending_challenge("session-identity-cancel")
-            .is_none());
+        assert!(
+            identity
+                .pending_challenge("session-identity-cancel")
+                .is_none()
+        );
     }
 
     /// 用户拒绝主机身份映射为 Error 状态并转发结构化语义。

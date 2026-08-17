@@ -41,6 +41,11 @@ pub struct SessionStatusEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalDataEvent {
     pub session_id: String,
+    /// 终端的 UTF-8 文本片段。生产端跨底层读取边界增量解码，绝不拆分完整 UTF-8
+    /// 字符；非 UTF-8 字节及 EOF 时未完成的序列会以 U+FFFD 替换。
+    ///
+    /// 此字段不是字节保真通道，不能用于通过 PTY 传输二进制数据；需要二进制传输时
+    /// 必须使用 SFTP 服务或定义带编码的字节载荷协议。
     pub data: String,
 }
 

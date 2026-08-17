@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::models::host::{AuthType, HostConfig};
-    use crate::storage::host_store::{migrate_legacy_hosts, HostStore};
+    use crate::storage::host_store::{HostStore, migrate_legacy_hosts};
     use proptest::prelude::*;
     use std::fs;
     use std::path::PathBuf;
@@ -243,10 +243,12 @@ mod tests {
             corrupt_content,
             "备份必须保留原始损坏内容"
         );
-        assert!(store
-            .load()
-            .expect("quarantine 后的下一次加载应视为空配置")
-            .is_empty());
+        assert!(
+            store
+                .load()
+                .expect("quarantine 后的下一次加载应视为空配置")
+                .is_empty()
+        );
     }
 
     /// 生成任意合法 AuthType 的策略

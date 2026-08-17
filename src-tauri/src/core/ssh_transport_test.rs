@@ -2,14 +2,17 @@
 mod tests {
     use crate::core::ssh_transport::test_support::allow_all_verifier;
     use crate::core::ssh_transport::{
-        ConnectPhase, RemoteFile, SSH_PROTOCOL_TIMEOUT_MS, SftpEntry, SftpOps, SftpTransport,
-        TerminalOps, TerminalTransport, build_connect_error, connect_tcp_stream, is_timeout_error,
-        map_sftp_rename_error, resolve_socket_addrs,
+        ConnectPhase, LIBSSH2_ERROR_EAGAIN, RemoteFile, SSH_PROTOCOL_TIMEOUT_MS, SftpEntry,
+        SftpOps, SftpTransport, TerminalOps, TerminalTransport, build_connect_error,
+        clear_long_lived_session_timeout, connect_tcp_stream, decode_exec_output,
+        map_sftp_path_error, map_sftp_rename_error, resolve_socket_addrs,
+        resolve_socket_addrs_with_timeout, socket_endpoint,
     };
     use crate::errors::app_error::AppError;
     use crate::models::host::{AuthType, HostConfig};
-    use std::io;
-    use std::net::SocketAddr;
+    use std::collections::VecDeque;
+    use std::io::{self, Write};
+    use std::net::{SocketAddr, ToSocketAddrs};
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
@@ -97,6 +100,152 @@ mod tests {
         assert_eq!(*writes.lock().unwrap(), vec!["uptime\n"]);
     }
 
+    /// 非阻塞终端在 SSH window 暂满时必须重试，并在发生部分写入后继续发送余下
+    /// 输入；flush 的 EAGAIN 也不得让已接受的粘贴内容被丢弃。
+    #[test]
+    fn terminal_input_retries_would_block_and_preserves_partial_progress() {
+        struct BackpressuredWriter {
+            write_results: VecDeque<io::Result<usize>>,
+            flush_results: VecDeque<io::Result<()>>,
+            written: Vec<u8>,
+        }
+
+        impl Write for BackpressuredWriter {
+            /// 按预设结果模拟 SSH channel 写入，成功时复制对应字节。
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                match self.write_results.pop_front().unwrap_or(Ok(buffer.len())) {
+                    Ok(size) => {
+                        self.written.extend_from_slice(&buffer[..size]);
+                        Ok(size)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+
+            /// 按预设结果模拟 SSH channel flush。
+            fn flush(&mut self) -> io::Result<()> {
+                self.flush_results.pop_front().unwrap_or(Ok(()))
+            }
+        }
+
+        let mut writer = BackpressuredWriter {
+            write_results: VecDeque::from([
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "window full")),
+                Ok(2),
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "window full")),
+                Ok(3),
+            ]),
+            flush_results: VecDeque::from([
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "window full")),
+                Ok(()),
+            ]),
+            written: Vec::new(),
+        };
+
+        crate::core::ssh_transport::write_terminal_input_with_retry(
+            &mut writer,
+            b"paste",
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .expect("短暂背压恢复后，完整终端输入应发送成功");
+
+        assert_eq!(writer.written, b"paste");
+        assert!(
+            writer.flush_results.is_empty(),
+            "flush 的 EAGAIN 必须被重试"
+        );
+    }
+
+    /// 若背压持续到已过的截止时间，终端输入必须有界返回，而不能在工作线程中忙等。
+    #[test]
+    fn terminal_input_returns_would_block_after_backpressure_deadline() {
+        struct AlwaysBlockedWriter;
+
+        impl Write for AlwaysBlockedWriter {
+            /// 模拟始终已满的 SSH channel window。
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "window full"))
+            }
+
+            /// 本测试不会到达 flush。
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = crate::core::ssh_transport::write_terminal_input_with_retry(
+            &mut AlwaysBlockedWriter,
+            b"paste",
+            Instant::now(),
+            Duration::ZERO,
+        )
+        .expect_err("持续背压超过截止时间必须返回");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// 调整 PTY 尺寸和关闭 channel 同样是非阻塞请求；一次 EAGAIN 不得被误报为
+    /// 协议失败，而应在背压恢复后完成。
+    #[test]
+    fn terminal_control_requests_retry_eagain() {
+        let mut resize_attempts = 0;
+        crate::core::ssh_transport::retry_terminal_protocol_operation_with_retry(
+            || {
+                resize_attempts += 1;
+                if resize_attempts == 1 {
+                    Err(ssh2::Error::new(
+                        ssh2::ErrorCode::Session(LIBSSH2_ERROR_EAGAIN),
+                        "window full",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .expect("resize 的短暂 EAGAIN 应重试成功");
+
+        let mut close_attempts = 0;
+        crate::core::ssh_transport::retry_terminal_protocol_operation_with_retry(
+            || {
+                close_attempts += 1;
+                if close_attempts == 1 {
+                    Err(ssh2::Error::new(
+                        ssh2::ErrorCode::Session(LIBSSH2_ERROR_EAGAIN),
+                        "window full",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .expect("close 的短暂 EAGAIN 应重试成功");
+
+        assert_eq!(resize_attempts, 2);
+        assert_eq!(close_attempts, 2);
+
+        let mut failure_attempts = 0;
+        let error = crate::core::ssh_transport::retry_terminal_protocol_operation_with_retry(
+            || {
+                failure_attempts += 1;
+                Err::<(), _>(ssh2::Error::new(
+                    ssh2::ErrorCode::Session(-7), // LIBSSH2_ERROR_SOCKET_SEND
+                    "socket failed",
+                ))
+            },
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .expect_err("非 EAGAIN 协议错误不得被重试或掩盖");
+
+        assert_eq!(failure_attempts, 1);
+        assert_eq!(error.code(), ssh2::ErrorCode::Session(-7));
+    }
+
     /// 阻塞的 SFTP adapter 不得阻塞独立 Terminal capability。
     #[test]
     fn blocking_sftp_does_not_block_terminal_capability() {
@@ -146,6 +295,22 @@ mod tests {
         assert!(resolve_socket_addrs(&make_host("invalid host name with spaces", 22)).is_err());
     }
 
+    /// 裸 IPv6 字面量必须使用方括号与端口组成可解析的 socket endpoint。
+    #[test]
+    fn socket_endpoint_brackets_bare_ipv6_without_changing_other_hosts() {
+        let ipv6_endpoint = socket_endpoint("fe80::1", 22);
+        assert_eq!(ipv6_endpoint, "[fe80::1]:22");
+        assert!(
+            ipv6_endpoint.to_socket_addrs().is_ok(),
+            "加方括号后的 IPv6 endpoint 必须可由 ToSocketAddrs 解析"
+        );
+        assert_eq!(socket_endpoint("192.0.2.10", 2200), "192.0.2.10:2200");
+        assert_eq!(
+            socket_endpoint("ssh.example.test", 22),
+            "ssh.example.test:22"
+        );
+    }
+
     /// 非超时网络错误保持连接失败语义。
     #[test]
     fn connect_tcp_stream_returns_connection_error_without_timeout() {
@@ -158,36 +323,44 @@ mod tests {
         ));
     }
 
-    /// 任一地址超时时优先保留 timeout 语义。
+    /// 多地址建连失败必须保留总尝试次数与最后错误；一次早期超时不得覆盖随后
+    /// 的 ConnectionRefused 并伪装成纯超时。
     #[test]
-    fn build_connect_error_prefers_timeout_error() {
+    fn build_connect_error_reports_attempt_count_and_last_error() {
         let error = build_connect_error(
-            true,
+            2,
             Some(io::Error::new(io::ErrorKind::ConnectionRefused, "refused")),
             Duration::from_secs(10),
         );
 
         assert!(matches!(
             error,
-            AppError::SshConnectionError(message) if message.to_string().contains("Connection timeout")
+            AppError::SshConnectionError(message)
+                if message.to_string().contains("2")
+                    && message.to_string().contains("refused")
+                    && !message.to_string().contains("Connection timeout")
         ));
     }
 
-    /// timeout 分类覆盖 TimedOut 与 WouldBlock，但不误判拒绝连接。
+    /// DNS 解析同样属于总连接预算；阻塞解析不得使连接等待超过给定 deadline。
     #[test]
-    fn is_timeout_error_recognizes_timeout_kinds() {
-        assert!(is_timeout_error(&io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out"
-        )));
-        assert!(is_timeout_error(&io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "would block"
-        )));
-        assert!(!is_timeout_error(&io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "refused"
-        )));
+    fn dns_resolution_returns_when_connect_deadline_expires() {
+        let started = Instant::now();
+        let error = resolve_socket_addrs_with_timeout(
+            "slow.example:22".to_string(),
+            started + Duration::from_millis(20),
+            || {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(Vec::new())
+            },
+        )
+        .expect_err("阻塞 DNS 解析必须在连接 deadline 返回");
+
+        assert!(started.elapsed() < Duration::from_millis(90));
+        assert!(matches!(
+            error,
+            AppError::SshConnectionError(message) if message.to_string().contains("DNS 解析超时")
+        ));
     }
 
     /// ConnectPhase 序列化名称保持现有事件契约。
@@ -203,6 +376,46 @@ mod tests {
     #[test]
     fn ssh_protocol_timeout_is_ten_seconds() {
         assert_eq!(SSH_PROTOCOL_TIMEOUT_MS, 10_000);
+    }
+
+    /// 认证完成后，SFTP 与 Monitoring Exec 的长生命周期会话不得保留建连期的
+    /// 十秒 libssh2 阻塞超时；慢速但健康的远端操作可以继续等待。
+    #[test]
+    fn long_lived_session_clears_protocol_timeout_after_authentication() {
+        let session = ssh2::Session::new().expect("应能构造 ssh2 Session");
+        session.set_timeout(SSH_PROTOCOL_TIMEOUT_MS);
+
+        clear_long_lived_session_timeout(&session);
+
+        assert_eq!(
+            session.timeout(),
+            0,
+            "SFTP/Exec 长生命周期会话必须关闭 libssh2 阻塞超时"
+        );
+    }
+
+    /// Exec 输出可能受远端 locale 影响而包含非 UTF-8 字节；这不得使监控采集
+    /// 直接失败，输出应以替换字符保留为可解析文本。
+    #[test]
+    fn exec_output_decodes_non_utf8_bytes_lossily() {
+        let output = decode_exec_output(b"CPU_TOTAL=1\xFF\n", 0)
+            .expect("含非 UTF-8 字节的成功命令输出仍应返回文本");
+
+        assert_eq!(output, "CPU_TOTAL=1\u{FFFD}\n");
+    }
+
+    /// Exec command 的非零退出码不能伪装成成功的部分 stdout；Monitoring 必须收到
+    /// 结构化错误并终止本轮采集。
+    #[test]
+    fn exec_output_rejects_nonzero_exit_status() {
+        let error = decode_exec_output(b"partial metric output\n", 17)
+            .expect_err("非零退出码必须使 Exec 失败");
+
+        assert!(matches!(
+            error,
+            AppError::SshProtocolError(detail)
+                if detail.to_string().contains("17")
+        ));
     }
 
     // ─── 远端 rename 错误映射 contract ────────────────────────────────────
@@ -222,6 +435,91 @@ mod tests {
             matches!(&mapped, AppError::SftpTargetExists(path) if path.to_string() == "/tmp/dst"),
             "no-clobber 撞目标应映射为 SftpTargetExists，实际: {mapped:?}"
         );
+    }
+
+    /// OpenSSH 的 SFTP v3 no-clobber rename 常把目标已存在报告为
+    /// SSH_FX_FAILURE（4）；即使没有英文 "already exists" 文本，也必须进入
+    /// 逐文件确认覆盖的 SftpTargetExists 流程。
+    #[test]
+    fn rename_failure_code_maps_to_target_exists_for_no_clobber() {
+        let error = ssh2::Error::new(
+            ssh2::ErrorCode::SFTP(4), // LIBSSH2_FX_FAILURE
+            "SFTP protocol failure",
+        );
+
+        let mapped = map_sftp_rename_error("/tmp/dst", false, error);
+
+        assert!(
+            matches!(&mapped, AppError::SftpTargetExists(path) if path.to_string() == "/tmp/dst"),
+            "SFTP v3 的 no-clobber failure 必须映射为 SftpTargetExists，实际: {mapped:?}"
+        );
+    }
+
+    /// 传输层错误即使携带英文 "File already exists" 诊断，也不是 SFTP 目标冲突；
+    /// 分类必须只取 SFTP 状态码，避免错误弹出覆盖确认。
+    #[test]
+    fn rename_does_not_classify_transport_error_by_english_message() {
+        let error = ssh2::Error::new(
+            ssh2::ErrorCode::Session(-7), // LIBSSH2_ERROR_SOCKET_SEND
+            "File already exists",
+        );
+
+        let mapped = map_sftp_rename_error("/tmp/dst", false, error);
+
+        assert!(
+            matches!(&mapped, AppError::SftpPublishError(detail)
+                if detail.to_string().contains("File already exists")),
+            "传输错误文本仅保留诊断，不能映射为 SftpTargetExists，实际: {mapped:?}"
+        );
+    }
+
+    /// SFTP 路径领域错误必须按协议码分类，不能依赖 libssh2/服务端产生的英文文本；
+    /// 否则会退化为 SftpChannelError 并无谓触发连接重建。
+    #[test]
+    fn path_errors_map_sftp_codes_without_english_messages() {
+        let missing_file = map_sftp_path_error(
+            "/missing-file",
+            ssh2::Error::new(ssh2::ErrorCode::SFTP(2), "SFTP protocol failure"),
+        );
+        let missing_path = map_sftp_path_error(
+            "/missing-path",
+            ssh2::Error::new(ssh2::ErrorCode::SFTP(10), "SFTP protocol failure"),
+        );
+        let denied = map_sftp_path_error(
+            "/forbidden",
+            ssh2::Error::new(ssh2::ErrorCode::SFTP(3), "SFTP protocol failure"),
+        );
+
+        assert!(matches!(
+            missing_file,
+            AppError::SftpPathNotFound(path) if path.to_string() == "/missing-file"
+        ));
+        assert!(matches!(
+            missing_path,
+            AppError::SftpPathNotFound(path) if path.to_string() == "/missing-path"
+        ));
+        assert!(matches!(
+            denied,
+            AppError::SftpPermissionDenied(path) if path.to_string() == "/forbidden"
+        ));
+    }
+
+    /// 非 SFTP 的传输失败即使含有英文路径错误文本也不能伪装成领域错误；它应保留
+    /// SftpChannelError 以便上层按连接故障处理。
+    #[test]
+    fn path_error_text_does_not_override_non_sftp_code() {
+        let mapped = map_sftp_path_error(
+            "/remote/path",
+            ssh2::Error::new(
+                ssh2::ErrorCode::Session(-7), // LIBSSH2_ERROR_SOCKET_SEND
+                "No such file",
+            ),
+        );
+
+        assert!(matches!(
+            mapped,
+            AppError::SftpChannelError(detail) if detail.to_string().contains("No such file")
+        ));
     }
 
     /// 覆盖 rename 撞上已存在目标：远端不支持覆盖语义（如 SFTP v3 无覆盖标志），

@@ -6,9 +6,10 @@ use crate::models::host::{AuthType, HostConfig};
 use serde::Serialize;
 use ssh2::{Channel, Session, Sftp};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// SSH TCP 建连固定超时时间，避免调用方无限等待。
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -16,6 +17,22 @@ const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_PROTOCOL_TIMEOUT_MS: u32 = 10_000;
 /// Terminal channel 初始化阶段超时时间，单位毫秒。
 const TERMINAL_SETUP_TIMEOUT_MS: u32 = 5_000;
+/// 非阻塞终端 channel 遇到背压时的最长重试时间。
+const TERMINAL_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 非阻塞终端 channel 背压重试间隔，避免忙等占满工作线程。
+const TERMINAL_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(5);
+/// libssh2 的 `LIBSSH2_ERROR_EAGAIN` 值；ssh2 未重新导出该原始常量。
+const LIBSSH2_ERROR_EAGAIN: std::ffi::c_int = -37;
+/// SFTP 的文件不存在状态。
+const LIBSSH2_FX_NO_SUCH_FILE: std::ffi::c_int = 2;
+/// SFTP 的权限拒绝状态。
+const LIBSSH2_FX_PERMISSION_DENIED: std::ffi::c_int = 3;
+/// SFTP 的通用失败状态；OpenSSH SFTP v3 的 no-clobber rename 目标冲突可能返回此值。
+const LIBSSH2_FX_FAILURE: std::ffi::c_int = 4;
+/// SFTP 的路径不存在状态。
+const LIBSSH2_FX_NO_SUCH_PATH: std::ffi::c_int = 10;
+/// SFTP 的明确目标已存在状态。
+const LIBSSH2_FX_FILE_ALREADY_EXISTS: std::ffi::c_int = 11;
 
 /// SSH transport 建连阶段，供 Terminal 保持既有诊断事件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -220,15 +237,13 @@ impl TerminalOps for Ssh2Terminal {
 
     /// 写入 ssh2 Channel 并刷新。
     fn write(&mut self, data: &str) -> Result<(), AppError> {
-        self.channel.write_all(data.as_bytes())?;
-        self.channel.flush()?;
+        write_terminal_input(&mut self.channel, data.as_bytes())?;
         Ok(())
     }
 
     /// 调整 ssh2 PTY 尺寸。
     fn resize(&mut self, cols: u32, rows: u32) -> Result<(), AppError> {
-        self.channel
-            .request_pty_size(cols, rows, None, None)
+        retry_terminal_protocol_operation(|| self.channel.request_pty_size(cols, rows, None, None))
             .map_err(protocol_error)
     }
 
@@ -239,8 +254,135 @@ impl TerminalOps for Ssh2Terminal {
 
     /// 关闭 ssh2 Channel。
     fn close(&mut self) -> Result<(), AppError> {
-        self.channel.close().map_err(protocol_error)
+        retry_terminal_protocol_operation(|| self.channel.close()).map_err(protocol_error)
     }
+}
+
+/// 向非阻塞终端 channel 写入完整输入并刷新，短暂背压时保留进度重试。
+///
+/// # 参数
+/// - `writer`: 终端 channel 的字节写入端
+/// - `data`: 待发送的完整终端输入
+///
+/// # 返回
+/// 数据与 flush 成功时返回 `Ok(())`；持续背压超过上限或发生非 EAGAIN 错误时返回
+/// 原始 IO 错误。
+fn write_terminal_input<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
+    write_terminal_input_with_retry(
+        writer,
+        data,
+        Instant::now() + TERMINAL_BACKPRESSURE_TIMEOUT,
+        TERMINAL_BACKPRESSURE_RETRY_DELAY,
+    )
+}
+
+/// 按给定截止时间向非阻塞终端 channel 写入完整输入，供生产路径与回归测试共用。
+///
+/// # 参数
+/// - `writer`: 终端 channel 的字节写入端
+/// - `data`: 待发送的完整终端输入
+/// - `deadline`: EAGAIN 可重试的最晚时刻
+/// - `retry_delay`: 两次重试之间的休眠时间
+///
+/// # 返回
+/// 数据与 flush 成功时返回 `Ok(())`；零字节写入、超时或其他 IO 错误时返回错误。
+fn write_terminal_input_with_retry<W: Write>(
+    writer: &mut W,
+    data: &[u8],
+    deadline: Instant,
+    retry_delay: Duration,
+) -> io::Result<()> {
+    let mut written = 0;
+    while written < data.len() {
+        let size = retry_terminal_operation(
+            deadline,
+            retry_delay,
+            |error: &io::Error| error.kind() == io::ErrorKind::WouldBlock,
+            || writer.write(&data[written..]),
+        )?;
+        if size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "终端 channel 未写入任何输入字节",
+            ));
+        }
+        written += size;
+    }
+
+    retry_terminal_operation(
+        deadline,
+        retry_delay,
+        |error: &io::Error| error.kind() == io::ErrorKind::WouldBlock,
+        || writer.flush(),
+    )
+}
+
+/// 在限定时间内重试非阻塞终端操作返回的临时背压错误。
+///
+/// # 参数
+/// - `deadline`: 可重试的最晚时刻
+/// - `retry_delay`: 两次重试之间的休眠时间
+/// - `is_retryable`: 判断错误是否属于可重试背压
+/// - `operation`: 单次终端 I/O 或 channel 请求
+///
+/// # 返回
+/// 首次成功值；非可重试错误或超过截止时间后的最后一次错误。
+fn retry_terminal_operation<T, E>(
+    deadline: Instant,
+    retry_delay: Duration,
+    is_retryable: impl Fn(&E) -> bool,
+    mut operation: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable(&error) && Instant::now() < deadline => {
+                thread::sleep(retry_delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// 重试非阻塞终端 channel 的 libssh2 请求，供 resize 与 close 复用。
+///
+/// # 参数
+/// - `operation`: 单次 libssh2 channel 请求
+///
+/// # 返回
+/// 请求成功时返回结果；持续 EAGAIN 超过背压上限或发生其他协议错误时返回原始错误。
+fn retry_terminal_protocol_operation<T>(
+    operation: impl FnMut() -> Result<T, ssh2::Error>,
+) -> Result<T, ssh2::Error> {
+    retry_terminal_protocol_operation_with_retry(
+        operation,
+        Instant::now() + TERMINAL_BACKPRESSURE_TIMEOUT,
+        TERMINAL_BACKPRESSURE_RETRY_DELAY,
+    )
+}
+
+/// 按给定截止时间重试非阻塞终端 channel 的 libssh2 请求，供生产路径与回归测试共用。
+///
+/// # 参数
+/// - `operation`: 单次 libssh2 channel 请求
+/// - `deadline`: EAGAIN 可重试的最晚时刻
+/// - `retry_delay`: 两次重试之间的休眠时间
+///
+/// # 返回
+/// 请求成功时返回结果；持续 EAGAIN 超过截止时间或发生其他协议错误时返回原始错误。
+fn retry_terminal_protocol_operation_with_retry<T>(
+    operation: impl FnMut() -> Result<T, ssh2::Error>,
+    deadline: Instant,
+    retry_delay: Duration,
+) -> Result<T, ssh2::Error> {
+    retry_terminal_operation(
+        deadline,
+        retry_delay,
+        |error: &ssh2::Error| {
+            matches!(error.code(), ssh2::ErrorCode::Session(LIBSSH2_ERROR_EAGAIN))
+        },
+        operation,
+    )
 }
 
 struct Ssh2Sftp {
@@ -326,15 +468,39 @@ struct Ssh2Exec {
 }
 
 impl ExecOps for Ssh2Exec {
-    /// 通过独立 ssh2 Session 执行命令并读取 stdout。
+    /// 通过独立 ssh2 Session 执行命令并读取合并后的 stdout/stderr。
     fn execute(&mut self, command: &str) -> Result<String, AppError> {
         let mut channel = self.session.channel_session().map_err(protocol_error)?;
+        // 合并 stderr 后以单一流读取，防止 stderr 填满 SSH channel window 使远端
+        // 阻塞、stdout 永不 EOF。必须在 exec 前设置，确保整个命令生命周期生效。
+        channel
+            .handle_extended_data(ssh2::ExtendedData::Merge)
+            .map_err(protocol_error)?;
         channel.exec(command).map_err(protocol_error)?;
-        let mut output = String::new();
-        channel.read_to_string(&mut output)?;
+        let mut output = Vec::new();
+        channel.read_to_end(&mut output)?;
         channel.wait_close().map_err(protocol_error)?;
-        Ok(output)
+        let exit_status = channel.exit_status().map_err(protocol_error)?;
+        decode_exec_output(&output, exit_status)
     }
+}
+
+/// 将已排空的远端 Exec 输出转换为文本，并验证命令的退出状态。
+///
+/// # 参数
+/// - `output`: 已合并 stdout/stderr 后读取到的原始字节
+/// - `exit_status`: 远端命令在 channel 关闭后报告的退出码
+///
+/// # 返回
+/// 退出码为零时返回 lossy UTF-8 文本；非零退出码返回结构化 SSH 协议错误。
+fn decode_exec_output(output: &[u8], exit_status: i32) -> Result<String, AppError> {
+    if exit_status != 0 {
+        return Err(AppError::SshProtocolError(ErrorDetail::msg(
+            "远端命令以非零退出码结束: {0}",
+            vec![exit_status.to_string()],
+        )));
+    }
+    Ok(String::from_utf8_lossy(output).into_owned())
 }
 
 /// 建立并初始化 Terminal 专用 SSH 连接。
@@ -372,6 +538,7 @@ pub fn connect_sftp(
     verifier: &HostKeyVerifier,
 ) -> Result<SftpTransport, AppError> {
     let session = connect_session(host, password, passphrase, verifier, &mut |_| {})?;
+    clear_long_lived_session_timeout(&session);
     let sftp = session
         .sftp()
         .map_err(|error| AppError::SftpChannelError(error.to_string().into()))?;
@@ -385,8 +552,21 @@ pub fn connect_exec(
     passphrase: Option<&str>,
     verifier: &HostKeyVerifier,
 ) -> Result<ExecTransport, AppError> {
-    connect_session(host, password, passphrase, verifier, &mut |_| {})
-        .map(|session| ExecTransport::from_backend(Ssh2Exec { session }))
+    let session = connect_session(host, password, passphrase, verifier, &mut |_| {})?;
+    clear_long_lived_session_timeout(&session);
+    Ok(ExecTransport::from_backend(Ssh2Exec { session }))
+}
+
+/// 清除已认证长生命周期连接的 libssh2 阻塞超时。
+///
+/// # 参数
+/// - `session`: 已完成认证、即将提供 SFTP 或 Monitoring Exec capability 的会话
+///
+/// # 副作用
+/// 将 libssh2 的阻塞调用超时设为 0（无限期），避免慢速但健康的文件传输、目录读取
+/// 或监控命令被建连阶段的十秒协议超时中断。
+fn clear_long_lived_session_timeout(session: &Session) {
+    session.set_timeout(0);
 }
 
 /// 建立 TCP、SSH 握手并完成认证；raw Session 不离开本 module。
@@ -403,8 +583,11 @@ where
     F: FnMut(ConnectPhase),
 {
     on_phase(ConnectPhase::ConnectingTcp);
-    let socket_addrs = resolve_socket_addrs(host)?;
-    let tcp = connect_tcp_stream(&socket_addrs, SSH_CONNECT_TIMEOUT)?;
+    // DNS 与所有 A/AAAA 地址尝试共用一个建连预算，避免多地址主机把 10 秒放大为
+    // N×10 秒，也避免 DNS 阻塞脱离连接超时约束。
+    let connect_deadline = Instant::now() + SSH_CONNECT_TIMEOUT;
+    let socket_addrs = resolve_socket_addrs_until(host, connect_deadline)?;
+    let tcp = connect_tcp_stream_until(&socket_addrs, connect_deadline, SSH_CONNECT_TIMEOUT)?;
     tcp.set_read_timeout(Some(Duration::from_millis(SSH_PROTOCOL_TIMEOUT_MS.into())))?;
     tcp.set_write_timeout(Some(Duration::from_millis(SSH_PROTOCOL_TIMEOUT_MS.into())))?;
 
@@ -473,10 +656,14 @@ fn protocol_error(error: ssh2::Error) -> AppError {
 /// 且旧目标保持不动，绝不先删旧文件。其余失败统一为 SftpPublishError 保留底层诊断。
 fn map_sftp_rename_error(dst: &str, overwrite: bool, error: ssh2::Error) -> AppError {
     let message = error.to_string();
-    // LIBSSH2_FX_FILE_ALREADY_EXISTS = 11（libssh2_sftp.h 稳定常量）；
-    // 消息兜底兼容错误码未能传递的服务端实现差异。
-    let already_exists = matches!(error.code(), ssh2::ErrorCode::SFTP(11))
-        || message.contains("File already exists");
+    // 仅根据 SFTP 状态码分类：11 是明确的 FILE_ALREADY_EXISTS；OpenSSH 在
+    // SFTP v3 no-clobber rename 冲突时常返回通用 FAILURE（4）。错误文本仅作诊断，
+    // 不可作为跨 libssh2/服务端版本的语义键。
+    let already_exists = matches!(
+        error.code(),
+        ssh2::ErrorCode::SFTP(LIBSSH2_FX_FILE_ALREADY_EXISTS)
+            | ssh2::ErrorCode::SFTP(LIBSSH2_FX_FAILURE)
+    );
     if already_exists {
         if overwrite {
             AppError::SftpPublishError(ErrorDetail::msg(
@@ -497,75 +684,177 @@ fn map_sftp_rename_error(dst: &str, overwrite: bool, error: ssh2::Error) -> AppE
 /// 将 SFTP 路径错误转换为稳定领域错误。
 fn map_sftp_path_error(path: &str, error: ssh2::Error) -> AppError {
     let message = error.to_string();
-    if message.contains("No such file") || message.contains("does not exist") {
-        AppError::SftpPathNotFound(path.to_string().into())
-    } else if message.contains("Permission denied") {
-        AppError::SftpPermissionDenied(path.to_string().into())
-    } else {
-        AppError::SftpChannelError(message.into())
+    // SFTP 领域错误必须以协议状态码分类；libssh2 的文本由服务端与库版本决定，
+    // 仅作为未知错误的诊断信息，不能决定是否淘汰并重连健康连接。
+    match error.code() {
+        ssh2::ErrorCode::SFTP(LIBSSH2_FX_NO_SUCH_FILE | LIBSSH2_FX_NO_SUCH_PATH) => {
+            AppError::SftpPathNotFound(path.to_string().into())
+        }
+        ssh2::ErrorCode::SFTP(LIBSSH2_FX_PERMISSION_DENIED) => {
+            AppError::SftpPermissionDenied(path.to_string().into())
+        }
+        _ => AppError::SftpChannelError(message.into()),
     }
 }
 
-/// 解析目标主机的所有可连接地址。
+/// 解析目标主机的所有可连接地址，使用默认 SSH 建连预算。
 fn resolve_socket_addrs(host: &HostConfig) -> Result<Vec<SocketAddr>, AppError> {
-    let address = format!("{}:{}", host.host, host.port);
-    let socket_addrs: Vec<SocketAddr> = address.to_socket_addrs()?.collect();
-    if socket_addrs.is_empty() {
-        return Err(AppError::SshConnectionError(ErrorDetail::msg(
+    resolve_socket_addrs_until(host, Instant::now() + SSH_CONNECT_TIMEOUT)
+}
+
+/// 在连接 deadline 内解析目标主机的所有可连接地址。
+///
+/// # 参数
+/// - `host`: 待解析的主机配置
+/// - `deadline`: DNS 与后续 TCP 建连共享的最晚完成时刻
+///
+/// # 返回
+/// 解析到的非空地址列表；DNS 解析超过 deadline 时返回连接超时错误。
+fn resolve_socket_addrs_until(
+    host: &HostConfig,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, AppError> {
+    let address = socket_endpoint(&host.host, host.port);
+    let resolver_address = address.clone();
+    resolve_socket_addrs_with_timeout(address, deadline, move || {
+        resolver_address
+            .to_socket_addrs()
+            .map(|addrs| addrs.collect())
+    })
+}
+
+/// 生成可传给 `ToSocketAddrs` 的主机端口 endpoint。
+///
+/// # 参数
+/// - `host`: 原始主机名、IPv4 地址或裸 IPv6 字面量
+/// - `port`: SSH 服务端口
+///
+/// # 返回
+/// IPv6 字面量以方括号包裹，其余主机格式保持不变，避免改变 HostConfig 的身份语义。
+fn socket_endpoint(host: &str, port: u16) -> String {
+    if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// 在给定 deadline 内异步等待一次 DNS 解析结果，防止阻塞 resolver 无限占用连接调用方。
+///
+/// # 参数
+/// - `address`: 用于 DNS 查询与错误诊断的 host:port 文本
+/// - `deadline`: DNS 解析允许完成的最晚时刻
+/// - `resolve`: 单次阻塞 DNS 解析动作
+///
+/// # 返回
+/// 解析到的非空地址列表；超时、解析失败或空结果均转换为连接错误。
+fn resolve_socket_addrs_with_timeout(
+    address: String,
+    deadline: Instant,
+    resolve: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> Result<Vec<SocketAddr>, AppError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(dns_timeout_error(&address));
+    }
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        // 超时后接收端会被释放；解析线程只能自然结束，绝不阻塞连接调用方。
+        let _ = sender.send(resolve());
+    });
+
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(socket_addrs)) if Instant::now() < deadline && !socket_addrs.is_empty() => {
+            Ok(socket_addrs)
+        }
+        Ok(Ok(_)) if Instant::now() >= deadline => Err(dns_timeout_error(&address)),
+        Ok(Ok(_)) => Err(AppError::SshConnectionError(ErrorDetail::msg(
             "连接失败: 未解析到可用地址 {0}",
             vec![address],
-        )));
+        ))),
+        Ok(Err(error)) => Err(error.into()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(dns_timeout_error(&address)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(AppError::SshConnectionError(
+            ErrorDetail::msg("连接失败: DNS 解析线程异常退出 ({0})", vec![address]),
+        )),
     }
-    Ok(socket_addrs)
 }
 
-/// 使用固定超时逐个尝试 TCP 建连。
+/// 构造 DNS 解析耗尽总连接预算时的稳定连接错误。
+///
+/// # 参数
+/// - `address`: 超时 DNS 查询的 host:port 文本
+///
+/// # 返回
+/// 携带 endpoint 诊断的 SSH 连接错误。
+fn dns_timeout_error(address: &str) -> AppError {
+    AppError::SshConnectionError(ErrorDetail::msg(
+        "连接失败: DNS 解析超时 ({0})",
+        vec![address.to_string()],
+    ))
+}
+
+/// 使用固定总预算逐个尝试 TCP 建连。
 fn connect_tcp_stream(
     socket_addrs: &[SocketAddr],
     timeout: Duration,
 ) -> Result<TcpStream, AppError> {
+    connect_tcp_stream_until(socket_addrs, Instant::now() + timeout, timeout)
+}
+
+/// 在给定 deadline 内逐个尝试 TCP 建连，每个地址仅可使用剩余预算。
+///
+/// # 参数
+/// - `socket_addrs`: DNS 解析得到的候选地址
+/// - `deadline`: 所有地址共享的最晚建连时刻
+/// - `total_timeout`: 原始总预算，仅用于稳定诊断信息
+///
+/// # 返回
+/// 首个成功 TCP 流；所有尝试失败或预算耗尽时返回聚合诊断错误。
+fn connect_tcp_stream_until(
+    socket_addrs: &[SocketAddr],
+    deadline: Instant,
+    total_timeout: Duration,
+) -> Result<TcpStream, AppError> {
     let mut last_error = None;
-    let mut saw_timeout = false;
+    let mut attempt_count = 0;
     for socket_addr in socket_addrs {
-        match TcpStream::connect_timeout(socket_addr, timeout) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        attempt_count += 1;
+        match TcpStream::connect_timeout(socket_addr, remaining) {
             Ok(stream) => return Ok(stream),
             Err(error) => {
-                saw_timeout |= is_timeout_error(&error);
                 last_error = Some(error);
             }
         }
     }
-    Err(build_connect_error(saw_timeout, last_error, timeout))
-}
-
-/// 判断底层 IO 错误是否属于连接超时。
-fn is_timeout_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    )
+    Err(build_connect_error(
+        attempt_count,
+        last_error,
+        total_timeout,
+    ))
 }
 
 /// 将多地址 TCP 尝试结果归一为稳定连接错误。
 fn build_connect_error(
-    saw_timeout: bool,
+    attempt_count: usize,
     last_error: Option<io::Error>,
     timeout: Duration,
 ) -> AppError {
-    if saw_timeout {
-        AppError::SshConnectionError(
-            format!("Connection timeout after {}s", timeout.as_secs()).into(),
-        )
-    } else {
-        AppError::SshConnectionError(ErrorDetail::msg(
-            "连接失败: {0}",
-            vec![
-                last_error
-                    .unwrap_or_else(|| io::Error::other("unknown TCP connection error"))
-                    .to_string(),
-            ],
-        ))
-    }
+    let last_error = last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "connect deadline expired"));
+    AppError::SshConnectionError(ErrorDetail::msg(
+        "连接失败: 在 {0}ms 预算内已尝试 {1} 个地址，最后错误: {2}",
+        vec![
+            timeout.as_millis().to_string(),
+            attempt_count.to_string(),
+            last_error.to_string(),
+        ],
+    ))
 }
 
 #[cfg(test)]
@@ -1507,7 +1796,9 @@ pub(crate) mod test_support {
 
             /// 模拟失效 SSH channel 的写入错误。
             fn write(&mut self, _data: &str) -> Result<(), AppError> {
-                Err(AppError::SshConnectionError("terminal write failed".to_string().into()))
+                Err(AppError::SshConnectionError(
+                    "terminal write failed".to_string().into(),
+                ))
             }
 
             /// 测试 capability 忽略窗口大小调整。

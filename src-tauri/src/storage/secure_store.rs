@@ -15,12 +15,24 @@ const SERVICE_NAME: &str = "TitanSSH";
 mod linux {
     use super::*;
 
-    /// 判定错误是否表示 Secret Service 守护不可用（无守护进程、无会话总线或
-    /// 存储拒绝访问）；此类错误触发内核 keyring 回退，其余错误原样上抛。
+    /// 仅判定 DBus 明确报告 Secret Service 未注册或没有拥有者；锁定集合、拒绝访问
+    /// 及其他平台错误均须原样上抛，避免把持久凭据悄然降级到易失内核 keyring。
     fn is_secret_service_unavailable(error: &keyring::Error) -> bool {
+        const DAEMON_ABSENT_ERROR_NAMES: [&str; 2] = [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+        ];
+
         matches!(
             error,
-            keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_)
+            keyring::Error::PlatformFailure(platform_error)
+                if matches!(
+                    platform_error.downcast_ref::<dbus_secret_service::Error>(),
+                    Some(dbus_secret_service::Error::Dbus(dbus_error))
+                        if dbus_error
+                            .name()
+                            .is_some_and(|name| DAEMON_ABSENT_ERROR_NAMES.contains(&name))
+                )
         )
     }
 
@@ -53,15 +65,22 @@ mod linux {
             Ok(entry) => entry,
             Err(error) if is_secret_service_unavailable(&error) => {
                 let entry = fallback().map_err(secure_store_error)?;
-                return entry.set_password(value).map_err(secure_store_error);
+                entry.set_password(value).map_err(secure_store_error)?;
+                attempt_cleanup(primary());
+                return Ok(());
             }
             Err(error) => return Err(secure_store_error(error)),
         };
         match primary_entry.set_password(value) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                attempt_cleanup(fallback());
+                Ok(())
+            }
             Err(error) if is_secret_service_unavailable(&error) => {
                 let entry = fallback().map_err(secure_store_error)?;
-                entry.set_password(value).map_err(secure_store_error)
+                entry.set_password(value).map_err(secure_store_error)?;
+                attempt_cleanup(primary());
+                Ok(())
             }
             Err(error) => Err(secure_store_error(error)),
         }
@@ -103,43 +122,50 @@ mod linux {
     }
 
     /// 从两个存储删除凭据（幂等）：凭据可能落在任意一个存储。
-    /// 无记录与守护不可用不视为错误；任一存储报硬错误时整体失败，但另一存储仍被清理。
+    /// 无记录不视为错误；仅主存储守护未注册可忽略，其他错误整体失败，但另一存储仍被清理。
     pub(super) fn delete_with_fallback(
         primary: impl Fn() -> Result<Entry, keyring::Error>,
         fallback: impl Fn() -> Result<Entry, keyring::Error>,
     ) -> Result<(), AppError> {
         let mut first_error = None;
-        attempt_delete(primary(), &mut first_error);
-        attempt_delete(fallback(), &mut first_error);
+        attempt_delete(primary(), true, &mut first_error);
+        attempt_delete(fallback(), false, &mut first_error);
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
-    /// 单存储删除尝试；忽略 NoEntry 与守护不可用，硬错误只记录第一个
+    /// 单存储删除尝试；仅主存储的守护未注册错误可忽略，硬错误只记录第一个
     fn attempt_delete(
         entry_result: Result<Entry, keyring::Error>,
+        is_primary: bool,
         first_error: &mut Option<AppError>,
     ) {
         match entry_result {
             Ok(entry) => match entry.delete_credential() {
                 Ok(()) => {}
                 Err(keyring::Error::NoEntry) => {}
-                Err(error) if is_secret_service_unavailable(&error) => {}
+                Err(error) if is_primary && is_secret_service_unavailable(&error) => {}
                 Err(error) => {
                     if first_error.is_none() {
                         *first_error = Some(secure_store_error(error));
                     }
                 }
             },
-            Err(error) if is_secret_service_unavailable(&error) => {}
+            Err(error) if is_primary && is_secret_service_unavailable(&error) => {}
             Err(error) => {
                 if first_error.is_none() {
                     *first_error = Some(secure_store_error(error));
                 }
             }
         }
+    }
+
+    /// 尝试清理写入目标的另一存储；所有错误均忽略，避免清理失败掩盖已成功的凭据写入
+    fn attempt_cleanup(entry_result: Result<Entry, keyring::Error>) {
+        let mut ignored_error = None;
+        attempt_delete(entry_result, false, &mut ignored_error);
     }
 }
 
@@ -286,6 +312,10 @@ mod fallback_tests {
         password: Option<String>,
         /// 下一次 set 返回的错误（一次性）
         fail_set: Option<keyring::Error>,
+        /// 下一次 get 返回的错误（一次性）
+        fail_get: Option<keyring::Error>,
+        /// 下一次 delete 返回的错误（一次性）
+        fail_delete: Option<keyring::Error>,
     }
 
     impl FakeCredential {
@@ -293,6 +323,35 @@ mod fallback_tests {
             Self {
                 state: Arc::new(Mutex::new(FakeCredentialState {
                     fail_set: Some(error),
+                    ..FakeCredentialState::default()
+                })),
+            }
+        }
+
+        fn with_password_and_failing_set(password: &str, error: keyring::Error) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeCredentialState {
+                    password: Some(password.to_string()),
+                    fail_set: Some(error),
+                    ..FakeCredentialState::default()
+                })),
+            }
+        }
+
+        fn with_password_and_failing_delete(password: &str, error: keyring::Error) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeCredentialState {
+                    password: Some(password.to_string()),
+                    fail_delete: Some(error),
+                    ..FakeCredentialState::default()
+                })),
+            }
+        }
+
+        fn failing_get(error: keyring::Error) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeCredentialState {
+                    fail_get: Some(error),
                     ..FakeCredentialState::default()
                 })),
             }
@@ -318,7 +377,10 @@ mod fallback_tests {
         }
 
         fn get_secret(&self) -> keyring::Result<Vec<u8>> {
-            let state = self.state.lock().expect("state lock poisoned");
+            let mut state = self.state.lock().expect("state lock poisoned");
+            if let Some(error) = state.fail_get.take() {
+                return Err(error);
+            }
             match &state.password {
                 Some(value) => Ok(value.clone().into_bytes()),
                 None => Err(keyring::Error::NoEntry),
@@ -327,6 +389,9 @@ mod fallback_tests {
 
         fn delete_credential(&self) -> keyring::Result<()> {
             let mut state = self.state.lock().expect("state lock poisoned");
+            if let Some(error) = state.fail_delete.take() {
+                return Err(error);
+            }
             match state.password.take() {
                 Some(_) => Ok(()),
                 None => Err(keyring::Error::NoEntry),
@@ -344,11 +409,23 @@ mod fallback_tests {
         move || Ok(keyring::Entry::new_with_credential(Box::new(fake.clone())))
     }
 
-    /// 模拟 Secret Service 守护缺失（DBus 服务未注册）
-    fn platform_failure() -> keyring::Error {
-        keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+    /// 构造 Secret Service 守护未注册时返回的具名 DBus 错误
+    fn daemon_absent_error(error_name: &str) -> keyring::Error {
+        let dbus_error = dbus::Error::new_custom(
+            error_name,
             "The name org.freedesktop.secrets was not provided by any .service files",
-        )))
+        );
+        keyring::Error::PlatformFailure(Box::new(dbus_secret_service::Error::Dbus(dbus_error)))
+    }
+
+    /// 模拟 DBus 无法激活 Secret Service 服务
+    fn service_unknown() -> keyring::Error {
+        daemon_absent_error("org.freedesktop.DBus.Error.ServiceUnknown")
+    }
+
+    /// 模拟 Secret Service 名称当前没有拥有者
+    fn name_has_no_owner() -> keyring::Error {
+        daemon_absent_error("org.freedesktop.DBus.Error.NameHasNoOwner")
     }
 
     // --- set 回退链 ---
@@ -356,7 +433,7 @@ mod fallback_tests {
     /// 主存储写入报守护不可用：回退到内核 keyring，保存成功
     #[test]
     fn set_falls_back_when_primary_store_unavailable() {
-        let primary = FakeCredential::failing_set(platform_failure());
+        let primary = FakeCredential::failing_set(service_unknown());
         let fallback = FakeCredential::default();
 
         set_with_fallback("key", "secret", entry(&primary), entry(&fallback))
@@ -366,12 +443,36 @@ mod fallback_tests {
         assert_eq!(primary.password(), None, "主存储不应被写入");
     }
 
-    /// 主存储无访问权限同样触发回退
+    /// 主存储被锁定或拒绝访问：向调用方报告错误，不写入易失回退存储
     #[test]
-    fn set_falls_back_when_primary_store_denies_access() {
+    fn set_propagates_primary_access_error_without_fallback() {
         let primary = FakeCredential::failing_set(keyring::Error::NoStorageAccess(Box::new(
             std::io::Error::other("keyring locked"),
         )));
+        let fallback = FakeCredential::default();
+
+        let error = set_with_fallback("key", "secret", entry(&primary), entry(&fallback))
+            .expect_err("主存储被锁定时应报告安全存储错误");
+
+        assert!(matches!(error, AppError::SecureStoreError(_)));
+        assert_eq!(fallback.password(), None, "回退存储不应被写入");
+    }
+
+    /// 主存储条目构造报告守护未注册：同样回退
+    #[test]
+    fn set_falls_back_when_primary_entry_build_fails() {
+        let fallback = FakeCredential::default();
+
+        set_with_fallback("key", "secret", || Err(service_unknown()), entry(&fallback))
+            .expect("回退保存应成功");
+
+        assert_eq!(fallback.password(), Some("secret".to_string()));
+    }
+
+    /// 主存储名称没有拥有者时：回退到内核 keyring，保存成功
+    #[test]
+    fn set_falls_back_when_primary_store_name_has_no_owner() {
+        let primary = FakeCredential::failing_set(name_has_no_owner());
         let fallback = FakeCredential::default();
 
         set_with_fallback("key", "secret", entry(&primary), entry(&fallback))
@@ -380,33 +481,51 @@ mod fallback_tests {
         assert_eq!(fallback.password(), Some("secret".to_string()));
     }
 
-    /// 主存储条目构造失败（无会话总线）：同样回退
+    /// 主存储正常写入新凭据后：清除回退存储中的旧凭据，避免守护不可用时读取过期值
     #[test]
-    fn set_falls_back_when_primary_entry_build_fails() {
-        let fallback = FakeCredential::default();
-
-        set_with_fallback(
-            "key",
-            "secret",
-            || Err(platform_failure()),
-            entry(&fallback),
-        )
-        .expect("回退保存应成功");
-
-        assert_eq!(fallback.password(), Some("secret".to_string()));
-    }
-
-    /// 主存储正常：直接写入主存储，不触碰回退存储
-    #[test]
-    fn set_uses_primary_when_available() {
+    fn set_clears_stale_fallback_after_primary_write() {
         let primary = FakeCredential::default();
         let fallback = FakeCredential::default();
+        fallback
+            .set_secret(b"stale-fallback-secret")
+            .expect("预置回退存储凭据应成功");
 
-        set_with_fallback("key", "secret", entry(&primary), entry(&fallback))
+        set_with_fallback("key", "primary-secret", entry(&primary), entry(&fallback))
             .expect("主存储保存应成功");
 
-        assert_eq!(primary.password(), Some("secret".to_string()));
-        assert_eq!(fallback.password(), None);
+        assert_eq!(primary.password(), Some("primary-secret".to_string()));
+        assert_eq!(fallback.password(), None, "回退存储旧凭据应被清理");
+    }
+
+    /// 回退存储正常写入新凭据后：清除主存储中的旧凭据，避免守护恢复前后读取过期值
+    #[test]
+    fn set_clears_stale_primary_after_fallback_write() {
+        let primary = FakeCredential::with_password_and_failing_set(
+            "stale-primary-secret",
+            service_unknown(),
+        );
+        let fallback = FakeCredential::default();
+
+        set_with_fallback("key", "fallback-secret", entry(&primary), entry(&fallback))
+            .expect("回退存储保存应成功");
+
+        assert_eq!(fallback.password(), Some("fallback-secret".to_string()));
+        assert_eq!(primary.password(), None, "主存储旧凭据应被清理");
+    }
+
+    /// 清理另一存储失败不影响已成功写入的凭据
+    #[test]
+    fn set_succeeds_when_opposite_store_cleanup_fails() {
+        let primary = FakeCredential::default();
+        let fallback = FakeCredential::with_password_and_failing_delete(
+            "stale-fallback-secret",
+            service_unknown(),
+        );
+
+        set_with_fallback("key", "primary-secret", entry(&primary), entry(&fallback))
+            .expect("主存储保存成功不应被回退存储清理失败掩盖");
+
+        assert_eq!(primary.password(), Some("primary-secret".to_string()));
     }
 
     /// 主存储报非可用性错误：原样上抛，不尝试回退
@@ -428,7 +547,7 @@ mod fallback_tests {
         let error = set_with_fallback(
             "key",
             "secret",
-            || Err(platform_failure()),
+            || Err(service_unknown()),
             || {
                 Err(keyring::Error::PlatformFailure(Box::new(
                     std::io::Error::other("keyrings disabled"),
@@ -463,7 +582,7 @@ mod fallback_tests {
         set_with_fallback(
             "key",
             "fallback-secret",
-            || Err(platform_failure()),
+            || Err(service_unknown()),
             entry(&fallback),
         )
         .expect("回退 set 应成功");
@@ -480,14 +599,28 @@ mod fallback_tests {
         set_with_fallback(
             "key",
             "fallback-secret",
-            || Err(platform_failure()),
+            || Err(service_unknown()),
             entry(&fallback),
         )
         .expect("回退 set 应成功");
 
-        let value = get_with_fallback("key", || Err(platform_failure()), entry(&fallback))
+        let value = get_with_fallback("key", || Err(service_unknown()), entry(&fallback))
             .expect("get 应回退成功");
         assert_eq!(value, "fallback-secret");
+    }
+
+    /// 主存储被锁定或拒绝访问：向调用方报告错误，不伪装为凭据不存在
+    #[test]
+    fn get_propagates_primary_access_error_without_fallback() {
+        let primary = FakeCredential::failing_get(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("keyring locked"),
+        )));
+        let fallback = FakeCredential::default();
+
+        let error = get_with_fallback("key", entry(&primary), entry(&fallback))
+            .expect_err("主存储被锁定时应报告安全存储错误");
+
+        assert!(matches!(error, AppError::SecureStoreError(_)));
     }
 
     /// 双存储均无记录：返回 CredentialNotFound（携带 key）
@@ -510,7 +643,7 @@ mod fallback_tests {
         let primary = FakeCredential::default();
         let fallback = FakeCredential::default();
         set_with_fallback("key", "a", entry(&primary), entry(&fallback)).expect("set 应成功");
-        set_with_fallback("key", "b", || Err(platform_failure()), entry(&fallback))
+        set_with_fallback("key", "b", || Err(service_unknown()), entry(&fallback))
             .expect("set 应成功");
 
         delete_with_fallback(entry(&primary), entry(&fallback)).expect("delete 应成功");
@@ -532,16 +665,50 @@ mod fallback_tests {
     #[test]
     fn delete_ignores_unavailable_primary() {
         let fallback = FakeCredential::default();
-        set_with_fallback(
-            "key",
-            "secret",
-            || Err(platform_failure()),
-            entry(&fallback),
-        )
-        .expect("set 应成功");
+        set_with_fallback("key", "secret", || Err(service_unknown()), entry(&fallback))
+            .expect("set 应成功");
 
-        delete_with_fallback(|| Err(platform_failure()), entry(&fallback)).expect("delete 应成功");
+        delete_with_fallback(|| Err(service_unknown()), entry(&fallback)).expect("delete 应成功");
         assert_eq!(fallback.password(), None);
+    }
+
+    /// 主存储被锁定或拒绝访问：向调用方报告错误，但仍清理另一存储
+    #[test]
+    fn delete_propagates_primary_access_error_and_cleans_fallback() {
+        let primary = FakeCredential::with_password_and_failing_delete(
+            "primary-secret",
+            keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("keyring locked"))),
+        );
+        let fallback = FakeCredential::default();
+        fallback
+            .set_secret(b"fallback-secret")
+            .expect("预置回退存储凭据应成功");
+
+        let error = delete_with_fallback(entry(&primary), entry(&fallback))
+            .expect_err("主存储被锁定时应报告安全存储错误");
+
+        assert!(matches!(error, AppError::SecureStoreError(_)));
+        assert_eq!(fallback.password(), None, "另一存储仍应被清理");
+    }
+
+    /// 回退内核 keyring 删除失败：向调用方报告错误，不能伪装为删除成功
+    #[test]
+    fn delete_propagates_fallback_platform_error() {
+        let primary = FakeCredential::default();
+        let fallback = FakeCredential::with_password_and_failing_delete(
+            "fallback-secret",
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::from_raw_os_error(13))),
+        );
+
+        let error = delete_with_fallback(entry(&primary), entry(&fallback))
+            .expect_err("回退内核 keyring 删除失败时应报告安全存储错误");
+
+        assert!(matches!(error, AppError::SecureStoreError(_)));
+        assert_eq!(
+            fallback.password(),
+            Some("fallback-secret".to_string()),
+            "删除失败的回退凭据应保持可见"
+        );
     }
 
     /// 任一存储报硬错误：整体失败且另一个存储仍被清理
@@ -549,13 +716,8 @@ mod fallback_tests {
     fn delete_reports_hard_error_and_still_cleans_other_store() {
         // 主存储条目构造即报硬错误，回退存储正常持有记录
         let fallback = FakeCredential::default();
-        set_with_fallback(
-            "key",
-            "secret",
-            || Err(platform_failure()),
-            entry(&fallback),
-        )
-        .expect("set 应成功");
+        set_with_fallback("key", "secret", || Err(service_unknown()), entry(&fallback))
+            .expect("set 应成功");
 
         let error = delete_with_fallback(|| Err(keyring::Error::NoEntry), entry(&fallback));
 

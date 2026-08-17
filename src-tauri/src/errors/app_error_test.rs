@@ -53,6 +53,42 @@ mod tests {
         );
     }
 
+    /// IPC 边界必须移除凭据、口令和私钥内容；后端日志仍可保留完整内部诊断。
+    #[test]
+    fn app_error_info_redacts_sensitive_diagnostics_before_ipc() {
+        let passphrase = "correct-horse-battery-staple";
+        let private_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nvery-secret-key-material\n-----END OPENSSH PRIVATE KEY-----";
+        let raw = AppErrorInfo::from(AppError::AuthenticationError(
+            format!("authentication failed: password={passphrase}; key={private_key}").into(),
+        ));
+        let structured = AppErrorInfo::from(AppError::SecureStoreError(ErrorDetail::msg(
+            "安全存储读取失败: {0}",
+            vec![format!("passphrase: {passphrase}")],
+        )));
+
+        let raw_json = serde_json::to_string(&raw).expect("Raw IPC payload 应序列化");
+        let structured_json = serde_json::to_string(&structured).expect("Msg IPC payload 应序列化");
+        for secret in [passphrase, "very-secret-key-material"] {
+            assert!(
+                !raw_json.contains(secret),
+                "Raw IPC payload 不得泄露敏感值: {raw_json}"
+            );
+            assert!(
+                !structured_json.contains(secret),
+                "Msg IPC payload 不得泄露敏感值: {structured_json}"
+            );
+        }
+        assert_eq!(
+            raw.detail.as_deref(),
+            Some("authentication failed: password=[REDACTED]; key=[REDACTED]")
+        );
+        assert_eq!(
+            structured.detail_params,
+            Some(vec!["passphrase: [REDACTED]".to_string()])
+        );
+    }
+
     /// Msg 模板占位按序替换；无占位的额外参数（with_appended_detail）以「；」连接。
     #[test]
     fn msg_detail_renders_template_placeholders_and_appended_params() {

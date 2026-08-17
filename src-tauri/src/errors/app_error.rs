@@ -8,7 +8,8 @@ use thiserror::Error;
 /// 中文模板留在后端日志里保持可读，前端按当前语言渲染翻译。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ErrorDetail {
-    /// 纯机器诊断文本（无固定文案），如底层库错误、文件路径
+    /// 纯机器诊断文本（无固定文案），如底层库错误、文件路径；写入后端日志时保留原文，
+    /// 跨 IPC 边界时由统一脱敏器处理。
     Raw(String),
     /// 中文固定文案模板 + 语言无关参数；模板用 {0}/{1} 占位参数
     Msg { key: String, params: Vec<String> },
@@ -54,19 +55,22 @@ impl fmt::Display for ErrorDetail {
 }
 
 /// 跨 Tauri 边界的稳定错误 payload；code 为稳定英文代码供前端本地化摘要，
-/// detail 为纯机器诊断（结构化详情时为 None），detailKey/detailParams 承载可翻译
-/// 固定文案模板与参数。
+/// detail 为已脱敏的机器诊断（结构化详情时为 None），detailKey/detailParams 承载
+/// 可翻译固定文案模板与已脱敏参数。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppErrorInfo {
     pub code: String,
-    /// 纯机器诊断文本（Raw 详情）；结构化详情时为 None
+    /// 已统一脱敏的机器诊断文本（Raw 详情）；结构化详情时为 None。
+    ///
+    /// 不变量：detail 绝不包含凭据、口令、私钥内容。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// 固定文案翻译 key（gettext msgid，中文源文案）；前端按当前语言渲染
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail_key: Option<String>,
-    /// 与 detailKey 模板 {0}/{1} 占位对应的语言无关参数
+    /// 与 detailKey 模板 {0}/{1} 占位对应的语言无关参数；跨 IPC 时同样统一脱敏，
+    /// 绝不包含凭据、口令、私钥内容。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail_params: Option<Vec<String>>,
 }
@@ -311,8 +315,114 @@ impl AppError {
     }
 }
 
+/// 脱敏 PEM/OpenSSH 私钥块，防止完整私钥内容跨越 IPC 边界。
+fn redact_private_key_blocks(text: &str) -> String {
+    const BEGIN_PREFIX: &str = "-----BEGIN ";
+
+    let mut remaining = text;
+    let mut redacted = String::with_capacity(text.len());
+    while let Some(begin_offset) = remaining.find(BEGIN_PREFIX) {
+        let header_start = begin_offset + BEGIN_PREFIX.len();
+        let Some(header_suffix_offset) = remaining[header_start..].find("-----") else {
+            if remaining[begin_offset..].contains("PRIVATE KEY") {
+                redacted.push_str(&remaining[..begin_offset]);
+                redacted.push_str("[REDACTED]");
+                return redacted;
+            }
+            redacted.push_str(remaining);
+            return redacted;
+        };
+        let header_end = header_start + header_suffix_offset + "-----".len();
+        let header = &remaining[begin_offset..header_end];
+        if !header.contains("PRIVATE KEY") {
+            redacted.push_str(&remaining[..header_end]);
+            remaining = &remaining[header_end..];
+            continue;
+        }
+
+        let end_marker = header.replacen("BEGIN", "END", 1);
+        redacted.push_str(&remaining[..begin_offset]);
+        redacted.push_str("[REDACTED]");
+        let body = &remaining[header_end..];
+        match body.find(&end_marker) {
+            Some(end_offset) => remaining = &body[end_offset + end_marker.len()..],
+            None => return redacted,
+        }
+    }
+    redacted.push_str(remaining);
+    redacted
+}
+
+/// 脱敏带有敏感字段名的值，覆盖底层库常见的 `password=...`、`passphrase: ...` 等诊断格式。
+fn redact_labeled_sensitive_values(text: &str) -> String {
+    const LABELS: [&str; 7] = [
+        "password",
+        "passphrase",
+        "credential",
+        "secret",
+        "private_key",
+        "privatekey",
+        "private-key",
+    ];
+
+    let mut remaining = text;
+    let mut redacted = String::with_capacity(text.len());
+    loop {
+        let normalized = remaining.to_ascii_lowercase();
+        let candidate = LABELS
+            .iter()
+            .filter_map(|label| normalized.find(label).map(|offset| (offset, *label)))
+            .min_by_key(|(offset, _)| *offset);
+        let Some((label_offset, label)) = candidate else {
+            redacted.push_str(remaining);
+            return redacted;
+        };
+
+        let label_end = label_offset + label.len();
+        let mut separator_offset = label_end;
+        while let Some(character) = remaining[separator_offset..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            separator_offset += character.len_utf8();
+        }
+        let separator_len = match remaining[separator_offset..].chars().next() {
+            Some(character @ ('=' | ':' | '：')) => character.len_utf8(),
+            _ => {
+                redacted.push_str(&remaining[..label_end]);
+                remaining = &remaining[label_end..];
+                continue;
+            }
+        };
+        let mut value_start = separator_offset + separator_len;
+        while let Some(character) = remaining[value_start..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            value_start += character.len_utf8();
+        }
+        let value_end = remaining[value_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                matches!(character, ';' | '；' | ',' | '\n' | '\r').then_some(value_start + offset)
+            })
+            .unwrap_or(remaining.len());
+        redacted.push_str(&remaining[..value_start]);
+        redacted.push_str("[REDACTED]");
+        remaining = &remaining[value_end..];
+    }
+}
+
+/// 统一清理即将进入 renderer 的自由诊断文本；日志路径不调用此函数以保留排障上下文。
+fn redact_ipc_diagnostic(text: &str) -> String {
+    redact_labeled_sensitive_values(&redact_private_key_blocks(text))
+}
+
 /// 将内部错误转换为语言无关的 IPC 错误：Raw 详情走 detail 字段（纯机器文本），
 /// Msg 详情拆成 detailKey（中文模板，前端按语言翻译）+ detailParams。
+///
+/// 这是 AppError 到 renderer 的统一自由文本出口：所有动态详情统一脱敏，确保凭据、
+/// 口令和私钥内容不会通过 AppError 的 Tauri IPC payload 暴露给前端。
 impl From<&AppError> for AppErrorInfo {
     fn from(error: &AppError) -> Self {
         let code = error.code();
@@ -351,8 +461,17 @@ impl From<&AppError> for AppErrorInfo {
             AppError::IoError(io) => Some(ErrorDetail::Raw(io.to_string())),
         };
         let (detail, detail_key, detail_params) = match payload {
-            Some(ErrorDetail::Raw(text)) => (Some(text), None, None),
-            Some(ErrorDetail::Msg { key, params }) => (None, Some(key), Some(params)),
+            Some(ErrorDetail::Raw(text)) => (Some(redact_ipc_diagnostic(&text)), None, None),
+            Some(ErrorDetail::Msg { key, params }) => (
+                None,
+                Some(key),
+                Some(
+                    params
+                        .into_iter()
+                        .map(|param| redact_ipc_diagnostic(&param))
+                        .collect(),
+                ),
+            ),
             None => (None, None, None),
         };
         Self {

@@ -38,11 +38,19 @@ tauri-plugin-dialog = "2.6.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# 仅用于识别 Secret Service 守护未注册的 DBus 错误；不为锁定或拒绝访问降级到易失存储
+dbus-secret-service = { version = "4.1.0", default-features = false }
+
 [dev-dependencies]
 proptest = "1.4"
 mockall = "0.12"
 tauri = { version = "2.10.3", features = ["test"] }
 url = "2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# 仅用于构造带 DBus 错误名称的 Secret Service 回退链单元测试
+dbus = { version = "0.9.10", default-features = false }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

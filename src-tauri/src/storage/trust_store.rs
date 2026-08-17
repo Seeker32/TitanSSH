@@ -12,10 +12,12 @@
 use crate::errors::app_error::{AppError, ErrorDetail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tauri::{AppHandle, Manager};
 use tempfile::NamedTempFile;
 
@@ -40,10 +42,18 @@ impl TrustRecord {
     }
 }
 
-/// 文件内部可变状态：路径 + 已加载记录缓存（None = 尚未成功加载）。
+/// 信任文件版本：用于检测外部修改，区分文件缺失与存在文件的长度及修改时间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileFingerprint {
+    Missing,
+    Present { len: u64, modified: SystemTime },
+}
+
+/// 文件内部可变状态：路径 + 已加载记录缓存（None = 尚未成功加载）+ 缓存文件版本。
 struct TrustStoreState {
     file_path: PathBuf,
     records: Option<Vec<TrustRecord>>,
+    fingerprint: Option<FileFingerprint>,
 }
 
 /// 线程安全的信任存储；读写全部在内部锁内串行化，并发保存不丢失记录。
@@ -80,6 +90,7 @@ impl TrustStore {
             state: Arc::new(Mutex::new(TrustStoreState {
                 file_path,
                 records: None,
+                fingerprint: None,
             })),
         }
     }
@@ -105,6 +116,7 @@ impl TrustStore {
     /// 在锁内完成 加载 → 修改 → 安全发布 → 更新缓存：并发 upsert 串行执行，
     /// 不会丢失其他 endpoint 的记录；磁盘写入失败时缓存保持原状并返回错误。
     pub fn upsert(&self, record: TrustRecord) -> Result<(), AppError> {
+        validate_record(&record)?;
         let mut state = self
             .state
             .lock()
@@ -112,8 +124,9 @@ impl TrustStore {
         let mut records = ensure_loaded(&mut state)?.to_vec();
         records.retain(|existing| !(existing.host == record.host && existing.port == record.port));
         records.push(record);
-        write_records(&state.file_path, &records)?;
+        let fingerprint = write_records(&state.file_path, &records)?;
         state.records = Some(records);
+        state.fingerprint = Some(fingerprint);
         Ok(())
     }
 
@@ -133,8 +146,9 @@ impl TrustStore {
             // endpoint 本无记录：无需发布，保持幂等
             return Ok(());
         }
-        write_records(&state.file_path, &records)?;
+        let fingerprint = write_records(&state.file_path, &records)?;
         state.records = Some(records);
+        state.fingerprint = Some(fingerprint);
         Ok(())
     }
 
@@ -164,12 +178,38 @@ impl TrustStore {
     }
 }
 
-/// 保证内存缓存已加载：首次访问读取文件，之后复用缓存。
+/// 保证内存缓存与磁盘版本一致：首次访问读取文件；长度或修改时间变化时重新加载，
+/// 使外部删除、恢复或另一实例发布的信任记录立即参与后续信任决策。
 fn ensure_loaded(state: &mut TrustStoreState) -> Result<&[TrustRecord], AppError> {
-    if state.records.is_none() {
+    let current_fingerprint = file_fingerprint(&state.file_path)?;
+    if state.records.is_none() || state.fingerprint.as_ref() != Some(&current_fingerprint) {
         state.records = Some(load_from_file(&state.file_path)?);
+        state.fingerprint = Some(file_fingerprint(&state.file_path)?);
     }
     Ok(state.records.as_deref().unwrap_or(&[]))
+}
+
+/// 读取信任文件的缓存校验元数据；仅不存在视为 Missing，其余元数据错误 fail-closed。
+fn file_fingerprint(file_path: &Path) -> Result<FileFingerprint, AppError> {
+    match fs::metadata(file_path) {
+        Ok(metadata) => {
+            let modified = metadata.modified().map_err(|error| {
+                AppError::TrustStoreError(ErrorDetail::msg(
+                    "读取信任存储修改时间失败: {0} ({1})",
+                    vec![file_path.display().to_string(), error.to_string()],
+                ))
+            })?;
+            Ok(FileFingerprint::Present {
+                len: metadata.len(),
+                modified,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileFingerprint::Missing),
+        Err(error) => Err(AppError::TrustStoreError(ErrorDetail::msg(
+            "读取信任存储元数据失败: {0} ({1})",
+            vec![file_path.display().to_string(), error.to_string()],
+        ))),
+    }
 }
 
 /// 读取并解析 known_hosts 文件。
@@ -193,6 +233,7 @@ fn load_from_file(file_path: &Path) -> Result<Vec<TrustRecord>, AppError> {
         }
     };
     let mut records = Vec::new();
+    let mut endpoints = HashSet::new();
     for (index, line) in content.lines().enumerate() {
         if let Some(record) = parse_entry(line).map_err(|reason| {
             AppError::TrustStoreError(ErrorDetail::msg(
@@ -204,6 +245,16 @@ fn load_from_file(file_path: &Path) -> Result<Vec<TrustRecord>, AppError> {
                 ],
             ))
         })? {
+            if !endpoints.insert((record.host.clone(), record.port)) {
+                return Err(AppError::TrustStoreError(ErrorDetail::msg(
+                    "解析信任存储失败: {0} 第 {1} 行 ({2})",
+                    vec![
+                        file_path.display().to_string(),
+                        (index + 1).to_string(),
+                        format!("endpoint 重复: {}:{}", record.host, record.port),
+                    ],
+                )));
+            }
             records.push(record);
         }
     }
@@ -287,6 +338,51 @@ fn format_host_pattern(host: &str, port: u16) -> String {
     }
 }
 
+/// 验证信任记录可被 known_hosts 格式无损序列化和解析，避免单条非法记录污染整个存储。
+fn validate_record(record: &TrustRecord) -> Result<(), AppError> {
+    let reason = if record.host.is_empty() {
+        Some("主机不能为空")
+    } else if record.host.starts_with('#') {
+        Some("主机不能以 # 开头")
+    } else if record
+        .host
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '[' | ']'))
+    {
+        Some("主机不能包含空白或方括号")
+    } else if record.algorithm.is_empty() || record.algorithm.chars().any(char::is_whitespace) {
+        Some("算法名不能为空或包含空白")
+    } else if record.blob.is_empty() {
+        Some("公钥不能为空")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(unserializable_record_error(reason));
+    }
+
+    let serialized = format!(
+        "{} {} {}",
+        format_host_pattern(&record.host, record.port),
+        record.algorithm,
+        STANDARD_NO_PAD.encode(&record.blob)
+    );
+    match parse_entry(&serialized) {
+        Ok(Some(parsed)) if parsed == *record => Ok(()),
+        Ok(Some(_)) => Err(unserializable_record_error("序列化后记录不一致")),
+        Ok(None) => Err(unserializable_record_error("序列化后被解析为注释或空行")),
+        Err(reason) => Err(unserializable_record_error(&reason)),
+    }
+}
+
+/// 构造不可序列化信任记录的结构化错误，调用方可阻止写入且不污染原有存储。
+fn unserializable_record_error(reason: &str) -> AppError {
+    AppError::TrustStoreError(ErrorDetail::msg(
+        "信任记录无法序列化: {0}",
+        vec![reason.to_string()],
+    ))
+}
+
 /// 将全部记录序列化为 known_hosts 文件内容。
 fn serialize_records(records: &[TrustRecord]) -> String {
     let mut content = String::new();
@@ -304,7 +400,7 @@ fn serialize_records(records: &[TrustRecord]) -> String {
 /// 安全发布：全部内容先写入同目录唯一临时文件，flush + sync 成功后原子替换目标。
 ///
 /// POSIX rename / Windows MoveFileEx REPLACE_EXISTING 语义：发布失败不改动原文件。
-fn write_records(file_path: &Path, records: &[TrustRecord]) -> Result<(), AppError> {
+fn write_records(file_path: &Path, records: &[TrustRecord]) -> Result<FileFingerprint, AppError> {
     let content = serialize_records(records);
     let dir = file_path.parent().ok_or_else(|| {
         AppError::TrustStoreError(ErrorDetail::msg(
@@ -336,7 +432,7 @@ fn write_records(file_path: &Path, records: &[TrustRecord]) -> Result<(), AppErr
             vec![file_path.display().to_string(), error.error.to_string()],
         ))
     })?;
-    Ok(())
+    file_fingerprint(file_path)
 }
 
 #[cfg(test)]

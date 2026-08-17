@@ -351,7 +351,7 @@ fn start_terminal_session_with_parts<R, F>(
             }
         }
 
-        // 终端数据读取缓冲区（UTF-8，4KB）
+        // 终端原始字节读取缓冲区（4 KiB）；由增量解码器转换为 UTF-8 文本事件。
         let mut buffer = [0_u8; 4096];
         // 保存跨读取边界的 UTF-8 不完整尾部字节，最多通常为 3 个字节。
         let mut utf8_carry = Vec::with_capacity(3);
@@ -817,8 +817,8 @@ fn emit_session_status<R: tauri::Runtime>(
 mod tests {
     use crate::models::session::TerminalDataEvent;
     use proptest::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// 生成非空字母数字字符串的策略（1-64 个字符）
     fn arb_session_id() -> impl Strategy<Value = String> {
