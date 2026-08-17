@@ -4,6 +4,8 @@
 //! 同时以纯文本单行追加到 OS 应用日志目录下的 titanssh.log。
 //! 查看器读同一文件（单一事实源），导出为文件复制。
 
+use std::borrow::Cow;
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::panic;
@@ -23,7 +25,7 @@ const LOG_FILE_NAME: &str = "titanssh.log";
 /// Tauri 配置中的 bundle identifier；早期 panic 时尚无 AppHandle，只能通过该稳定值解析目录。
 const APP_IDENTIFIER: &str = "com.titanssh.desktop";
 
-/// 日志文件大小上限；启动时超过即截断，防止无限增长。
+/// 日志文件大小上限；启动与运行时写入均执行截断，防止无限增长。
 /// ponytail: 单文件截断即可，需要滚动轮转时再引入轮转逻辑。
 const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -64,12 +66,8 @@ fn early_panic_log_file_path() -> PathBuf {
 /// 直接追加启动前 panic 诊断；不依赖全局 Logger 或 Tauri AppHandle，调用方负责降级处理。
 fn write_early_panic_record(file_path: &Path, message: &str) -> Result<(), std::io::Error> {
     let mut file = ensure_log_file(file_path)?;
-    let line = format_entry(
-        Level::Error,
-        "panic",
-        message,
-        &Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-    );
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let line = format_entry(Level::Error, "panic", message, timestamp);
     writeln!(file, "{line}")?;
     file.flush()
 }
@@ -167,7 +165,7 @@ impl LogStore {
     }
 }
 
-/// 打开日志文件用于追加；父目录缺失时创建，文件超过 LOG_MAX_BYTES 时截断。
+/// 打开日志文件用于追加；父目录缺失时创建，启动阶段文件已超限时截断。
 fn ensure_log_file(file_path: &Path) -> Result<File, std::io::Error> {
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -179,22 +177,102 @@ fn ensure_log_file(file_path: &Path) -> Result<File, std::io::Error> {
     OpenOptions::new().create(true).append(true).open(file_path)
 }
 
+/// 将单条记录限制在文件上限内（预留一个换行字节）。超长记录保留可读前缀并标记截断，
+/// 防止单条异常大的终端/错误日志绕过整个文件的大小上限。
+fn limit_log_line(line: &str, max_bytes: u64) -> Cow<'_, str> {
+    const TRUNCATION_SUFFIX: &str = "… [truncated]";
+
+    let max_line_bytes = max_bytes.saturating_sub(1) as usize;
+    if line.len() <= max_line_bytes {
+        return Cow::Borrowed(line);
+    }
+    if max_line_bytes <= TRUNCATION_SUFFIX.len() {
+        let mut end = max_line_bytes.min(line.len());
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Cow::Owned(line[..end].to_string());
+    }
+
+    let mut end = max_line_bytes - TRUNCATION_SUFFIX.len();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}{TRUNCATION_SUFFIX}", &line[..end]))
+}
+
+/// 追加一条文件日志，并在运行时保证文件不超过指定上限。
+///
+/// 写入者由 Logger 的 Mutex 串行化，`written_bytes` 因此无需独立原子同步；若本条
+/// 记录会超限，先清空并回绕文件，再写入完整的新记录。
+fn write_log_line(
+    file: &mut File,
+    written_bytes: &mut u64,
+    line: &str,
+    max_bytes: u64,
+) -> Result<(), std::io::Error> {
+    let line = limit_log_line(line, max_bytes);
+    let record_bytes = line.len() as u64 + 1;
+    if written_bytes.saturating_add(record_bytes) > max_bytes {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        *written_bytes = 0;
+    }
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")?;
+    *written_bytes = written_bytes.saturating_add(record_bytes);
+    Ok(())
+}
+
 /// 将一条日志记录格式化为单行纯文本：`2025-06-01 14:30:00.123 [INFO] target: message`。
 ///
 /// 消息内的换行符转义为字面 `\\n` / `\\r`：多行消息（嵌套错误 Debug、
 /// 命令输出）不得破坏单行格式，否则查看器出现无归属行、可伪造 [INFO]/[ERROR]
 /// 记录（日志注入），且 500 行上限被碎片占满。
-fn format_entry(level: Level, target: &str, message: &str, timestamp: &str) -> String {
-    let message = message.replace('\n', "\\n").replace('\r', "\\r");
+fn format_entry(
+    level: Level,
+    target: &str,
+    message: impl Display,
+    timestamp: impl Display,
+) -> String {
+    let message = format!("{message}")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     format!("{timestamp} [{level}] {target}: {message}")
 }
 
 /// 全局日志器：stderr 输出委托 env_logger（保留终端彩色与现有行为），
 /// 文件输出追加纯文本行；文件写入失败静默忽略（日志不得成为崩溃源）。
 /// 全局等级过滤由 log::set_max_level 统一控制，对两个输出同时生效。
+struct FileLogger {
+    file: File,
+    written_bytes: u64,
+}
+
+impl FileLogger {
+    /// 从已打开的追加文件构造写入器，并记录当前文件长度供后续运行时上限判断。
+    fn new(file: File) -> Result<Self, std::io::Error> {
+        let written_bytes = file.metadata()?.len();
+        Ok(Self {
+            file,
+            written_bytes,
+        })
+    }
+
+    /// 写入单条日志；超过上限时清空旧日志后从本条开始重新累计。
+    fn write_line(&mut self, line: &str) -> Result<(), std::io::Error> {
+        write_log_line(&mut self.file, &mut self.written_bytes, line, LOG_MAX_BYTES)
+    }
+
+    /// 刷新底层日志文件。
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.file.flush()
+    }
+}
+
 struct Logger {
     stderr_logger: env_logger::Logger,
-    file: Option<Mutex<File>>,
+    file: Option<Mutex<FileLogger>>,
 }
 
 impl Log for Logger {
@@ -204,14 +282,10 @@ impl Log for Logger {
 
     fn log(&self, record: &Record) {
         self.stderr_logger.log(record);
-        let line = format_entry(
-            record.level(),
-            record.target(),
-            &format!("{}", record.args()),
-            &Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-        );
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let line = format_entry(record.level(), record.target(), record.args(), timestamp);
         if let Some(Ok(mut file)) = self.file.as_ref().map(|file| file.lock()) {
-            let _ = writeln!(file, "{line}");
+            let _ = file.write_line(&line);
         }
     }
 
@@ -251,6 +325,7 @@ static LOGGER_INSTALLED: AtomicBool = AtomicBool::new(false);
 pub fn install_logger(file_path: Option<&Path>) {
     let file = file_path
         .and_then(|path| ensure_log_file(path).ok())
+        .and_then(|file| FileLogger::new(file).ok())
         .map(Mutex::new);
     let stderr_logger = env_logger::Builder::new()
         .filter_level(LevelFilter::Trace)

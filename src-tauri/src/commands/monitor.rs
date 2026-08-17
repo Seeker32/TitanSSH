@@ -3,7 +3,7 @@ use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 /// 为指定会话启动监控任务
 ///
@@ -39,19 +39,23 @@ pub async fn start_monitoring<R: Runtime>(
 /// 任务不存在（从未创建、已停止或已过期）时返回结构化错误
 /// MonitorTaskNotFound，前端可据此区分「已停止」与「早已消失」，
 /// 暴露陈旧/重复的任务状态。
+///
+/// 异步 command：任务注册表与监控 worker 共享 std::sync::Mutex，等待锁必须不占用
+/// Tauri 主线程。
 #[tauri::command]
-pub fn stop_monitoring<R: Runtime>(
+pub async fn stop_monitoring<R: Runtime>(
     app: AppHandle<R>,
     task_id: String,
-    monitor_service: State<'_, MonitorService>,
 ) -> Result<(), AppErrorInfo> {
-    if monitor_service.stop_monitoring(&app, &task_id) {
-        Ok(())
-    } else {
-        Err(AppErrorInfo::from(AppError::MonitorTaskNotFound(
-            task_id.into(),
-        )))
-    }
+    let service = app.state::<MonitorService>().inner().clone();
+    run_blocking_op(move || {
+        if service.stop_monitoring(&app, &task_id) {
+            Ok(())
+        } else {
+            Err(AppError::MonitorTaskNotFound(task_id.into()))
+        }
+    })
+    .await
 }
 
 /// 获取指定会话的最新监控快照
@@ -60,18 +64,25 @@ pub fn stop_monitoring<R: Runtime>(
 /// SessionNotFound；会话存在但尚无快照（首轮采集完成前、或监控已停止/失败）
 /// 返回 MonitorSnapshotUnavailable。SessionNotFound 是 close_session 式
 /// teardown 的键，瞬时无数据不得伪装成「会话已消失」触发前端拆除会话状态。
+///
+/// 异步 command：Session 与 snapshot 注册表均由 monitor worker 共享的
+/// std::sync::Mutex 保护，锁等待与快照克隆均在线程池执行。
 #[tauri::command]
-pub fn get_monitor_status(
+pub async fn get_monitor_status<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
-    session_manager: State<'_, SessionManager>,
-    monitor_service: State<'_, MonitorService>,
 ) -> Result<MonitorSnapshot, AppErrorInfo> {
-    session_manager
-        .host_config(&session_id)
-        .map_err(AppErrorInfo::from)?;
-    monitor_service
-        .get_monitor_status(&session_id)
-        .ok_or_else(|| AppErrorInfo::from(AppError::MonitorSnapshotUnavailable(session_id.into())))
+    let monitor_service = app.state::<MonitorService>().inner().clone();
+    let app_for_status = app.clone();
+    run_blocking_op(move || {
+        app_for_status
+            .state::<SessionManager>()
+            .host_config(&session_id)?;
+        monitor_service
+            .get_monitor_status(&session_id)
+            .ok_or_else(|| AppError::MonitorSnapshotUnavailable(session_id.into()))
+    })
+    .await
 }
 
 #[cfg(test)]

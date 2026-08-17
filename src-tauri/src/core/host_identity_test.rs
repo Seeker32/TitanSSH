@@ -122,6 +122,73 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 接受并保存的 known_hosts 写入可能在慢盘上阻塞；此时 global state 锁必须
+    /// 已释放，避免其他 Session 的 verify、关闭或决定操作被整个写盘周期卡住。
+    #[test]
+    fn accept_and_save_releases_state_lock_while_trust_store_write_blocks() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("titan-identity-save-fifo-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let fifo = dir.join("known_hosts");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("应能创建 FIFO")
+                .success()
+        );
+
+        let app = mock_app();
+        // 先在无持久化存储的状态创建 challenge，避免 verify 本身读取 FIFO。
+        let service = HostIdentityService::new();
+        let verifier = service.verifier(app.handle().clone(), "session-1".to_string());
+        let waiter = thread::spawn(move || verifier(&make_presented("SHA256:save-block")));
+        let challenge = wait_pending(&service, "session-1");
+        *service.trust_store.lock().expect("信任存储锁应可获取") =
+            Some(TrustStore::from_file_path(fifo.clone()));
+
+        let save = {
+            let service = service.clone();
+            let app_handle = app.handle().clone();
+            let challenge_id = challenge.challenge_id.clone();
+            thread::spawn(move || service.accept_and_save(&app_handle, &challenge_id))
+        };
+
+        // 非阻塞 writer 成功意味着 upsert 已在 FIFO 上等待读取；此刻保存操作的
+        // 文件 I/O 正在进行，state 锁若仍被持有则说明会阻塞所有其他 Session。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut probe_writer = None;
+        while Instant::now() < deadline {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x800)
+                .open(&fifo)
+            {
+                Ok(writer) => {
+                    probe_writer = Some(writer);
+                    assert!(
+                        service.state.try_lock().is_ok(),
+                        "accept_and_save 写入 known_hosts 时不得持有 global state 锁"
+                    );
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        drop(probe_writer.expect("保存操作应在期限内进入信任存储读取"));
+
+        save.join()
+            .expect("保存线程不应 panic")
+            .expect("解除 FIFO 阻塞后保存应成功");
+        waiter
+            .join()
+            .expect("等待线程不应 panic")
+            .expect("保存成功后应放行认证");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 已保存 key 精确匹配：verify 在认证前直接放行，不产生 challenge。
     #[test]
     fn saved_key_exact_match_skips_challenge() {
@@ -435,6 +502,8 @@ mod tests {
     /// 保存失败：challenge 保持未决，不降级为临时信任，错误结构化返回。
     #[test]
     fn save_failure_keeps_challenge_unresolved_without_temporary_trust() {
+        use std::os::unix::fs::PermissionsExt;
+
         let app = mock_app();
         let events = Arc::new(AtomicUsize::new(0));
         let counter = events.clone();
@@ -456,12 +525,17 @@ mod tests {
         });
         let challenge = wait_pending(&service, "session-1");
 
-        // 破坏发布目标：文件路径替换为目录，写盘必然失败（读取缓存不受影响）
-        fs::remove_file(&path).unwrap();
-        fs::create_dir_all(&path).unwrap();
+        // 禁止父目录创建临时发布文件，但保留 known_hosts 可读取，使第二个 verifier
+        // 仍能合并到原 challenge 并验证「保存失败不授予临时信任」。
+        let parent = path.parent().expect("信任文件应有父目录");
+        let original_permissions = fs::metadata(parent).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o555);
+        fs::set_permissions(parent, read_only_permissions).unwrap();
         let error = service
             .accept_and_save(app.handle(), &challenge.challenge_id)
             .unwrap_err();
+        fs::set_permissions(parent, original_permissions).unwrap();
         assert_eq!(error.code(), "HostKeySaveFailed");
         // challenge 保持未决：等待者仍在等待，pending 未清除
         assert_eq!(
@@ -1716,6 +1790,8 @@ mod tests {
     /// 仅本次接受或拒绝；绝不静默降级或丢失旧记录。
     #[test]
     fn replace_write_failure_keeps_old_record_and_pending_challenge() {
+        use std::os::unix::fs::PermissionsExt;
+
         let app = mock_app();
         let (service, path) = service_with_record(TrustRecord {
             host: "10.0.0.8".to_string(),
@@ -1736,12 +1812,17 @@ mod tests {
         let challenge = wait_pending(&service, "session-1");
         assert_eq!(challenge.kind, HostIdentityChallengeKind::Changed);
 
-        // 破坏发布目标：文件路径替换为目录，写盘必然失败（读取缓存不受影响）
-        fs::remove_file(&path).unwrap();
-        fs::create_dir_all(&path).unwrap();
+        // 禁止父目录创建临时发布文件，但保留 known_hosts 可读取，旧 key 的后续
+        // verifier 才能验证失败替换没有污染持久化记录。
+        let parent = path.parent().expect("信任文件应有父目录");
+        let original_permissions = fs::metadata(parent).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o555);
+        fs::set_permissions(parent, read_only_permissions).unwrap();
         let error = service
             .accept_and_save(app.handle(), &challenge.challenge_id)
             .unwrap_err();
+        fs::set_permissions(parent, original_permissions).unwrap();
         assert_eq!(error.code(), "HostKeySaveFailed");
         // 旧信任记录未被失败替换污染：新 Session 呈现旧 key 仍精确匹配静默放行
         let verifier_old = service.verifier(app.handle().clone(), "session-old".to_string());
@@ -1904,8 +1985,9 @@ mod tests {
     }
 
     /// 并发压力：保存/替换与「服务端再次换 key」（取代旧 challenge）竞争。
-    /// 无论竞争顺序如何，结局必须安全：保存成功 ⇒ 磁盘只保留呈现 key；
-    /// 保存失败（stale）⇒ 写盘前失败、磁盘仍是旧记录；新 challenge 始终可解决。
+    /// 无论竞争顺序如何，stale 保存都不得授予旧 challenge 的临时信任；写盘在
+    /// state 锁外，用户已选择保存时磁盘可保留旧 key 或保存 key-a，新 challenge
+    /// 始终可解决。
     #[test]
     fn save_racing_supersede_never_persists_stale_key() {
         let app = mock_app();
@@ -1956,10 +2038,14 @@ mod tests {
                         .expect("保存成功应放行本挑战等待者");
                 }
                 Err(error) => {
-                    // stale 保存：challenge_a 先被取代，写盘前安全失败，磁盘仍是旧记录
+                    // stale 保存：不得放行 challenge_a；保存与取代竞争时，磁盘可能
+                    // 仍是旧记录（取代先发生）或是用户已确认的 key-a（写盘先完成）。
                     assert_eq!(error.code(), "HostKeyChallengeNotFound");
                     let records = TrustStore::from_file_path(path.clone()).reload().unwrap();
-                    assert_eq!(records[0].blob, b"old");
+                    assert!(
+                        matches!(records[0].blob.as_slice(), b"old" | b"key-a"),
+                        "stale 保存的磁盘结果只能是旧记录或用户确认的 key-a"
+                    );
                     assert_eq!(
                         waiter_a.join().unwrap().unwrap_err().code(),
                         "HostKeyVerificationCancelled"

@@ -207,8 +207,6 @@ fn start_terminal_session_with_parts<R, F>(
         // libssh2 的 set_timeout 对 userauth_password 不生效，必须用此方案。
         let (conn_tx, conn_rx) = mpsc::channel::<Result<TerminalTransport, AppError>>();
         let host_clone = host.clone();
-        let password_owned = password.map(|s| s.to_string());
-        let passphrase_owned = passphrase.map(|s| s.to_string());
         let app_for_connect = app.clone();
         let session_id_for_connect = session_id.clone();
         let current_phase = Arc::new(Mutex::new(ConnectionPhase::ConnectingTcp));
@@ -218,8 +216,8 @@ fn start_terminal_session_with_parts<R, F>(
         thread::spawn(move || {
             let result = connect_fn(
                 &host_clone,
-                password_owned.as_deref(),
-                passphrase_owned.as_deref(),
+                password.as_deref(),
+                passphrase.as_deref(),
                 &verifier_for_connect,
                 &mut |phase| {
                     let mapped_phase = map_connect_phase(phase);

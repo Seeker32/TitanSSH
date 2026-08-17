@@ -59,10 +59,14 @@ struct TrustStoreState {
     fingerprint: Option<FileFingerprint>,
 }
 
-/// 线程安全的信任存储；读写全部在内部锁内串行化，并发保存不丢失记录。
+/// 线程安全的信任存储：state 锁保护路径与缓存，publish 锁串行化完整读改写周期。
+///
+/// 持久化写入（临时文件、fsync、原子替换）在 state 锁外执行，慢盘不会阻塞
+/// 其他 Session 的 lookup；publish 锁仍保证并发保存不丢失记录。
 #[derive(Clone)]
 pub struct TrustStore {
     state: Arc<Mutex<TrustStoreState>>,
+    publish: Arc<Mutex<()>>,
 }
 
 impl TrustStore {
@@ -95,6 +99,7 @@ impl TrustStore {
                 records: None,
                 fingerprint: None,
             })),
+            publish: Arc::new(Mutex::new(())),
         }
     }
 
@@ -116,18 +121,30 @@ impl TrustStore {
 
     /// 写入或替换精确 endpoint 的信任记录（每个 host + port 至多一条）。
     ///
-    /// 在锁内完成 加载 → 修改 → 安全发布 → 更新缓存：并发 upsert 串行执行，
-    /// 不会丢失其他 endpoint 的记录；磁盘写入失败时缓存保持原状并返回错误。
+    /// publish 锁内完成加载 → 修改 → 安全发布 → 更新缓存，保证并发 upsert 不丢失
+    /// 其他 endpoint；state 锁只覆盖缓存快照与更新，fsync/rename 不阻塞 lookup。
+    /// 磁盘写入失败时缓存保持原状并返回错误。
     pub fn upsert(&self, record: TrustRecord) -> Result<(), AppError> {
         validate_record(&record)?;
+        let _publish = self
+            .publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (file_path, mut records) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.file_path.clone(), ensure_loaded(&mut state)?.to_vec())
+        };
+        records.retain(|existing| !(existing.host == record.host && existing.port == record.port));
+        records.push(record);
+        let fingerprint = write_records(&file_path, &records)?;
+
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut records = ensure_loaded(&mut state)?.to_vec();
-        records.retain(|existing| !(existing.host == record.host && existing.port == record.port));
-        records.push(record);
-        let fingerprint = write_records(&state.file_path, &records)?;
         state.records = Some(records);
         state.fingerprint = Some(fingerprint);
         Ok(())
@@ -135,21 +152,32 @@ impl TrustStore {
 
     /// 移除精确 endpoint 的信任记录；endpoint 不存在时静默成功（幂等）。
     ///
-    /// 与 upsert 一样在锁内完成 加载 → 修改 → 安全发布 → 更新缓存；
+    /// 与 upsert 一样由 publish 锁串行化完整读改写周期；state 锁不跨越安全发布，
     /// 磁盘写入失败时缓存保持原状并返回错误（不得让调用方误以为已删除）。
     pub fn remove(&self, host: &str, port: u16) -> Result<(), AppError> {
-        let mut state = self
-            .state
+        let _publish = self
+            .publish
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut records = ensure_loaded(&mut state)?.to_vec();
+        let (file_path, mut records) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.file_path.clone(), ensure_loaded(&mut state)?.to_vec())
+        };
         let before = records.len();
         records.retain(|record| !(record.host == host && record.port == port));
         if records.len() == before {
             // endpoint 本无记录：无需发布，保持幂等
             return Ok(());
         }
-        let fingerprint = write_records(&state.file_path, &records)?;
+        let fingerprint = write_records(&file_path, &records)?;
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.records = Some(records);
         state.fingerprint = Some(fingerprint);
         Ok(())

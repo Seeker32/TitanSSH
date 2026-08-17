@@ -1,12 +1,13 @@
 #[cfg(test)]
 mod tests {
     use crate::core::logging::{
-        LOG_FILE_NAME, LOG_MAX_BYTES, LOG_VIEW_MAX_LINES, LogStore, ensure_log_file, format_entry,
-        install_logger, logger_install_recorded, write_early_panic_record,
+        FileLogger, LOG_FILE_NAME, LOG_MAX_BYTES, LOG_VIEW_MAX_LINES, LogStore, ensure_log_file,
+        format_entry, install_logger, logger_install_recorded, write_early_panic_record,
+        write_log_line,
     };
     use log::Level;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -183,6 +184,31 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "fresh\n");
     }
 
+    /// 回归：运行时写入将超过上限时，旧内容必须立即截断；日志文件不得只在
+    /// 启动阶段限长后又无限增长。
+    #[test]
+    fn log_writer_truncates_before_a_record_exceeds_the_runtime_limit() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let path = directory.path().join(LOG_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(path)
+            .expect("日志文件应可打开");
+        file.write_all(b"old\n").expect("旧日志应可写入");
+        let mut written_bytes = 4;
+        write_log_line(&mut file, &mut written_bytes, "next", 8).expect("超限时应截断并写入新记录");
+        file.flush().expect("日志文件应可刷新");
+        file.seek(SeekFrom::Start(0)).expect("日志文件应可回读");
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .expect("日志文件应可读取");
+        assert_eq!(contents, "next\n");
+        assert_eq!(written_bytes, 5);
+    }
+
     /// 日志目录不存在时递归创建。
     #[test]
     fn ensure_log_file_creates_missing_parent_directories() {
@@ -224,7 +250,7 @@ mod tests {
     fn logger_writes_records_to_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(LOG_FILE_NAME);
-        let file = ensure_log_file(&path).unwrap();
+        let file = FileLogger::new(ensure_log_file(&path).unwrap()).unwrap();
         let logger = crate::core::logging::Logger {
             stderr_logger: env_logger::Builder::new()
                 .filter_level(log::LevelFilter::Trace)

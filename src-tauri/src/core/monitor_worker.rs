@@ -6,6 +6,7 @@ use crate::models::host::HostConfig;
 use crate::models::monitor::{MonitorSnapshot, NetworkInterface, NetworkSnapshot};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -47,6 +48,10 @@ struct NetworkCounter {
     receive_bytes: u64,
     transmit_bytes: u64,
 }
+
+/// 上一轮网卡数量达到此值时建立名称索引；小型主机保持零分配线性查找，
+/// 容器/K8s 主机的大量 veth 接口则避免每轮 O(n²) 字符串比较。
+const NETWORK_COUNTER_INDEX_THRESHOLD: usize = 8;
 
 #[cfg(test)]
 impl NetworkSample {
@@ -339,16 +344,31 @@ fn compute_network_rates(
     previous: Option<&NetworkSample>,
     current: &NetworkSample,
 ) -> Vec<NetworkInterface> {
+    // 仅在接口数量显著时建立索引：常见主机通常只有少量 NIC，HashMap 分配反而
+    // 比线性查找昂贵。entry 保留同名重复记录中的首项，与原 find 语义一致。
+    let previous_by_name = previous
+        .filter(|sample| sample.interfaces.len() >= NETWORK_COUNTER_INDEX_THRESHOLD)
+        .map(|sample| {
+            let mut index = HashMap::with_capacity(sample.interfaces.len());
+            for counter in &sample.interfaces {
+                index.entry(counter.name.as_str()).or_insert(counter);
+            }
+            index
+        });
+
     current
         .interfaces
         .iter()
         .map(|counter| {
             let previous_counter = previous.and_then(|sample| {
-                sample
-                    .interfaces
-                    .iter()
-                    .find(|candidate| candidate.name == counter.name)
-                    .map(|candidate| (sample, candidate))
+                let candidate = match previous_by_name.as_ref() {
+                    Some(index) => index.get(counter.name.as_str()).copied(),
+                    None => sample
+                        .interfaces
+                        .iter()
+                        .find(|candidate| candidate.name == counter.name),
+                };
+                candidate.map(|candidate| (sample, candidate))
             });
             let receive_bytes_per_second = previous_counter.and_then(|(sample, candidate)| {
                 rate_between(
@@ -428,7 +448,8 @@ fn resolve_memory_usage(total_kb: Option<f64>, available_kb: Option<f64>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::{
-        NetworkSample, STATUS_SCRIPT, build_collect_command, compute_cpu_usage, parse_snapshot_at,
+        NetworkSample, STATUS_SCRIPT, build_collect_command, compute_cpu_usage,
+        compute_network_rates, parse_snapshot_at,
     };
     use crate::errors::app_error::AppError;
 
@@ -643,6 +664,45 @@ mod tests {
             snapshot.network.interfaces[1].transmit_bytes_per_second,
             Some(800)
         );
+    }
+
+    /// 大量网卡时按名称索引上一轮计数，但仍须保留当前轮顺序、正确计算速率，
+    /// 并让上轮不存在的新接口维持未知速率。
+    #[test]
+    fn compute_network_rates_handles_reordered_large_interface_sets() {
+        let previous = NetworkSample::new(
+            1_000,
+            vec![
+                ("veth0", 100, 200),
+                ("veth1", 200, 400),
+                ("veth2", 300, 600),
+                ("veth3", 400, 800),
+                ("veth4", 500, 1_000),
+                ("veth5", 600, 1_200),
+                ("veth6", 700, 1_400),
+                ("veth7", 800, 1_600),
+            ],
+        );
+        let current = NetworkSample::new(
+            2_000,
+            vec![
+                ("veth7", 1_000, 2_000),
+                ("veth0", 150, 300),
+                ("veth-new", 1, 1),
+            ],
+        );
+
+        let rates = compute_network_rates(Some(&previous), &current);
+
+        assert_eq!(rates[0].name, "veth7");
+        assert_eq!(rates[0].receive_bytes_per_second, Some(200));
+        assert_eq!(rates[0].transmit_bytes_per_second, Some(400));
+        assert_eq!(rates[1].name, "veth0");
+        assert_eq!(rates[1].receive_bytes_per_second, Some(50));
+        assert_eq!(rates[1].transmit_bytes_per_second, Some(100));
+        assert_eq!(rates[2].name, "veth-new");
+        assert_eq!(rates[2].receive_bytes_per_second, None);
+        assert_eq!(rates[2].transmit_bytes_per_second, None);
     }
 
     /// 验证首次、新接口、计数器回退及无效间隔都保留未知速率，零流量仍为零。

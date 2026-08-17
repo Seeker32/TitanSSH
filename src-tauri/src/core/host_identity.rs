@@ -479,50 +479,70 @@ impl HostIdentityService {
     /// 保存成功后，其他 Session 中同 endpoint + 同 key 的 pending challenge 一并放行，
     /// 并派发撤销事件让对应 UI 撤下确认卡；发起保存的 challenge 由 UI 自行撤下。
     ///
-    /// 状态锁覆盖「存在性检查 → 持久化 → 移除」全程：保存期间 challenge 无法被
-    /// 取代/拒绝/重复解决，stale 决定（challenge 已不存在）在写盘前即失败，
-    /// 绝不把过时 key 写入信任存储。锁顺序为 state → trust store；verify 的 store
-    /// 锁仅覆盖 clone（let 绑定后即释放，不与 state 锁嵌套），不构成环。
+    /// 两阶段提交：状态锁内仅快照并确认 challenge 仍未决，持久化写盘在锁外执行，
+    /// 写入成功后重新取锁确认仍是同一 challenge 才授予临时信任并唤醒等待者。
+    /// 写盘期间 challenge 可能被取代/拒绝/关闭；此时返回 stale 错误且绝不授予
+    /// 内存信任。用户已明确选择保存，写盘与取代竞争时持久化结果以完成顺序为准。
     pub fn accept_and_save<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         challenge_id: &str,
     ) -> Result<(), AppError> {
+        // 第一阶段：仅在状态锁内确认并快照 challenge，不得把文件 I/O 放在全局
+        // state 锁中，否则其他 Session 的 verify/关闭/决定都会被慢盘阻塞。
+        let wait = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.pending.get(challenge_id).cloned().ok_or_else(|| {
+                AppError::HostKeyChallengeNotFound(challenge_id.to_string().into())
+            })?
+        };
+
+        // 第二阶段：信任存储内部串行化读写并安全发布；整个阻塞过程不持有 state 锁。
+        // 写入失败时不修改内存状态，原 challenge 仍可由用户重试或另行决定。
+        let store = self
+            .trust_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                AppError::HostKeySaveFailed(ErrorDetail::msg(
+                    "信任存储未初始化，无法持久化信任记录",
+                    Vec::new(),
+                ))
+            })?;
+        store
+            .upsert(TrustRecord {
+                host: wait.challenge.host.clone(),
+                port: wait.challenge.port,
+                algorithm: wait.challenge.key_algorithm.clone(),
+                blob: wait.presented_blob.clone(),
+            })
+            .map_err(|error| AppError::HostKeySaveFailed(error.to_string().into()))?;
+
+        // 第三阶段：写盘完成后再次确认 challenge 未被取代/拒绝/关闭。以 Arc 身份
+        // 比较避免未来改变 challenge ID 生成策略时把不同 wait 误认为同一决定。
         let (wait, released_others) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // challenge 已被取代/拒绝/重复解决：stale 决定在写盘前安全失败
-            let wait = state.pending.get(challenge_id).cloned().ok_or_else(|| {
+            let current_wait = state.pending.get(challenge_id).ok_or_else(|| {
                 AppError::HostKeyChallengeNotFound(challenge_id.to_string().into())
             })?;
-
-            // 持久化：trust store 内部串行化读写并安全发布，失败不改动旧记录。
-            // 写入失败时本 challenge 尚未从 pending 移除，保持未决。
-            let store = self
-                .trust_store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .ok_or_else(|| {
-                    AppError::HostKeySaveFailed(ErrorDetail::msg(
-                        "信任存储未初始化，无法持久化信任记录",
-                        Vec::new(),
-                    ))
-                })?;
-            store
-                .upsert(TrustRecord {
-                    host: wait.challenge.host.clone(),
-                    port: wait.challenge.port,
-                    algorithm: wait.challenge.key_algorithm.clone(),
-                    blob: wait.presented_blob.clone(),
-                })
-                .map_err(|error| AppError::HostKeySaveFailed(error.to_string().into()))?;
+            if !Arc::ptr_eq(current_wait, &wait) {
+                return Err(AppError::HostKeyChallengeNotFound(
+                    challenge_id.to_string().into(),
+                ));
+            }
 
             // 移除本 challenge + 写入临时信任；同 endpoint + 同 key 的
             // 其他 Session pending challenge 一并移除（其等待者由持久化信任覆盖）
-            state.pending.remove(challenge_id);
+            let wait = state.pending.remove(challenge_id).ok_or_else(|| {
+                AppError::HostKeyChallengeNotFound(challenge_id.to_string().into())
+            })?;
             let key = IdentityKey::from_challenge(&wait.challenge);
             state.pending_index.remove(&key);
             state.trusted.insert(key);
