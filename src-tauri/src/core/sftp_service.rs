@@ -10,6 +10,7 @@ use crate::models::sftp::{
     TransferTask, TransferType,
 };
 use crate::storage::secure_store;
+use log::warn;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -574,27 +575,6 @@ impl SftpService {
 
         let handle = self.handle(&session_id)?;
 
-        // 同一 Session 已有 Pending/Running 下载占用相同最终目标时拒绝入队：
-        // 并发写同一本地目标会互相破坏临时文件与发布语义
-        {
-            let tasks = self
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let occupied = tasks.values().any(|task| {
-                task.session_id == session_id
-                    && task.transfer_type == TransferType::Download
-                    && matches!(
-                        task.status,
-                        SftpTaskStatus::Pending | SftpTaskStatus::Running
-                    )
-                    && task.local_path == local_path
-            });
-            if occupied {
-                return Err(AppError::SftpTargetBusy(local_path.into()));
-            }
-        }
-
         let file_name = Path::new(&remote_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -620,10 +600,26 @@ impl SftpService {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
-        self.tasks
+        // 元数据查询不持有 registry 锁；随后在同一临界区内检查并保留目标，
+        // 防止并发入队同时越过占用检查而写入同一最终文件。
+        let mut tasks = self
+            .tasks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(task_id.clone(), task.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let occupied = tasks.values().any(|existing| {
+            existing.session_id == session_id
+                && existing.transfer_type == TransferType::Download
+                && matches!(
+                    existing.status,
+                    SftpTaskStatus::Pending | SftpTaskStatus::Running
+                )
+                && existing.local_path == local_path
+        });
+        if occupied {
+            return Err(AppError::SftpTargetBusy(local_path.into()));
+        }
+        tasks.insert(task_id.clone(), task.clone());
+        drop(tasks);
         // 入队序号决定 Session 内传输名额的 FIFO 顺序，也是取消时移出队列的依据
         let queue_seq = handle.register_cancel_entry(task_id.clone(), cancel_token.clone());
 
@@ -682,31 +678,14 @@ impl SftpService {
             format!("{}/{}", remote_path, file_name)
         };
 
-        let total_bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+        // exists() 与 metadata() 之间文件可能被删除或权限可能变化；必须显式返回，
+        // 不得把真实失败伪装成零字节传输。
+        let total_bytes = std::fs::metadata(&local_path)
+            .map(|metadata| metadata.len())
+            .map_err(|error| AppError::SftpOpenError(error.to_string().into()))?;
 
         // 传输连接由 worker 按需建立：命令线程不被远端建连阻塞
         let handle = self.handle(&session_id)?;
-
-        // 同一 Session 已有 Pending/Running 上传占用相同最终目标时拒绝入队：
-        // 并发写同一远端目标会互相破坏临时文件与安全发布语义
-        {
-            let tasks = self
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let occupied = tasks.values().any(|task| {
-                task.session_id == session_id
-                    && task.transfer_type == TransferType::Upload
-                    && matches!(
-                        task.status,
-                        SftpTaskStatus::Pending | SftpTaskStatus::Running
-                    )
-                    && task.remote_path == full_remote_path
-            });
-            if occupied {
-                return Err(AppError::SftpTargetBusy(full_remote_path.into()));
-            }
-        }
 
         let task_id = Uuid::new_v4().to_string();
         let cancel_token = CancelToken::new();
@@ -725,10 +704,25 @@ impl SftpService {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
-        self.tasks
+        // check 与 insert 必须共用同一 registry 临界区，避免并发上传重复保留远端目标。
+        let mut tasks = self
+            .tasks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(task_id.clone(), task.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let occupied = tasks.values().any(|existing| {
+            existing.session_id == session_id
+                && existing.transfer_type == TransferType::Upload
+                && matches!(
+                    existing.status,
+                    SftpTaskStatus::Pending | SftpTaskStatus::Running
+                )
+                && existing.remote_path == full_remote_path
+        });
+        if occupied {
+            return Err(AppError::SftpTargetBusy(full_remote_path.into()));
+        }
+        tasks.insert(task_id.clone(), task.clone());
+        drop(tasks);
         // 入队序号决定 Session 内传输名额的 FIFO 顺序，也是取消时移出队列的依据
         let queue_seq = handle.register_cancel_entry(task_id.clone(), cancel_token.clone());
         self.spawn_transfer_task(
@@ -789,7 +783,7 @@ impl SftpService {
 
     /// 迁移任务状态：registry 先更新，再发布事件；任务不存在或迁移非法时拒绝。
     ///
-    /// 状态机：Pending → {Running, Cancelled}，Running → {Done, Failed, Cancelled}；
+    /// 状态机：Pending → {Running, Failed, Cancelled}，Running → {Done, Failed, Cancelled}；
     /// Done / Failed / Cancelled 为终态。终态迁移时同步移除取消令牌，
     /// 使 cancel_task 与 cleanup 不再触碰已结束的任务。
     ///
@@ -821,6 +815,7 @@ impl SftpService {
         let legal = matches!(
             (&task.status, &status),
             (SftpTaskStatus::Pending, SftpTaskStatus::Running)
+                | (SftpTaskStatus::Pending, SftpTaskStatus::Failed)
                 | (SftpTaskStatus::Pending, SftpTaskStatus::Cancelled)
                 | (SftpTaskStatus::Running, SftpTaskStatus::Done)
                 | (SftpTaskStatus::Running, SftpTaskStatus::Failed)
@@ -848,15 +843,20 @@ impl SftpService {
                 .remove(task_id);
         }
 
-        let _ = app.emit(
+        if let Err(emit_error) = app.emit(
             "sftp:task_status",
             SftpTaskStatusEvent {
                 task_id: task_id.to_string(),
                 session_id: session_id.to_string(),
-                status,
-                error,
+                status: status.clone(),
+                error: error.clone(),
             },
-        );
+        ) {
+            warn!(
+                "[session:{}][task:{}][diagnostic] Failed to emit SFTP status {:?}: {}",
+                session_id, task_id, status, emit_error
+            );
+        }
         true
     }
 
@@ -1024,16 +1024,7 @@ impl SftpService {
                     return;
                 }
                 Ok(Err(CheckoutError::Connect(error))) => {
-                    // 建连失败只影响本任务，保留结构化错误。
-                    // 状态机只允许 Pending → Running → Failed：先进入 Running 再迁移到
-                    // Failed，保证每步都是合法迁移。
-                    service.transition_task(
-                        &app,
-                        &task_id,
-                        &session_id,
-                        SftpTaskStatus::Running,
-                        None,
-                    );
+                    // 建连失败时尚未取得传输资源，直接 Pending → Failed，不伪造 Running 事件。
                     service.transition_task(
                         &app,
                         &task_id,
@@ -1044,13 +1035,6 @@ impl SftpService {
                     return;
                 }
                 Err(join_error) => {
-                    service.transition_task(
-                        &app,
-                        &task_id,
-                        &session_id,
-                        SftpTaskStatus::Running,
-                        None,
-                    );
                     service.transition_task(
                         &app,
                         &task_id,
@@ -1072,13 +1056,6 @@ impl SftpService {
                     Ok(permit) => permit,
                     Err(_) => {
                         service.release_transfer_connection(&session_id, checkout, true);
-                        service.transition_task(
-                            &app,
-                            &task_id,
-                            &session_id,
-                            SftpTaskStatus::Running,
-                            None,
-                        );
                         service.transition_task(
                             &app,
                             &task_id,
@@ -1338,9 +1315,10 @@ fn run_transfer_blocking<R: Runtime>(
     /// 内联辅助：推送进度事件
     macro_rules! emit_progress {
         () => {
-            if last_report.elapsed().as_millis() >= 500 {
-                let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
-                let speed = ((transferred - last_transferred) as f64 / elapsed) as u64;
+            let elapsed = last_report.elapsed();
+            if elapsed.as_millis() >= 500 {
+                let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+                let speed = ((transferred - last_transferred) as f64 / elapsed_secs) as u64;
                 let _ = app.emit(
                     "sftp:progress",
                     SftpProgressEvent {
@@ -1454,8 +1432,7 @@ fn run_transfer_blocking<R: Runtime>(
                 }
             };
             // 与最终目标同目录、包含 taskId 的唯一远端临时文件：发布前旧目标不受影响
-            let temp_path = upload_temp_path(remote_path, task_id);
-            let temp_path_str = temp_path.to_string_lossy().to_string();
+            let temp_path_str = upload_temp_path(remote_path, task_id);
             let mut remote_file = match sftp.create(&temp_path_str) {
                 Ok(file) => file,
                 Err(error) => return TransferOutcome::Failed(error),
@@ -1552,9 +1529,17 @@ fn download_temp_path(local_path: &str, task_id: &str) -> PathBuf {
 /// 计算与最终目标同目录、包含 taskId 的上传临时文件路径（远端）。
 ///
 /// 与下载共用同一命名规则（.文件名.taskId.part）：taskId 全局唯一，
-/// 同目标并发任务不会撞名；临时文件与最终目标同目录，发布重命名不跨目录。
-fn upload_temp_path(remote_path: &str, task_id: &str) -> PathBuf {
-    download_temp_path(remote_path, task_id)
+/// 同目标并发任务不会撞名；远端路径始终使用 POSIX `/` 分隔符，绝不经过本地 Path API。
+fn upload_temp_path(remote_path: &str, task_id: &str) -> String {
+    let (parent, file_name) = remote_path.rsplit_once('/').unwrap_or(("", remote_path));
+    let temp_name = format!(".{file_name}.{task_id}.part");
+    if parent == "/" || (parent.is_empty() && remote_path.starts_with('/')) {
+        format!("/{temp_name}")
+    } else if parent.is_empty() {
+        temp_name
+    } else {
+        format!("{parent}/{temp_name}")
+    }
 }
 
 /// 把已完成写入并关闭句柄的远端临时文件安全发布为最终目标：

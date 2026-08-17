@@ -4163,10 +4163,7 @@ mod tests {
     fn upload_temp_path_lives_in_target_directory_with_task_id() {
         let temp_path = upload_temp_path("/srv/data/file.bin", "task-42");
 
-        assert_eq!(
-            temp_path.to_string_lossy(),
-            "/srv/data/.file.bin.task-42.part"
-        );
+        assert_eq!(temp_path, "/srv/data/.file.bin.task-42.part");
     }
 
     /// 根目录下的目标文件：临时文件仍在同一根目录，无重复斜杠。
@@ -4174,7 +4171,7 @@ mod tests {
     fn upload_temp_path_handles_root_directory() {
         let temp_path = upload_temp_path("/file.bin", "task-7");
 
-        assert_eq!(temp_path.to_string_lossy(), "/.file.bin.task-7.part");
+        assert_eq!(temp_path, "/.file.bin.task-7.part");
     }
 
     // ─── 上传发布（publish_upload_file）contract ───────────────────────────
@@ -4351,10 +4348,7 @@ mod tests {
             "目标内容应为本地文件内容"
         );
         let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
-        assert!(
-            !fs.has_file(&temp_path.to_string_lossy()),
-            "发布成功后临时文件不应残留"
-        );
+        assert!(!fs.has_file(&temp_path), "发布成功后临时文件不应残留");
         assert!(fs.unlink_calls().is_empty(), "发布成功不得触发任何 unlink");
         let _ = std::fs::remove_file(&local_path);
     }
@@ -4396,7 +4390,7 @@ mod tests {
             "零字节文件应以空内容发布到目标"
         );
         let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
-        assert!(!fs.has_file(&temp_path.to_string_lossy()));
+        assert!(!fs.has_file(&temp_path));
         let _ = std::fs::remove_file(&local_path);
     }
 
@@ -4463,13 +4457,10 @@ mod tests {
             Some(b"old".to_vec()),
             "Reject 冲突不得破坏远端旧目标"
         );
-        assert!(
-            !fs.has_file(&temp_path.to_string_lossy()),
-            "冲突失败后本任务临时文件应被清理"
-        );
+        assert!(!fs.has_file(&temp_path), "冲突失败后本任务临时文件应被清理");
         assert_eq!(
             fs.unlink_calls(),
-            vec![temp_path.to_string_lossy().to_string()],
+            vec![temp_path.clone()],
             "只清理本任务临时文件，不扫描未知 .part"
         );
         assert!(
@@ -4518,7 +4509,7 @@ mod tests {
             "确认覆盖后目标内容应为新内容"
         );
         let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
-        assert!(!fs.has_file(&temp_path.to_string_lossy()));
+        assert!(!fs.has_file(&temp_path));
         assert!(fs.unlink_calls().is_empty(), "原子替换不得触发 unlink");
         let _ = std::fs::remove_dir_all(&local_dir);
     }
@@ -4582,10 +4573,7 @@ mod tests {
             Some(b"old".to_vec()),
             "发布失败不得改动远端旧目标"
         );
-        assert!(
-            !fs.has_file(&temp_path.to_string_lossy()),
-            "临时文件应被清理"
-        );
+        assert!(!fs.has_file(&temp_path), "临时文件应被清理");
         let _ = std::fs::remove_dir_all(&local_dir);
     }
 
@@ -4641,13 +4629,10 @@ mod tests {
             .as_ref()
             .expect("写入失败必须携带结构化错误");
         assert_eq!(error.code, "SftpWriteError");
-        assert!(
-            !fs.has_file(&temp_path.to_string_lossy()),
-            "写入失败后本任务临时文件应被清理"
-        );
+        assert!(!fs.has_file(&temp_path), "写入失败后本任务临时文件应被清理");
         assert_eq!(
             fs.unlink_calls(),
-            vec![temp_path.to_string_lossy().to_string()],
+            vec![temp_path.clone()],
             "只清理本任务临时文件"
         );
         assert_eq!(fs.content("/srv/keep.txt"), Some(b"old".to_vec()));
@@ -4703,10 +4688,7 @@ mod tests {
             .unwrap()
             .clone();
         assert!(registry_task.error.is_none(), "清理成功的取消不得携带错误");
-        assert!(
-            !fs.has_file(&temp_path.to_string_lossy()),
-            "取消后本任务临时文件应被清理"
-        );
+        assert!(!fs.has_file(&temp_path), "取消后本任务临时文件应被清理");
         assert_eq!(fs.content("/srv/keep.txt"), Some(b"old".to_vec()));
         let _ = std::fs::remove_dir_all(&local_dir);
     }
@@ -4743,7 +4725,7 @@ mod tests {
             )
             .expect("上传应正常入队");
         let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
-        let temp_str = temp_path.to_string_lossy().to_string();
+        let temp_str = temp_path.clone();
         gate.wait_arrived();
         service.cancel_task(&task.task_id).unwrap();
         gate.open();
@@ -4808,7 +4790,7 @@ mod tests {
             )
             .expect("上传应正常入队");
         let temp_path = upload_temp_path(&task.remote_path, &task.task_id);
-        let temp_str = temp_path.to_string_lossy().to_string();
+        let temp_str = temp_path.clone();
         gate.wait_arrived();
         gate.open();
 
