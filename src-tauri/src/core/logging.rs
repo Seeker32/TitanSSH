@@ -6,6 +6,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,9 @@ use crate::errors::app_error::{AppError, ErrorDetail};
 
 /// 日志文件名（位于 OS 应用日志目录）。
 const LOG_FILE_NAME: &str = "titanssh.log";
+
+/// Tauri 配置中的 bundle identifier；早期 panic 时尚无 AppHandle，只能通过该稳定值解析目录。
+const APP_IDENTIFIER: &str = "com.titanssh.desktop";
 
 /// 日志文件大小上限；启动时超过即截断，防止无限增长。
 /// ponytail: 单文件截断即可，需要滚动轮转时再引入轮转逻辑。
@@ -39,6 +43,67 @@ pub fn resolve_log_file_path(app_handle: &AppHandle) -> Result<PathBuf, AppError
         ))
     })?;
     Ok(log_dir.join(LOG_FILE_NAME))
+}
+
+/// 在 Tauri Builder 创建前解析 panic 日志文件路径；与 Tauri 的 app_log_dir 平台规则一致。
+/// 无法解析 OS 目录时回退到系统临时目录，确保无控制台的 release 构建仍保留诊断文件。
+fn early_panic_log_file_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let log_dir = dirs::home_dir()
+        .map(|home| home.join("Library").join("Logs").join(APP_IDENTIFIER))
+        .unwrap_or_else(|| std::env::temp_dir().join("TitanSSH").join("logs"));
+
+    #[cfg(not(target_os = "macos"))]
+    let log_dir = dirs::data_local_dir()
+        .map(|data| data.join(APP_IDENTIFIER).join("logs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("TitanSSH").join("logs"));
+
+    log_dir.join(LOG_FILE_NAME)
+}
+
+/// 直接追加启动前 panic 诊断；不依赖全局 Logger 或 Tauri AppHandle，调用方负责降级处理。
+fn write_early_panic_record(file_path: &Path, message: &str) -> Result<(), std::io::Error> {
+    let mut file = ensure_log_file(file_path)?;
+    let line = format_entry(
+        Level::Error,
+        "panic",
+        message,
+        &Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+    );
+    writeln!(file, "{line}")?;
+    file.flush()
+}
+
+/// 安装启动前 panic hook：Builder、context 或插件初始化失败时也写入文件日志。
+///
+/// 保留先前 hook，调试构建仍可在 stderr 获得标准 panic 输出；写入失败仅尝试 stderr，
+/// panic hook 本身绝不因日志失败再次 panic。
+pub fn install_early_panic_hook() {
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        let payload = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|value| (*value).to_string())
+            .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        let location = panic_info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = format!("{payload} at {location}");
+        if let Err(error) = write_early_panic_record(&early_panic_log_file_path(), &message) {
+            eprintln!("[TitanSSH] failed to persist early panic diagnostic: {error}");
+        }
+        previous_hook(panic_info);
+    }));
 }
 
 /// 日志文件存取适配器：查看器读取与导出复制（写入由全局 Logger 完成）。

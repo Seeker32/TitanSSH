@@ -293,6 +293,53 @@ mod integration_tests {
         }
     }
 
+    /// 关闭发生在连接等待期间时，终端工作线程必须在下一次短轮询后退出，
+    /// 而不是继续等待连接函数结束或消耗完整连接超时预算。
+    #[test]
+    fn shutdown_during_connect_wait_exits_terminal_worker_promptly() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        let (connect_started_tx, connect_started_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-shutdown-during-connect".to_string(),
+            command_rx,
+            shutdown.clone(),
+            runtime_status,
+            |_| Ok((Some("password".to_string()), None)),
+            test_allow_all_verifier(),
+            Box::new(move |_host, _password, _passphrase, _verifier, on_phase| {
+                on_phase(ConnectPhase::ConnectingTcp);
+                let _ = connect_started_tx.send(());
+                thread::sleep(Duration::from_secs(2));
+                Err(AppError::SshConnectionError(
+                    "connection refused".to_string().into(),
+                ))
+            }),
+            Duration::from_secs(5),
+            Box::new(move || {
+                let _ = exit_tx.send(());
+            }),
+        );
+
+        connect_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("连接工作线程应已开始");
+        shutdown.store(true, Ordering::Relaxed);
+
+        exit_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("关闭期间终端工作线程应立即退出");
+    }
+
     /// 主机身份等待用户决定期间不占用连接总超时：远超预算仍保持 Connecting，
     /// 接受后进入认证并连接成功。
     #[test]
@@ -323,6 +370,7 @@ mod integration_tests {
             }),
             // 预算远小于下方等待时长：验证等待期间不设独立自动超时
             Duration::from_millis(300),
+            Box::new(|| {}),
         );
 
         // challenge 出现后等待 1s（> 3× 预算），状态必须仍为 Connecting
@@ -404,6 +452,7 @@ mod integration_tests {
             connect_fn,
             // 预算远小于验证等待时长：预算在等待期间耗尽
             Duration::from_millis(300),
+            Box::new(|| {}),
         );
 
         // challenge 出现后等待超过预算，再接受
@@ -456,6 +505,7 @@ mod integration_tests {
                 blob: b"blob".to_vec(),
             }),
             Duration::from_secs(15),
+            Box::new(|| {}),
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -504,6 +554,7 @@ mod integration_tests {
                 blob: b"blob".to_vec(),
             }),
             Duration::from_secs(15),
+            Box::new(|| {}),
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -584,6 +635,7 @@ mod integration_tests {
                 ))
             }),
             Duration::from_secs(15),
+            Box::new(|| {}),
         );
 
         let deadline = Instant::now() + Duration::from_secs(7);

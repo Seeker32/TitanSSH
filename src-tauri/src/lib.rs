@@ -12,6 +12,11 @@ use crate::core::session_manager::SessionManager;
 use crate::core::sftp_service::SftpService;
 use tauri::Manager;
 
+/// 安装 Tauri 初始化前的 panic 文件日志 hook，供二进制入口在启动第一步调用。
+pub fn install_early_panic_hook() {
+    logging::install_early_panic_hook();
+}
+
 /// 初始化并启动 Tauri 应用
 ///
 /// 注册所有插件、全局状态和 invoke 命令处理器，
@@ -74,11 +79,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Titan SSH")
         .run(|app_handle, event| {
-            // 应用退出：取消全部主机身份等待者，等待中的连接不进入认证
-            if let tauri::RunEvent::Exit = event {
+            // 退出请求和最终退出均执行幂等的全量回收；前者让 worker 尽早收到关闭信号。
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
                 app_handle
-                    .state::<HostIdentityService>()
-                    .cancel_all(app_handle);
+                    .state::<SessionManager>()
+                    .shutdown_all(app_handle);
             }
         });
 }

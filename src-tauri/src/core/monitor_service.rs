@@ -229,6 +229,15 @@ impl MonitorService {
         }
     }
 
+    /// 停止全部监控任务并清空快照；应用退出时兜底回收不再关联 Session 的任务。
+    pub fn stop_all<R: Runtime>(&self, app: &AppHandle<R>) {
+        let task_ids: Vec<String> = lock_unpoisoned(&self.tasks).keys().cloned().collect();
+        for task_id in task_ids {
+            self.stop_monitoring(app, &task_id);
+        }
+        lock_unpoisoned(&self.snapshots).clear();
+    }
+
     /// 获取指定会话的最新监控快照
     ///
     /// # 参数

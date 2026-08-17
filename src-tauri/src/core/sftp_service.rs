@@ -906,6 +906,24 @@ impl SftpService {
         }
     }
 
+    /// 清理全部 SFTP capability 与传输任务；应用退出时覆盖已脱离 Session registry 的遗留项。
+    pub fn cleanup_all<R: Runtime>(&self, app: &AppHandle<R>) {
+        let session_ids: Vec<String> = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for session_id in session_ids {
+            self.cleanup_session(&session_id, app);
+        }
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     /// 返回指定 Session 的权威任务快照，按 createdAt 最新优先排序。
     ///
     /// 前端用快照重建投影以恢复错过的事件，后续事件继续增量更新；

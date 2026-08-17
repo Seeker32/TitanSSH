@@ -6,6 +6,7 @@ use crate::core::terminal_service::TerminalCommand;
 use crate::errors::app_error::AppError;
 use crate::models::host::HostConfig;
 use crate::models::session::{SessionInfo, SessionStatus};
+use log::warn;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -36,7 +37,7 @@ pub struct SessionHandle {
 /// 监控能力统一由 monitor_service 提供，不存在双轨实现。
 pub struct SessionManager {
     /// 存储所有活跃会话的 HashMap，键为 session_id
-    sessions: Mutex<HashMap<String, SessionHandle>>,
+    sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
     /// 独立监控服务，负责管理所有监控任务的生命周期（单一实现）
     monitor_service: MonitorService,
     /// File Transfer module，共享 clone 只复制内部 registry 引用。
@@ -53,7 +54,7 @@ impl SessionManager {
         identity_service: HostIdentityService,
     ) -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             monitor_service,
             sftp_service,
             identity_service,
@@ -129,6 +130,12 @@ impl SessionManager {
         );
 
         // 启动 terminal_service 工作线程（独立 SSH 连接、PTY、终端 IO）
+        let sessions_for_cleanup = Arc::clone(&self.sessions);
+        let monitor_service_for_cleanup = self.monitor_service.clone();
+        let sftp_service_for_cleanup = self.sftp_service.clone();
+        let identity_service_for_cleanup = self.identity_service.clone();
+        let app_for_cleanup = app.clone();
+        let session_id_for_cleanup = session_id.clone();
         terminal_service::start_terminal_session(
             app,
             host,
@@ -137,6 +144,16 @@ impl SessionManager {
             shutdown.clone(),
             runtime_status,
             verifier,
+            Box::new(move || {
+                cleanup_registered_session(
+                    &sessions_for_cleanup,
+                    &monitor_service_for_cleanup,
+                    &sftp_service_for_cleanup,
+                    &identity_service_for_cleanup,
+                    &session_id_for_cleanup,
+                    &app_for_cleanup,
+                );
+            }),
         );
 
         Ok(session_info)
@@ -156,7 +173,7 @@ impl SessionManager {
             .clone();
         command_tx
             .send(TerminalCommand::Write(data))
-            .map_err(|error| AppError::IoError(std::io::Error::other(error.to_string())))
+            .map_err(|_| AppError::SessionNotFound(session_id.to_string().into()))
     }
 
     /// 调整指定会话的终端大小
@@ -173,7 +190,7 @@ impl SessionManager {
             .clone();
         command_tx
             .send(TerminalCommand::Resize { cols, rows })
-            .map_err(|error| AppError::IoError(std::io::Error::other(error.to_string())))
+            .map_err(|_| AppError::SessionNotFound(session_id.to_string().into()))
     }
 
     /// 关闭指定会话
@@ -189,24 +206,44 @@ impl SessionManager {
         session_id: &str,
         app: &AppHandle<R>,
     ) -> Result<(), AppError> {
-        let handle = self
+        if cleanup_registered_session(
+            &self.sessions,
+            &self.monitor_service,
+            &self.sftp_service,
+            &self.identity_service,
+            session_id,
+            app,
+        ) {
+            Ok(())
+        } else {
+            Err(AppError::SessionNotFound(session_id.to_string().into()))
+        }
+    }
+
+    /// 协调应用退出：关闭全部 Terminal、取消 File Transfer、停止 Monitoring 并撤销主机身份等待者。
+    ///
+    /// ExitRequested 与 Exit 可重复调用；各 service teardown 均按 registry miss 幂等处理。
+    pub fn shutdown_all<R: Runtime>(&self, app: &AppHandle<R>) {
+        let session_ids: Vec<String> = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(session_id)
-            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string().into()))?;
-        // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
-        self.identity_service.cancel_session(app, session_id);
-        // 通知所有工作线程退出
-        handle.shutdown.store(true, Ordering::Relaxed);
-        // 发送关闭命令到终端工作线程
-        let _ = handle.command_tx.send(TerminalCommand::Close);
-        // 停止该会话的全部监控任务（每个任务补发 Done 终态事件），
-        // teardown 不再依赖前端调用顺序
-        self.monitor_service.stop_session(app, session_id);
-        // 清理 SFTP 状态，取消所有 Pending/Running 任务并推送 sftp:task_status = Cancelled
-        self.sftp_service.cleanup_session(session_id, app);
-        Ok(())
+            .keys()
+            .cloned()
+            .collect();
+        for session_id in session_ids {
+            cleanup_registered_session(
+                &self.sessions,
+                &self.monitor_service,
+                &self.sftp_service,
+                &self.identity_service,
+                &session_id,
+                app,
+            );
+        }
+        self.monitor_service.stop_all(app);
+        self.sftp_service.cleanup_all(app);
+        self.identity_service.cancel_all(app);
     }
 
     /// 获取所有活跃会话的列表
@@ -281,6 +318,44 @@ impl SessionManager {
             },
         );
     }
+}
+
+/// 回收已注册会话及其所属的所有后台资源。
+///
+/// 显式关闭和终端工作线程退出共享这一路径；若另一方已先完成回收，返回 false，
+/// 以保证并发 teardown 幂等且不会重复推送取消事件。
+fn cleanup_registered_session<R: Runtime>(
+    sessions: &Arc<Mutex<HashMap<String, SessionHandle>>>,
+    monitor_service: &MonitorService,
+    sftp_service: &SftpService,
+    identity_service: &HostIdentityService,
+    session_id: &str,
+    app: &AppHandle<R>,
+) -> bool {
+    let Some(handle) = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id)
+    else {
+        return false;
+    };
+
+    // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
+    identity_service.cancel_session(app, session_id);
+    // 通知所有工作线程退出
+    handle.shutdown.store(true, Ordering::Relaxed);
+    // 发送关闭命令到终端工作线程；接收端已退出时仍继续其余回收，但记录可观测诊断。
+    if let Err(error) = handle.command_tx.send(TerminalCommand::Close) {
+        warn!(
+            "[session:{}][diagnostic] Failed to deliver terminal close command: {}",
+            session_id, error
+        );
+    }
+    // 停止该会话的全部监控任务（每个任务补发 Done 终态事件）
+    monitor_service.stop_session(app, session_id);
+    // 清理 SFTP 状态，取消所有 Pending/Running 任务并推送 sftp:task_status = Cancelled
+    sftp_service.cleanup_session(session_id, app);
+    true
 }
 
 #[cfg(test)]

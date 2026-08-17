@@ -64,6 +64,33 @@ type TerminalConnectFn = Box<
         + Send,
 >;
 
+/// 终端工作线程退出时调用的回收回调，由会话协调层释放 Session 所属资源。
+type TerminalExitFn = Box<dyn FnOnce() + Send>;
+
+/// 终端工作线程退出守卫，确保所有 return、断开及显式关闭路径都会通知协调层。
+struct TerminalExitGuard {
+    /// 工作线程退出后执行一次的资源回收回调
+    on_exit: Option<TerminalExitFn>,
+}
+
+impl TerminalExitGuard {
+    /// 创建终端退出守卫，接管工作线程结束时的资源回收回调。
+    fn new(on_exit: TerminalExitFn) -> Self {
+        Self {
+            on_exit: Some(on_exit),
+        }
+    }
+}
+
+impl Drop for TerminalExitGuard {
+    /// 线程作用域结束时执行会话资源回收，保证失败分支不依赖前端事件处理。
+    fn drop(&mut self) {
+        if let Some(on_exit) = self.on_exit.take() {
+            on_exit();
+        }
+    }
+}
+
 /// 启动终端服务工作线程
 ///
 /// 负责从安全存储读取凭据、建立 SSH 连接（含首次主机身份确认）、请求 PTY、启动 Shell，
@@ -77,6 +104,7 @@ type TerminalConnectFn = Box<
 /// - `shutdown`: 关闭标志，设置为 true 时工作线程退出
 /// - `runtime_status`: 后端权威会话状态，事件发出前先更新
 /// - `verifier`: 主机身份统一校验器（握手后、认证前生效）
+/// - `on_exit`: 工作线程结束时通知会话协调层回收关联资源
 pub fn start_terminal_session<R: Runtime>(
     app: AppHandle<R>,
     host: HostConfig,
@@ -85,6 +113,7 @@ pub fn start_terminal_session<R: Runtime>(
     shutdown: Arc<AtomicBool>,
     runtime_status: Arc<Mutex<SessionStatus>>,
     verifier: HostKeyVerifier,
+    on_exit: TerminalExitFn,
 ) {
     start_terminal_session_with_parts(
         app,
@@ -101,6 +130,7 @@ pub fn start_terminal_session<R: Runtime>(
             },
         ),
         Duration::from_secs(CONNECT_TOTAL_TIMEOUT_SECS),
+        on_exit,
     );
 }
 
@@ -117,11 +147,13 @@ fn start_terminal_session_with_parts<R, F>(
     verifier: HostKeyVerifier,
     connect_fn: TerminalConnectFn,
     connect_timeout: Duration,
+    on_exit: TerminalExitFn,
 ) where
     R: Runtime,
     F: FnOnce(&HostConfig) -> Result<(Option<String>, Option<String>), AppError> + Send + 'static,
 {
     thread::spawn(move || {
+        let _exit_guard = TerminalExitGuard::new(on_exit);
         // 系统安全存储首次访问可能等待用户授权；终端工作线程直接等待授权结果
         // ponytail: Keychain API 无法取消；先等待系统结果，若出现真实永久挂起再引入可取消凭据代理。
         emit_connection_progress(&app, &session_id, ConnectionPhase::LoadingCredentials);
@@ -150,6 +182,15 @@ fn start_terminal_session_with_parts<R, F>(
             }
         };
         let (password, passphrase) = credentials;
+
+        // 系统凭据读取不可中断；一旦返回，优先处理关闭请求，避免继续启动连接线程。
+        if shutdown.load(Ordering::Relaxed) {
+            info!(
+                "[session:{}][diagnostic] Shutdown requested after credential loading",
+                session_id
+            );
+            return;
+        }
 
         // 将 SSH 连接（TCP握手 + SSH握手 + 认证）放到独立线程执行，
         // 外层通过 channel + recv_timeout 实现真正的连接阶段超时。
@@ -193,9 +234,27 @@ fn start_terminal_session_with_parts<R, F>(
         let mut overall_deadline = Instant::now() + connect_timeout;
         let mut verify_wait_start: Option<Instant> = None;
         let mut terminal = loop {
+            // connect_fn 可能被底层 SSH 库阻塞；外层必须在每个短轮询周期响应关闭。
+            if shutdown.load(Ordering::Relaxed) {
+                info!(
+                    "[session:{}][diagnostic] Shutdown requested while waiting for connection",
+                    session_id
+                );
+                return;
+            }
             let active_phase = current_phase_value(&current_phase);
             match conn_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Ok(terminal)) => break terminal,
+                Ok(Ok(terminal)) => {
+                    // recv_timeout 返回时关闭可能刚刚发生，不得继续发布 Connected 状态。
+                    if shutdown.load(Ordering::Relaxed) {
+                        info!(
+                            "[session:{}][diagnostic] Shutdown requested after connection completed",
+                            session_id
+                        );
+                        return;
+                    }
+                    break terminal;
+                }
                 Ok(Err(error)) => {
                     let (status, message) = map_phase_error_to_status(&active_phase, &error);
                     emit_session_status(&app, &session_id, &runtime_status, status, message);

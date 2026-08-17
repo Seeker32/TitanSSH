@@ -42,6 +42,52 @@ mod tests {
         }
     }
 
+    /// 终端工作线程已退出并释放命令接收端后，写入与调整尺寸必须报告会话不可用，
+    /// 不得将 channel SendError 伪装为底层 IO 故障。
+    #[test]
+    fn terminal_commands_with_dropped_receiver_return_session_not_found() {
+        let manager = make_manager();
+        let session_id = "session-terminal-worker-exited";
+        manager.insert_session_for_test(session_id, make_host("host-1"));
+
+        for result in [
+            manager.write_terminal(session_id, "echo test".to_string()),
+            manager.resize_terminal(session_id, 120, 40),
+        ] {
+            match result.unwrap_err() {
+                AppError::SessionNotFound(id) => assert_eq!(id.to_string(), session_id),
+                other => panic!("期望 SessionNotFound，实际: {other:?}"),
+            }
+        }
+    }
+
+    /// 应用退出必须一次性回收全部 Session 与 SFTP capability；重复调用不得复活或遗留资源。
+    #[test]
+    fn shutdown_all_reaps_every_session_and_sftp_registration() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let sftp_service = SftpService::with_connector(|_, _| {
+            Err(AppError::SshConnectionError("unused".to_string().into()))
+        });
+        let manager = SessionManager::new(
+            MonitorService::new(),
+            sftp_service.clone(),
+            HostIdentityService::new(),
+        );
+        for session_id in ["session-exit-a", "session-exit-b"] {
+            manager.insert_session_for_test(session_id, make_host(session_id));
+            sftp_service.register_session(session_id.to_string(), make_host(session_id));
+        }
+
+        manager.shutdown_all(app.handle());
+        manager.shutdown_all(app.handle());
+
+        assert!(manager.list_sessions().is_empty());
+        assert!(!sftp_service.has_session("session-exit-a"));
+        assert!(!sftp_service.has_session("session-exit-b"));
+    }
+
     /// list_sessions 必须读取后端运行时状态，不依赖前端回写。
     #[test]
     fn list_sessions_reads_backend_runtime_status() {
@@ -95,6 +141,43 @@ mod tests {
             .unwrap();
 
         assert!(sftp_service.has_session(&session.session_id));
+    }
+
+    /// 终端连接在读取凭据阶段失败时，后端必须自行回收 Session 和 SFTP 状态，
+    /// 不得依赖前端收到状态事件后再调用 close_session。
+    #[test]
+    fn terminal_startup_failure_reaps_session_and_sftp_registration() {
+        use std::time::{Duration, Instant};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let sftp_service = SftpService::with_connector(|_, _| {
+            Err(AppError::SshConnectionError(
+                "expected test failure".to_string().into(),
+            ))
+        });
+        let manager = SessionManager::new(
+            MonitorService::new(),
+            sftp_service.clone(),
+            HostIdentityService::new(),
+        );
+        let mut host = make_host("host-terminal-startup-failure");
+        host.password_ref = None;
+
+        let session = manager.open_session(app.handle().clone(), host).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !manager.list_sessions().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            manager.list_sessions().is_empty(),
+            "凭据加载失败后不得保留已终态 Session"
+        );
+        assert!(
+            !sftp_service.has_session(&session.session_id),
+            "凭据加载失败后必须清理该 Session 的 SFTP 注册"
+        );
     }
 
     /// close_session 必须取消该 Session 等待中的主机身份验证并清除临时信任。

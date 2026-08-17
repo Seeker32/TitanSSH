@@ -2,7 +2,7 @@
 mod tests {
     use crate::core::logging::{
         LOG_FILE_NAME, LOG_MAX_BYTES, LOG_VIEW_MAX_LINES, LogStore, ensure_log_file, format_entry,
-        install_logger, logger_install_recorded,
+        install_logger, logger_install_recorded, write_early_panic_record,
     };
     use log::Level;
     use std::fs::{self, OpenOptions};
@@ -43,6 +43,21 @@ mod tests {
         assert_eq!(
             line,
             "2025-06-01 14:30:00.123 [ERROR] core::ssh: 第一行\\n第二行\\r\\n[INFO] fake-target: pwned"
+        );
+    }
+
+    /// Tauri setup 前发生的 panic 也必须直接追加到日志文件，不能依赖已安装的全局 Logger。
+    #[test]
+    fn early_panic_writer_persists_diagnostic_without_global_logger() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+
+        write_early_panic_record(&path, "startup context generation failed").unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(
+            content.contains("[ERROR] panic: startup context generation failed"),
+            "早期 panic 诊断必须写入文件，实际内容: {content}"
         );
     }
 
