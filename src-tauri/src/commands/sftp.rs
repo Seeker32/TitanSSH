@@ -54,29 +54,33 @@ pub async fn sftp_download<R: Runtime>(
 
 /// 发起文件上传任务，立即返回 status = Pending 的 TransferTask
 ///
+/// 异步 command：入队前需检查本地文件是否存在并读取元数据；这些文件系统调用
+/// 在 SMB/NFS/FUSE 等挂载上可能长时间等待，必须在线程池执行而不能占用 Tauri 主线程。
+///
 /// # 参数
 /// - `session_id`: 关联的 SSH 会话 ID
 /// - `local_path`: 本地文件完整路径
 /// - `remote_path`: 远程目标目录路径（后端自动拼接文件名）
 /// - `conflict_strategy`: 目标已存在时的处理策略，缺省 Reject（拒绝覆盖）
 #[tauri::command]
-pub fn sftp_upload<R: Runtime>(
+pub async fn sftp_upload<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
     local_path: String,
     remote_path: String,
     conflict_strategy: Option<ConflictStrategy>,
-    sftp_service: State<'_, SftpService>,
 ) -> Result<TransferTask, AppErrorInfo> {
-    sftp_service
-        .enqueue_upload(
+    let service = app.state::<SftpService>().inner().clone();
+    run_blocking_op(move || {
+        service.enqueue_upload(
             session_id,
             local_path,
             remote_path,
             conflict_strategy.unwrap_or_default(),
             app,
         )
-        .map_err(AppErrorInfo::from)
+    })
+    .await
 }
 
 /// 取消指定传输任务；任务不存在时拒绝并返回结构化错误，已终态任务静默成功

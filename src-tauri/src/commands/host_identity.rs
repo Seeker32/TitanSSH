@@ -1,3 +1,4 @@
+use crate::commands::run_blocking_op;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::AppErrorInfo;
 use crate::models::host_identity::TrustedHostInfo;
@@ -9,14 +10,15 @@ use tauri::{AppHandle, State};
 /// port 稳定排序），返回 endpoint、算法与 SHA-256 指纹的 typed JSON。
 /// 信任存储读取/解析失败时以 TrustStoreError 结构化返回，绝不伪装成空列表；
 /// 前端只消费本结果，不解析 known_hosts 文本。
+///
+/// 异步 command：known_hosts 的完整读取与解析可能被慢速文件系统阻塞，必须在线程池
+/// 执行，避免占用 Tauri 主线程。
 #[tauri::command]
-pub fn list_trusted_hosts(
+pub async fn list_trusted_hosts(
     session_manager: State<'_, SessionManager>,
 ) -> Result<Vec<TrustedHostInfo>, AppErrorInfo> {
-    session_manager
-        .identity_service()
-        .list_trusted_hosts()
-        .map_err(AppErrorInfo::from)
+    let identity_service = session_manager.identity_service().clone();
+    run_blocking_op(move || identity_service.list_trusted_hosts()).await
 }
 
 /// 仅本次接受未知主机身份
@@ -41,16 +43,17 @@ pub fn accept_host_identity(
 /// 随后与 accept 一致：为该 Runtime Session 记录临时信任并唤醒全部等待连接。
 /// 保存失败时 challenge 保持未决并以 HostKeySaveFailed 结构化返回，
 /// 前端保持确认卡并展示错误，可重试保存、改选仅本次接受或拒绝。
+///
+/// 异步 command：known_hosts 的安全发布包含阻塞文件 I/O，并会在保存期间持有
+/// host-identity 状态锁；该过程必须在线程池执行，不能阻塞命令分发线程。
 #[tauri::command]
-pub fn accept_and_save_host_identity(
+pub async fn accept_and_save_host_identity(
     app: AppHandle,
     challenge_id: String,
     session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
-    session_manager
-        .identity_service()
-        .accept_and_save(&app, &challenge_id)
-        .map_err(AppErrorInfo::from)
+    let identity_service = session_manager.identity_service().clone();
+    run_blocking_op(move || identity_service.accept_and_save(&app, &challenge_id)).await
 }
 
 /// 拒绝未知主机身份并关闭整个 Session

@@ -1,8 +1,21 @@
+use crate::commands::run_blocking_op;
 use crate::core::host_service::SharedHostConfigService;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use crate::models::session::SessionInfo;
 use tauri::{AppHandle, Manager, State};
+
+/// 在阻塞线程池读取打开会话所需的主机配置。
+///
+/// hosts.json 的读取可能因磁盘延迟或大型配置文件而阻塞；此处确保该工作不占用
+/// Tauri 主线程。调用方仍负责把已读取的配置交给 session_manager 创建 Runtime Session。
+async fn run_host_lookup<T, F>(lookup: F) -> Result<T, AppErrorInfo>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+{
+    run_blocking_op(lookup).await
+}
 
 /// 打开新的 SSH 会话
 ///
@@ -14,16 +27,21 @@ use tauri::{AppHandle, Manager, State};
 /// - `host_id`: 目标主机的唯一标识符
 /// - `session_manager`: 会话管理器状态
 #[tauri::command]
-pub fn open_session(
+pub async fn open_session(
     app: AppHandle,
     host_id: String,
     session_manager: State<'_, SessionManager>,
 ) -> Result<SessionInfo, AppErrorInfo> {
-    // 从受管共享服务持锁查询主机配置（与 save/delete 串行化，避免读到半写入文件）
-    let host = app
-        .state::<SharedHostConfigService>()
-        .with_locked(|service| service.get_host(&host_id))
-        .map_err(AppErrorInfo::from)?
+    // 从受管共享服务持锁查询主机配置（与 save/delete 串行化，避免读到半写入文件）；
+    // hosts.json 的同步读取在线程池完成，不得占用 Tauri 主线程。
+    let app_for_lookup = app.clone();
+    let lookup_host_id = host_id.clone();
+    let host = run_host_lookup(move || {
+        app_for_lookup
+            .state::<SharedHostConfigService>()
+            .with_locked(|service| service.get_host(&lookup_host_id))
+    })
+    .await?
         .ok_or_else(|| {
             AppErrorInfo::from(AppError::InvalidHostConfig(
                 format!("Host not found: {host_id}").into(),
@@ -35,6 +53,10 @@ pub fn open_session(
         .open_session(app, host)
         .map_err(AppErrorInfo::from)
 }
+
+#[cfg(test)]
+#[path = "session_test.rs"]
+mod tests;
 
 /// 关闭指定 SSH 会话
 ///
