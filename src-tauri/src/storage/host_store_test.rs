@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::models::host::{AuthType, HostConfig};
-    use crate::storage::host_store::{HostStore, migrate_legacy_hosts};
+    use crate::storage::host_store::{migrate_legacy_hosts, HostStore};
     use proptest::prelude::*;
     use std::fs;
     use std::path::PathBuf;
@@ -77,9 +77,10 @@ mod tests {
         );
     }
 
-    /// 旧路径不可复制时返回存储错误，不静默丢失主机配置
+    /// 旧路径不可读取时保留诊断错误，供 HostStore::new 记录日志后继续启动；
+    /// 旧路径恢复正常后，后续启动可重试迁移。
     #[test]
-    fn migrate_legacy_hosts_reports_copy_failure() {
+    fn migrate_legacy_hosts_reports_read_failure_and_can_retry() {
         let root = std::env::temp_dir().join(format!("titan-host-migration-{}", Uuid::new_v4()));
         let legacy_file = root.join("legacy-directory");
         let new_file = root.join("production/hosts.json");
@@ -88,9 +89,21 @@ mod tests {
             .expect("production dir should be created");
 
         let error = migrate_legacy_hosts(&legacy_file, &new_file)
-            .expect_err("copying a directory as hosts.json should fail");
+            .expect_err("reading a directory as hosts.json should fail");
 
-        assert!(error.to_string().contains("迁移旧主机配置失败"));
+        assert!(error.to_string().contains("读取旧主机配置失败"));
+        assert!(
+            !new_file.exists(),
+            "失败的可选迁移不得创建或破坏正式 hosts.json"
+        );
+
+        fs::remove_dir(&legacy_file).expect("legacy directory should be removable");
+        fs::write(&legacy_file, "legacy hosts").expect("legacy hosts should be written");
+        migrate_legacy_hosts(&legacy_file, &new_file).expect("repaired legacy source should retry");
+        assert_eq!(
+            fs::read_to_string(new_file).expect("production hosts should exist"),
+            "legacy hosts"
+        );
     }
 
     #[test]
@@ -196,6 +209,44 @@ mod tests {
 
         let error = store.load().expect_err("load should fail");
         assert!(error.to_string().contains("解析主机配置文件失败"));
+    }
+
+    /// 解析失败时必须隔离损坏配置，使下一次启动可将其视为空配置，且保留原始内容
+    /// 供用户恢复。
+    #[test]
+    fn load_quarantines_corrupt_file_and_allows_subsequent_empty_load() {
+        let file_path = temp_hosts_file();
+        let corrupt_content = "{not-json";
+        fs::write(&file_path, corrupt_content).expect("invalid json should be written");
+        let store = HostStore::from_file_path(file_path.clone());
+
+        let error = store
+            .load()
+            .expect_err("corrupt hosts file should report an error");
+        assert!(error.to_string().contains("解析主机配置文件失败"));
+        assert!(
+            !file_path.exists(),
+            "损坏文件必须从 hosts.json 原路径移走，避免阻断后续加载"
+        );
+
+        let backup_path = fs::read_dir(file_path.parent().expect("parent should exist"))
+            .expect("host directory should be readable")
+            .map(|entry| entry.expect("directory entry should be readable").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("hosts.json.corrupt-"))
+            })
+            .expect("损坏文件必须被保留为独立备份");
+        assert_eq!(
+            fs::read_to_string(backup_path).expect("corrupt backup should be readable"),
+            corrupt_content,
+            "备份必须保留原始损坏内容"
+        );
+        assert!(store
+            .load()
+            .expect("quarantine 后的下一次加载应视为空配置")
+            .is_empty());
     }
 
     /// 生成任意合法 AuthType 的策略

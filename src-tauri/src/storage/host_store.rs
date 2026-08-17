@@ -1,26 +1,82 @@
 use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::HostConfig;
-use std::fs;
+use log::{debug, info, warn};
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
+use uuid::Uuid;
 
 const LEGACY_IDENTIFIER: &str = "dev.titanssh.ssh-terminal-manager";
 const HOSTS_FILE_NAME: &str = "hosts.json";
 
-/// 将开发期 identifier 目录中的主机配置复制到正式目录
+/// 为损坏的主机配置生成同目录且唯一的隔离备份路径。
+fn corrupt_hosts_backup_path(file_path: &Path) -> PathBuf {
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(HOSTS_FILE_NAME);
+    file_path.with_file_name(format!("{file_name}.corrupt-{}", Uuid::new_v4()))
+}
+
+/// 将开发期 identifier 目录中的主机配置复制到正式目录。
+///
+/// 使用 `create_new` 原子地声明正式 hosts.json，避免先检查文件存在性再写入的
+/// TOCTOU 竞争；文件已存在或旧文件不存在均为正常跳过。
 fn migrate_legacy_hosts(legacy_file: &Path, new_file: &Path) -> Result<(), AppError> {
-    if new_file.exists() || !legacy_file.exists() {
-        return Ok(());
+    let legacy_content = match fs::read(legacy_file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            debug!(
+                "[host-store][migration] Legacy hosts file is absent; migration skipped: {}",
+                legacy_file.display()
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(AppError::StorageError(ErrorDetail::msg(
+                "读取旧主机配置失败: {0}",
+                vec![error.to_string()],
+            )));
+        }
+    };
+
+    let mut new_hosts = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(new_file)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            debug!(
+                "[host-store][migration] Production hosts file already exists; migration skipped: {}",
+                new_file.display()
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(AppError::StorageError(ErrorDetail::msg(
+                "创建迁移后的主机配置失败: {0}",
+                vec![error.to_string()],
+            )));
+        }
+    };
+
+    if let Err(error) = new_hosts.write_all(&legacy_content) {
+        // Windows 不允许删除仍被本进程持有的文件，先关闭再清理部分写入结果。
+        drop(new_hosts);
+        let _ = fs::remove_file(new_file);
+        return Err(AppError::StorageError(ErrorDetail::msg(
+            "迁移旧主机配置失败: {0}",
+            vec![error.to_string()],
+        )));
     }
 
-    fs::copy(legacy_file, new_file)
-        .map(|_| ())
-        .map_err(|error| {
-            AppError::StorageError(ErrorDetail::msg(
-                "迁移旧主机配置失败: {0}",
-                vec![error.to_string()],
-            ))
-        })?;
+    info!(
+        "[host-store][migration] Migrated legacy hosts file: {} -> {}",
+        legacy_file.display(),
+        new_file.display()
+    );
     Ok(())
 }
 
@@ -57,7 +113,14 @@ impl HostStore {
         let file_path = app_data_dir.join(HOSTS_FILE_NAME);
         if let Some(data_root) = app_data_dir.parent() {
             let legacy_file = data_root.join(LEGACY_IDENTIFIER).join(HOSTS_FILE_NAME);
-            migrate_legacy_hosts(&legacy_file, &file_path)?;
+            if let Err(error) = migrate_legacy_hosts(&legacy_file, &file_path) {
+                // 旧配置仅是可选的一次性迁移源；失败不能阻断正式存储的首次使用，
+                // 下次启动仍会重试，诊断保留在日志中供排查。
+                warn!(
+                    "[host-store][migration] Legacy hosts migration failed; continuing with production store: {}",
+                    error
+                );
+            }
         }
 
         Ok(Self { file_path })
@@ -72,31 +135,39 @@ impl HostStore {
     /// 从持久化存储加载所有主机配置
     ///
     /// 若 hosts.json 不存在则返回空列表（首次运行场景）。
-    /// 文件存在但内容非法时返回 StorageError。
+    /// 文件读取期间消失同样返回空列表；内容非法时隔离损坏文件后返回 StorageError。
     ///
     /// # 返回
     /// 成功返回主机配置列表，失败返回 StorageError
     pub fn load(&self) -> Result<Vec<HostConfig>, AppError> {
-        // 文件不存在时返回空列表，对应首次运行场景
-        if !self.file_path.exists() {
-            return Ok(Vec::new());
+        let content = match fs::read_to_string(&self.file_path) {
+            Ok(content) => content,
+            // 不预先检查 exists，避免文件在检查和读取之间消失时被误报为存储错误。
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::StorageError(ErrorDetail::msg(
+                    "读取主机配置文件失败: {0}",
+                    vec![error.to_string()],
+                )));
+            }
+        };
+
+        match serde_json::from_str(&content) {
+            Ok(hosts) => Ok(hosts),
+            Err(parse_error) => {
+                let backup_path = corrupt_hosts_backup_path(&self.file_path);
+                match fs::rename(&self.file_path, &backup_path) {
+                    Ok(()) => Err(AppError::StorageError(ErrorDetail::msg(
+                        "解析主机配置文件失败: {0}；损坏文件已隔离至: {1}",
+                        vec![parse_error.to_string(), backup_path.display().to_string()],
+                    ))),
+                    Err(quarantine_error) => Err(AppError::StorageError(ErrorDetail::msg(
+                        "解析主机配置文件失败: {0}；隔离损坏文件失败: {1}",
+                        vec![parse_error.to_string(), quarantine_error.to_string()],
+                    ))),
+                }
+            }
         }
-
-        let content = fs::read_to_string(&self.file_path).map_err(|error| {
-            AppError::StorageError(ErrorDetail::msg(
-                "读取主机配置文件失败: {0}",
-                vec![error.to_string()],
-            ))
-        })?;
-
-        let hosts: Vec<HostConfig> = serde_json::from_str(&content).map_err(|error| {
-            AppError::StorageError(ErrorDetail::msg(
-                "解析主机配置文件失败: {0}",
-                vec![error.to_string()],
-            ))
-        })?;
-
-        Ok(hosts)
     }
 
     /// 将主机配置列表持久化到 hosts.json
