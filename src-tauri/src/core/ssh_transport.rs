@@ -575,7 +575,7 @@ pub(crate) mod test_support {
         TerminalTransport,
     };
     use crate::errors::app_error::{AppError, ErrorDetail};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
@@ -1493,6 +1493,82 @@ pub(crate) mod test_support {
             }
         }
         TerminalTransport::from_backend(IdleTerminal)
+    }
+
+    /// 构建写入必定失败但读取保持空闲的终端 capability，供终端断开契约测试使用。
+    pub(crate) fn write_failing_terminal() -> TerminalTransport {
+        struct WriteFailingTerminal;
+
+        impl TerminalOps for WriteFailingTerminal {
+            /// 始终无数据可读，确保测试仅由写入失败驱动断开。
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "idle"))
+            }
+
+            /// 模拟失效 SSH channel 的写入错误。
+            fn write(&mut self, _data: &str) -> Result<(), AppError> {
+                Err(AppError::SshConnectionError("terminal write failed".to_string().into()))
+            }
+
+            /// 测试 capability 忽略窗口大小调整。
+            fn resize(&mut self, _cols: u32, _rows: u32) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            /// 保持非 EOF，确保实现不能依赖读路径发现断开。
+            fn eof(&self) -> bool {
+                false
+            }
+
+            /// 测试 capability 关闭为 no-op。
+            fn close(&mut self) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+
+        TerminalTransport::from_backend(WriteFailingTerminal)
+    }
+
+    /// 构建按预设字节块读取的终端 capability，供终端流事件契约测试模拟分块读取。
+    pub(crate) fn chunked_terminal(chunks: Vec<Vec<u8>>) -> TerminalTransport {
+        struct ChunkedTerminal {
+            chunks: VecDeque<Vec<u8>>,
+        }
+
+        impl TerminalOps for ChunkedTerminal {
+            /// 将下一段预设字节复制到读取缓冲区，所有分块读完后返回零字节。
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                buffer[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+
+            /// 测试 capability 不保留终端输入。
+            fn write(&mut self, _data: &str) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            /// 测试 capability 忽略窗口大小调整。
+            fn resize(&mut self, _cols: u32, _rows: u32) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            /// 预设分块全部读取后报告 EOF。
+            fn eof(&self) -> bool {
+                self.chunks.is_empty()
+            }
+
+            /// 测试 capability 关闭为 no-op。
+            fn close(&mut self) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+
+        TerminalTransport::from_backend(ChunkedTerminal {
+            chunks: chunks.into(),
+        })
     }
 
     pub(crate) fn empty_sftp() -> SftpTransport {

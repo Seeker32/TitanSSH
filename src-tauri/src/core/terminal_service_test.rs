@@ -340,6 +340,211 @@ mod integration_tests {
             .expect("关闭期间终端工作线程应立即退出");
     }
 
+    /// 连接等待期间收到 Close 命令时，终端工作线程必须立即退出，且不得为已关闭
+    /// 的 Session 发布 Connected 状态。
+    #[test]
+    fn close_command_during_connect_wait_exits_without_connected_status() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let (command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        let (connect_started_tx, connect_started_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-close-during-connect".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| Ok((Some("password".to_string()), None)),
+            test_allow_all_verifier(),
+            Box::new(move |_host, _password, _passphrase, _verifier, on_phase| {
+                on_phase(ConnectPhase::ConnectingTcp);
+                let _ = connect_started_tx.send(());
+                thread::sleep(Duration::from_secs(2));
+                Ok(crate::core::ssh_transport::test_support::idle_terminal())
+            }),
+            Duration::from_secs(5),
+            Box::new(move || {
+                let _ = exit_tx.send(());
+            }),
+        );
+
+        connect_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("连接工作线程应已开始");
+        command_tx
+            .send(TerminalCommand::Close)
+            .expect("关闭命令应可发送到终端工作线程");
+
+        exit_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("连接等待期间收到 Close 后终端工作线程应立即退出");
+        assert_eq!(
+            *runtime_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            SessionStatus::Connecting,
+            "已关闭的 Session 不得在连接完成前发布 Connected 状态"
+        );
+    }
+
+    /// 写入失败意味着终端通道已失效：工作线程必须只派发一次 Disconnected 并退出，
+    /// 不得保留在循环中为后续按键重复派发 Error。
+    #[test]
+    fn write_failure_disconnects_and_exits_terminal_worker() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let statuses_for_listener = statuses.clone();
+        {
+            use tauri::Listener;
+            app.listen("session:status", move |event| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(event.payload()).expect("状态事件应为结构化数据");
+                statuses_for_listener
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(
+                        payload["status"]
+                            .as_str()
+                            .expect("状态事件必须包含字符串 status 字段")
+                            .to_string(),
+                    );
+            });
+        }
+
+        let (command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        let (exit_tx, exit_rx) = mpsc::channel();
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-write-failure".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| Ok((Some("password".to_string()), None)),
+            test_allow_all_verifier(),
+            Box::new(|_host, _password, _passphrase, _verifier, _on_phase| {
+                Ok(crate::core::ssh_transport::test_support::write_failing_terminal())
+            }),
+            Duration::from_secs(1),
+            Box::new(move || {
+                let _ = exit_tx.send(());
+            }),
+        );
+
+        command_tx
+            .send(TerminalCommand::Write("echo test\n".to_string()))
+            .expect("写入命令应可发送到终端工作线程");
+        exit_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("写入失败后终端工作线程应退出");
+
+        assert_eq!(
+            *runtime_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            SessionStatus::Disconnected,
+            "写入失败后会话应进入 Disconnected 状态"
+        );
+        assert_eq!(
+            *statuses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["Connected", "Disconnected"],
+            "写入失败不得派发 Error 或留下可重复派发状态的工作线程"
+        );
+        assert!(
+            command_tx
+                .send(TerminalCommand::Write("ignored\n".to_string()))
+                .is_err(),
+            "工作线程退出后不应继续接收写入命令"
+        );
+    }
+
+    /// 终端输出中的 UTF-8 字符跨两次底层读取时，terminal:data 事件合并后必须与
+    /// 原始文本完全一致，且不得产生替换字符。
+    #[test]
+    fn terminal_data_events_preserve_utf8_character_split_across_reads() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let received_data = Arc::new(Mutex::new(Vec::new()));
+        let received_data_for_listener = received_data.clone();
+        {
+            use tauri::Listener;
+            app.listen("terminal:data", move |event| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(event.payload()).expect("终端事件应为结构化数据");
+                received_data_for_listener
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(
+                        payload["data"]
+                            .as_str()
+                            .expect("终端事件必须包含字符串 data 字段")
+                            .to_string(),
+                    );
+            });
+        }
+
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        let (exit_tx, exit_rx) = mpsc::channel();
+        // 使 4096 字节读取恰好以 "中" 的前两个 UTF-8 字节结束，模拟生产缓冲区边界。
+        let mut first_chunk = vec![b'x'; 4094];
+        first_chunk.extend_from_slice(b"\xE4\xB8");
+        let expected = format!("{}中B", "x".repeat(4094));
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-split-utf8".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status,
+            |_| Ok((Some("password".to_string()), None)),
+            test_allow_all_verifier(),
+            Box::new(move |_host, _password, _passphrase, _verifier, _on_phase| {
+                // "中" 的 UTF-8 编码为 E4 B8 AD，故该字符被刻意拆在两个读取块之间。
+                Ok(crate::core::ssh_transport::test_support::chunked_terminal(
+                    vec![first_chunk, b"\xADB".to_vec()],
+                ))
+            }),
+            Duration::from_secs(1),
+            Box::new(move || {
+                let _ = exit_tx.send(());
+            }),
+        );
+
+        exit_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("预设终端输出读取结束后工作线程应退出");
+
+        let data = received_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .join("");
+        assert_eq!(data, expected, "跨读取边界的 UTF-8 字符不得损坏");
+        assert!(
+            !data.contains('\u{FFFD}'),
+            "terminal:data 事件不得包含 UTF-8 替换字符"
+        );
+    }
+
     /// 主机身份等待用户决定期间不占用连接总超时：远超预算仍保持 Connecting，
     /// 接受后进入认证并连接成功。
     #[test]
@@ -573,11 +778,9 @@ mod integration_tests {
             SessionStatus::Error,
             "会话关闭取消等待中的主机身份验证，终端以 Error 退出"
         );
-        assert!(
-            identity
-                .pending_challenge("session-identity-cancel")
-                .is_none()
-        );
+        assert!(identity
+            .pending_challenge("session-identity-cancel")
+            .is_none());
     }
 
     /// 用户拒绝主机身份映射为 Error 状态并转发结构化语义。

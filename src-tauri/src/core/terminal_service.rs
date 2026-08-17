@@ -52,6 +52,16 @@ pub enum TerminalCommand {
     Close,
 }
 
+/// 已连接终端命令的处理结果，用于区分继续、断开循环与立即退出。
+enum TerminalCommandOutcome {
+    /// 命令处理完成，继续终端 IO 循环。
+    Continue,
+    /// 通道已失效，退出 IO 循环并执行统一关闭清理。
+    Disconnect,
+    /// 已显式关闭通道，终端工作线程立即退出。
+    Exit,
+}
+
 /// SSH 连接函数：生产为 ssh_transport::connect_terminal，测试可注入模拟实现。
 type TerminalConnectFn = Box<
     dyn FnOnce(
@@ -233,6 +243,8 @@ fn start_terminal_session_with_parts<R, F>(
         // 尚未被读取的连接不得因旧截止被误杀。
         let mut overall_deadline = Instant::now() + connect_timeout;
         let mut verify_wait_start: Option<Instant> = None;
+        // 连接建立前收到的非关闭命令在连接成功后按原顺序处理，避免轮询关闭命令时丢失。
+        let mut pending_connect_commands = Vec::new();
         let mut terminal = loop {
             // connect_fn 可能被底层 SSH 库阻塞；外层必须在每个短轮询周期响应关闭。
             if shutdown.load(Ordering::Relaxed) {
@@ -246,9 +258,11 @@ fn start_terminal_session_with_parts<R, F>(
             match conn_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(terminal)) => {
                     // recv_timeout 返回时关闭可能刚刚发生，不得继续发布 Connected 状态。
-                    if shutdown.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Relaxed)
+                        || drain_connect_commands(&command_rx, &mut pending_connect_commands)
+                    {
                         info!(
-                            "[session:{}][diagnostic] Shutdown requested after connection completed",
+                            "[session:{}][diagnostic] Close requested after connection completed",
                             session_id
                         );
                         return;
@@ -261,6 +275,17 @@ fn start_terminal_session_with_parts<R, F>(
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    // 连接函数可能被底层 SSH 库阻塞；每轮超时都必须响应关闭，
+                    // 防止已从 Session Manager 移除的会话随后发布 Connected。
+                    if shutdown.load(Ordering::Relaxed)
+                        || drain_connect_commands(&command_rx, &mut pending_connect_commands)
+                    {
+                        info!(
+                            "[session:{}][diagnostic] Close requested while waiting for connection",
+                            session_id
+                        );
+                        return;
+                    }
                     let verifying = active_phase == ConnectionPhase::VerifyingHostKey;
                     match (verifying, verify_wait_start) {
                         (true, None) => verify_wait_start = Some(Instant::now()),
@@ -308,23 +333,45 @@ fn start_terminal_session_with_parts<R, F>(
             None,
         );
 
+        // 执行连接等待期间暂存的输入与窗口调整命令，保持命令顺序。
+        for command in pending_connect_commands.drain(..) {
+            match handle_terminal_command(
+                &mut terminal,
+                command,
+                &app,
+                &session_id,
+                &runtime_status,
+            ) {
+                TerminalCommandOutcome::Continue => {}
+                TerminalCommandOutcome::Disconnect => {
+                    let _ = terminal.close();
+                    return;
+                }
+                TerminalCommandOutcome::Exit => return,
+            }
+        }
+
         // 终端数据读取缓冲区（UTF-8，4KB）
         let mut buffer = [0_u8; 4096];
+        // 保存跨读取边界的 UTF-8 不完整尾部字节，最多通常为 3 个字节。
+        let mut utf8_carry = Vec::with_capacity(3);
 
         // 主循环：非阻塞读取终端输出并处理命令队列
-        while !shutdown.load(Ordering::Relaxed) {
+        'io: while !shutdown.load(Ordering::Relaxed) {
             // 读取 SSH Channel 的 stdout 输出
             match terminal.read(&mut buffer) {
                 Ok(size) if size > 0 => {
-                    // 使用 UTF-8 解码，确保中文等多字节字符正确显示
-                    let data = String::from_utf8_lossy(&buffer[..size]).to_string();
-                    let _ = app.emit(
-                        "terminal:data",
-                        TerminalDataEvent {
-                            session_id: session_id.clone(),
-                            data,
-                        },
-                    );
+                    // 延迟跨读取边界的不完整尾部字节，确保中文等多字节字符正确显示。
+                    let data = decode_terminal_bytes(&mut utf8_carry, &buffer[..size]);
+                    if !data.is_empty() {
+                        let _ = app.emit(
+                            "terminal:data",
+                            TerminalDataEvent {
+                                session_id: session_id.clone(),
+                                data,
+                            },
+                        );
+                    }
                 }
                 Ok(_) => {}
                 // WouldBlock 表示当前无数据可读，继续循环
@@ -346,46 +393,32 @@ fn start_terminal_session_with_parts<R, F>(
 
             // 处理命令队列中的所有待处理命令
             while let Ok(command) = command_rx.try_recv() {
-                match command {
-                    TerminalCommand::Write(data) => {
-                        if let Err(error) = terminal.write(&data) {
-                            emit_session_status(
-                                &app,
-                                &session_id,
-                                &runtime_status,
-                                SessionStatus::Error,
-                                Some(raw_status_error(error.to_string())),
-                            );
-                        }
-                    }
-                    TerminalCommand::Resize { cols, rows } => {
-                        if let Err(error) = terminal.resize(cols, rows) {
-                            emit_session_status(
-                                &app,
-                                &session_id,
-                                &runtime_status,
-                                SessionStatus::Error,
-                                Some(raw_status_error(error.to_string())),
-                            );
-                        }
-                    }
-                    TerminalCommand::Close => {
-                        // 主动关闭：关闭通道并派发断开状态
-                        let _ = terminal.close();
-                        emit_session_status(
-                            &app,
-                            &session_id,
-                            &runtime_status,
-                            SessionStatus::Disconnected,
-                            None,
-                        );
-                        return;
-                    }
+                match handle_terminal_command(
+                    &mut terminal,
+                    command,
+                    &app,
+                    &session_id,
+                    &runtime_status,
+                ) {
+                    TerminalCommandOutcome::Continue => {}
+                    TerminalCommandOutcome::Disconnect => break 'io,
+                    TerminalCommandOutcome::Exit => return,
                 }
             }
 
             // 检测 EOF（远程端主动断开连接），派发断开状态（前端展示本地化文案）
             if terminal.eof() {
+                // EOF 后不再有后续读取可补全残留字节，按既有 lossy 语义一次性刷新。
+                let data = flush_terminal_utf8_carry(&mut utf8_carry);
+                if !data.is_empty() {
+                    let _ = app.emit(
+                        "terminal:data",
+                        TerminalDataEvent {
+                            session_id: session_id.clone(),
+                            data,
+                        },
+                    );
+                }
                 emit_session_status(
                     &app,
                     &session_id,
@@ -403,6 +436,140 @@ fn start_terminal_session_with_parts<R, F>(
         // 退出循环后关闭通道，释放资源
         let _ = terminal.close();
     });
+}
+
+/// 排空连接阶段的命令队列，识别关闭请求并暂存其余命令。
+///
+/// # 参数
+/// - `command_rx`: 终端命令接收端
+/// - `pending_commands`: 用于保存连接成功后仍需处理的写入和窗口调整命令
+///
+/// # 返回
+/// 收到 `Close` 时返回 `true`；该命令不会进入后续 I/O 循环。
+fn drain_connect_commands(
+    command_rx: &Receiver<TerminalCommand>,
+    pending_commands: &mut Vec<TerminalCommand>,
+) -> bool {
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            TerminalCommand::Close => return true,
+            command => pending_commands.push(command),
+        }
+    }
+    false
+}
+
+/// 解码一段终端字节流，并保留末尾尚未完成的 UTF-8 序列供下一次读取补全。
+///
+/// # 参数
+/// - `carry`: 上次读取遗留的不完整 UTF-8 尾部字节
+/// - `chunk`: 本次从终端读取的原始字节
+///
+/// # 返回
+/// 当前可以安全派发到前端的 UTF-8 文本；完整但无效的字节序列以替换字符表示。
+fn decode_terminal_bytes(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    carry.extend_from_slice(chunk);
+    let mut data = String::new();
+
+    loop {
+        match std::str::from_utf8(carry) {
+            Ok(text) => {
+                data.push_str(text);
+                carry.clear();
+                return data;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                data.push_str(&String::from_utf8_lossy(&carry[..valid_up_to]));
+
+                match error.error_len() {
+                    Some(error_len) => {
+                        // 已确定无效的字节不能等待后续读取，保持 lossy 解码的替换字符语义。
+                        data.push('\u{FFFD}');
+                        carry.drain(..valid_up_to + error_len);
+                    }
+                    None => {
+                        // 仅末尾序列尚不完整：保留它，等待下一次读取补全。
+                        carry.drain(..valid_up_to);
+                        return data;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 在终端 EOF 时以 lossy 语义刷新无法再补全的 UTF-8 残留字节。
+///
+/// # 参数
+/// - `carry`: 连接结束前遗留的不完整 UTF-8 尾部字节
+///
+/// # 返回
+/// 用替换字符表示残留无效字节后的最终文本。
+fn flush_terminal_utf8_carry(carry: &mut Vec<u8>) -> String {
+    let data = String::from_utf8_lossy(carry).to_string();
+    carry.clear();
+    data
+}
+
+/// 执行已连接终端的一条控制命令，并在主动关闭时派发断开状态。
+///
+/// # 参数
+/// - `terminal`: 已建立的终端传输能力
+/// - `command`: 待执行的写入、窗口调整或关闭命令
+/// - `app`: Tauri 应用句柄，用于派发状态事件
+/// - `session_id`: 会话唯一标识
+/// - `runtime_status`: 后端权威会话状态
+///
+/// # 返回
+/// 命令处理结果决定终端 IO 循环是否继续、断开或立即退出。
+fn handle_terminal_command<R: Runtime>(
+    terminal: &mut TerminalTransport,
+    command: TerminalCommand,
+    app: &AppHandle<R>,
+    session_id: &str,
+    runtime_status: &Arc<Mutex<SessionStatus>>,
+) -> TerminalCommandOutcome {
+    match command {
+        TerminalCommand::Write(data) => {
+            if terminal.write(&data).is_err() {
+                emit_session_status(
+                    app,
+                    session_id,
+                    runtime_status,
+                    SessionStatus::Disconnected,
+                    None,
+                );
+                TerminalCommandOutcome::Disconnect
+            } else {
+                TerminalCommandOutcome::Continue
+            }
+        }
+        TerminalCommand::Resize { cols, rows } => {
+            if let Err(error) = terminal.resize(cols, rows) {
+                emit_session_status(
+                    app,
+                    session_id,
+                    runtime_status,
+                    SessionStatus::Error,
+                    Some(raw_status_error(error.to_string())),
+                );
+            }
+            TerminalCommandOutcome::Continue
+        }
+        TerminalCommand::Close => {
+            // 主动关闭：关闭通道并派发断开状态
+            let _ = terminal.close();
+            emit_session_status(
+                app,
+                session_id,
+                runtime_status,
+                SessionStatus::Disconnected,
+                None,
+            );
+            TerminalCommandOutcome::Exit
+        }
+    }
 }
 
 /// 从安全存储加载运行时凭据
@@ -650,8 +817,8 @@ fn emit_session_status<R: tauri::Runtime>(
 mod tests {
     use crate::models::session::TerminalDataEvent;
     use proptest::prelude::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// 生成非空字母数字字符串的策略（1-64 个字符）
     fn arb_session_id() -> impl Strategy<Value = String> {
