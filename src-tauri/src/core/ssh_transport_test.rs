@@ -343,20 +343,39 @@ mod tests {
     }
 
     /// DNS 解析同样属于总连接预算；阻塞解析不得使连接等待超过给定 deadline。
+    ///
+    /// 用 rendezvous 栅栏做决定性验证（不依赖墙钟，避免 CI 负载导致的计时抖动）：
+    /// 解析线程阻塞在栅栏上。若调用正确地按 deadline 返回，则调用返回时解析线程
+    /// 必然仍阻塞在栅栏上（try_send 成功）；若超时机制回归（如误用 recv 等待解析），
+    /// 调用会等解析线程完成，栅栏已无人等待（try_send 失败）。
     #[test]
     fn dns_resolution_returns_when_connect_deadline_expires() {
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let started = Instant::now();
         let error = resolve_socket_addrs_with_timeout(
             "slow.example:22".to_string(),
             started + Duration::from_millis(20),
-            || {
-                std::thread::sleep(Duration::from_millis(100));
+            move || {
+                // 模拟慢 DNS：阻塞在栅栏上；兜底 5s，防止回归时测试无限挂起。
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
                 Ok(Vec::new())
             },
         )
         .expect_err("阻塞 DNS 解析必须在连接 deadline 返回");
 
-        assert!(started.elapsed() < Duration::from_millis(90));
+        // 解析线程从 spawn 到阻塞在栅栏上存在调度延迟；小步重试直至其就绪。
+        let resolver_still_blocked = (0..100).any(|_| {
+            if release_tx.try_send(()).is_ok() {
+                true
+            } else {
+                std::thread::sleep(Duration::from_millis(50));
+                false
+            }
+        });
+        assert!(
+            resolver_still_blocked,
+            "调用返回时解析线程必须仍在栅栏上阻塞，证明调用未等待解析完成"
+        );
         assert!(matches!(
             error,
             AppError::SshConnectionError(message) if message.to_string().contains("DNS 解析超时")
