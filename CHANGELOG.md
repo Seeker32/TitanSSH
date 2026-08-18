@@ -1,10 +1,36 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.5] - 2026-08-18
 
 ### Features
 
+- Made host identity and session management commands asynchronous to prevent blocking the main thread.
+- Made monitoring commands asynchronous to improve performance and prevent blocking.
 - Added backend log file persistence (app log dir, append + 10MB startup truncation) with an in-app log viewer (2s polling) and export via save dialog in Settings → Logging.
+- Enhanced log export functionality and error handling.
+- Improved SFTP entry validation and macOS Keychain deletion logic.
+- Improved error handling and security in storage and IPC.
+- Hardened legacy host migration with error handling and backup for corrupt configurations.
+- Improved terminal command handling and UTF-8 data preservation in terminal sessions.
+- Enhanced logging and session management with early panic handling and cleanup capabilities.
+- Added release process documentation and pre-tag checklist.
+
+### Changed
+
+- Required English commit messages in agent rules.
+- Refactored trust store tests into a separate file.
+
+### Fixed
+
+- Hardened host identity verification: revocation events, deadlock fixes, and bounded cancel flags.
+- Hardened host config persistence: atomic writes, three-state credential input, and boundary validation.
+- Restored overwritten legacy credentials via failure compensation; parsed only auth-related credentials.
+- Hardened the remote monitoring collection pipeline against silent degradation.
+- Completed monitor task lifecycle terminal states and exception protection.
+- Typed monitor command errors to distinguish missing task, session, and snapshot.
+- Serialized hosts.json concurrent read-modify-write with a shared lock and made host commands asynchronous.
+- Fixed log viewer breakage for log files larger than 64 KiB and single-line format corruption from multiline messages.
+- Simplified SFTP temporary path assertions in tests and improved readability.
 
 ## [0.1.4] - 2026-08-15
 
