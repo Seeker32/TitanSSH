@@ -57,8 +57,7 @@ mod tests {
     #[test]
     fn app_error_info_redacts_sensitive_diagnostics_before_ipc() {
         let passphrase = "correct-horse-battery-staple";
-        let private_key =
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nvery-secret-key-material\n-----END OPENSSH PRIVATE KEY-----";
+        let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nvery-secret-key-material\n-----END OPENSSH PRIVATE KEY-----";
         let raw = AppErrorInfo::from(AppError::AuthenticationError(
             format!("authentication failed: password={passphrase}; key={private_key}").into(),
         ));

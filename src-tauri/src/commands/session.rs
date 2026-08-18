@@ -42,11 +42,11 @@ pub async fn open_session(
             .with_locked(|service| service.get_host(&lookup_host_id))
     })
     .await?
-        .ok_or_else(|| {
-            AppErrorInfo::from(AppError::InvalidHostConfig(
-                format!("Host not found: {host_id}").into(),
-            ))
-        })?;
+    .ok_or_else(|| {
+        AppErrorInfo::from(AppError::InvalidHostConfig(
+            format!("Host not found: {host_id}").into(),
+        ))
+    })?;
 
     // 路由到 session_manager 协调层，由其启动 terminal_service
     session_manager

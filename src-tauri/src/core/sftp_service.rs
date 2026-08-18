@@ -482,7 +482,12 @@ impl SftpService {
         let mut entries: Vec<RemoteEntry> = entries
             .into_iter()
             .map(|entry| {
-                let name = entry.path.rsplit('/').next().unwrap_or_default().to_string();
+                let name = entry
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
                 RemoteEntry {
                     name,
                     path: entry.path,
