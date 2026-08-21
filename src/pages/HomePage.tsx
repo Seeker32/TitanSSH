@@ -47,11 +47,11 @@ export default function HomePage() {
   // 标签视图模型（ADR-0002）：标签栏与内容区从标签列表渲染；激活会话由激活标签派生
   const tabs = useMemo(() => [...tabsMap.values()], [tabsMap]);
   const activeTab = activeTabId === null ? null : tabsMap.get(activeTabId) ?? null;
-  const activeView = activeTab === null ? null : activeTab.sessionId;
-  const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
-  const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
-  const snapshot = activeView === null ? null : monitorSnapshots.get(activeView) ?? null;
-  const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
+  const activeSessionId = activeTab === null ? null : activeTab.sessionId;
+  const selectedInterfaceName = useMonitorStore((state) => activeSessionId === null ? null : state.selectedInterfaces.get(activeSessionId) ?? null);
+  const trendSamples = useMonitorStore((state) => activeSessionId === null ? undefined : state.networkTrends.get(activeSessionId));
+  const snapshot = activeSessionId === null ? null : monitorSnapshots.get(activeSessionId) ?? null;
+  const sftpState = activeSessionId === null ? null : sftpStates.get(activeSessionId) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
   /** 最近一次主机保存失败的结构化错误；在编辑弹窗内展示，保存成功后清空 */
@@ -204,7 +204,7 @@ export default function HomePage() {
         {monitorCollapsed ? (
           <div className="sidebar-footer-row">
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
-              onInterfaceChange={(name) => activeView && useMonitorStore.getState().selectNetworkInterface(activeView, name)}
+              onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
             <FooterActions theme={theme} />
@@ -212,7 +212,7 @@ export default function HomePage() {
         ) : (
           <>
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
-              onInterfaceChange={(name) => activeView && useMonitorStore.getState().selectNetworkInterface(activeView, name)}
+              onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed={false} onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
             <div className="sidebar-footer-row sidebar-footer-row--right"><FooterActions theme={theme} /></div>
@@ -234,13 +234,13 @@ export default function HomePage() {
           onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
           onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
           onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />
-        {activeView !== null && <SftpPanel sessionId={activeView} state={sftpState}
+        {activeSessionId !== null && <SftpPanel sessionId={activeSessionId} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
-          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry}
+          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeSessionId)} onRetry={retry}
           onOverwrite={overwrite}
-          onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeView)} />}
+          onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeSessionId)} />}
       </div>
     </section>
     <HostEditorDialog open={editorOpen} editingHost={editingHost} saveError={editorError} groups={useMemo(

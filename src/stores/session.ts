@@ -204,7 +204,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     },
 
     /** 关闭标签（ADR-0002）：终端标签是会话锚点，关闭即触发 close_session 完整
-     *  teardown（终端、SFTP、双采样、共享连接）；未知标签为无操作。 */
+     *  teardown（终端、SFTP、双采样、共享连接）；未知标签与非终端类型（未实现）均为无操作。 */
     async closeTab(tabId) {
       const tab = get().tabs.get(tabId);
       if (!tab) return;
