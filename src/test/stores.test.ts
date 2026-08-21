@@ -7,9 +7,10 @@ import { useMonitorStore } from '@/stores/monitor';
 import { connectionLabel, useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
+import { terminalTabId } from '@/types/tab';
 import { TaskStatus } from '@/types/monitor';
 import { uploadTargetDir, type RemoteEntry, type TransferTask } from '@/types/sftp';
-import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTransferTask } from './fixtures';
+import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -191,8 +192,85 @@ describe('Zustand stores', () => {
     const task = makeTaskInfo();
     mockInvoke.mockImplementation(async (command) => command === 'open_session' ? session : task);
     await useSessionStore.getState().openSession('host-1');
-    expect(useSessionStore.getState().activeView).toBe(session.sessionId);
+    expect(useSessionStore.getState().activeTabId).toBe(terminalTabId(session.sessionId));
     expect(useMonitorStore.getState().sessionTaskMap.get(session.sessionId)).toBe(task.taskId);
+  });
+
+  it('标签视图模型：打开会话建立恰好一个终端标签（会话锚点）并按打开顺序排列', async () => {
+    let openCount = 0;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') {
+        openCount += 1;
+        return makeSession({ sessionId: `session-${openCount}` });
+      }
+      return makeTaskInfo();
+    });
+    await useSessionStore.getState().openSession('host-1');
+    await useSessionStore.getState().openSession('host-1');
+
+    const state = useSessionStore.getState();
+    // 一个会话恰有一个终端标签：两会话 → 两标签，顺序与打开顺序一致（标签栏渲染源）
+    expect([...state.tabs.values()].map((tab) => tab.sessionId)).toEqual(['session-1', 'session-2']);
+    expect([...state.tabs.values()].every((tab) => tab.type === 'terminal')).toBe(true);
+    expect(state.activeTabId).toBe(terminalTabId('session-2'));
+  });
+
+  it('锚点语义：关闭终端标签触发 close_session 完整 teardown 并清理会话与标签投影', async () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
+    });
+    mockInvoke.mockResolvedValue(undefined);
+
+    await useSessionStore.getState().closeTab(terminalTabId('session-1'));
+
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    const state = useSessionStore.getState();
+    expect(state.sessions.has('session-1')).toBe(false);
+    expect(state.tabs.has(terminalTabId('session-1'))).toBe(false);
+    expect(state.activeTabId).toBeNull();
+  });
+
+  it('锚点语义：关闭后台会话的终端标签不影响当前激活标签', async () => {
+    useSessionStore.setState({
+      sessions: new Map([
+        ['session-1', makeSession()],
+        ['session-2', makeSession({ sessionId: 'session-2' })],
+      ]),
+      tabs: new Map([
+        [terminalTabId('session-1'), makeTerminalTab()],
+        [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
+      ]),
+      activeTabId: terminalTabId('session-2'),
+    });
+    mockInvoke.mockResolvedValue(undefined);
+
+    await useSessionStore.getState().closeTab(terminalTabId('session-1'));
+
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().tabs.has(terminalTabId('session-1'))).toBe(false);
+    expect(useSessionStore.getState().activeTabId).toBe(terminalTabId('session-2'));
+  });
+
+  it('关闭未知标签为无操作：不发起后端调用也不改动状态', async () => {
+    mockInvoke.mockResolvedValue(undefined);
+    await useSessionStore.getState().closeTab(terminalTabId('ghost'));
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().tabs.size).toBe(0);
+    expect(useSessionStore.getState().activeTabId).toBeNull();
+  });
+
+  it('切换激活标签：setActiveTab 迁移视图选择状态到标签语义', () => {
+    useSessionStore.setState({
+      tabs: new Map([
+        [terminalTabId('session-1'), makeTerminalTab()],
+        [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
+      ]),
+      activeTabId: terminalTabId('session-1'),
+    });
+    useSessionStore.getState().setActiveTab(terminalTabId('session-2'));
+    expect(useSessionStore.getState().activeTabId).toBe(terminalTabId('session-2'));
   });
 
   it('监控启动失败不阻断会话打开', async () => {

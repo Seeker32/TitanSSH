@@ -1,5 +1,7 @@
 import { AuthType, type HostConfig, type SaveHostRequest } from '@/types/host';
 import { SessionStatus, type SessionInfo } from '@/types/session';
+import type { TerminalTab } from '@/types/tab';
+import { terminalTabId } from '@/types/tab';
 import type { MonitorSnapshot, TaskInfo } from '@/types/monitor';
 import { TaskStatus } from '@/types/monitor';
 import type { RemoteEntry, TransferTask } from '@/types/sftp';
@@ -45,6 +47,17 @@ export function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     port: 22,
     username: 'root',
     status: SessionStatus.Connecting,
+    createdAt: 1_710_000_000_000,
+    ...overrides,
+  };
+}
+
+/** 生成测试用终端标签（会话锚点；tabId 由 sessionId 派生） */
+export function makeTerminalTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
+  return {
+    tabId: terminalTabId('session-1'),
+    type: 'terminal',
+    sessionId: 'session-1',
     createdAt: 1_710_000_000_000,
     ...overrides,
   };
