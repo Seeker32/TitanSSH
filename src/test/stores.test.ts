@@ -411,7 +411,8 @@ describe('Zustand stores', () => {
     const task = makeTaskInfo();
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession()]]),
-      activeView: 'session-1',
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
       connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
     });
     useMonitorStore.setState({
@@ -423,9 +424,10 @@ describe('Zustand stores', () => {
     mockInvoke.mockResolvedValue(undefined);
     await useSessionStore.getState().closeSession('session-1');
 
-    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSessionStore.getState().activeTabId).toBeNull();
     expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().tabs.has(terminalTabId('session-1'))).toBe(false);
     expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
     expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
@@ -438,7 +440,8 @@ describe('Zustand stores', () => {
     // 前端投影保留 Error 状态与覆盖层，用户点击关闭时后端返回 SessionNotFound
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession({ status: SessionStatus.Error })]]),
-      activeView: 'session-1',
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
       connections: new Map([['session-1', {
         phase: null,
         error: { code: 'CredentialNotFound', detail: '凭据不存在: titanssh-xxx-password' },
@@ -451,7 +454,7 @@ describe('Zustand stores', () => {
 
     expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
     expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
-    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSessionStore.getState().activeTabId).toBeNull();
   });
 
   it('后端撤销事件撤下对应确认卡，且不误删已被新 challenge 取代的投影', async () => {
@@ -498,7 +501,8 @@ describe('Zustand stores', () => {
     };
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession()]]),
-      activeView: 'session-1',
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
       hostKeyChallenges: new Map([['session-1', challenge]]),
     });
     mockInvoke.mockResolvedValue(undefined);
@@ -510,7 +514,7 @@ describe('Zustand stores', () => {
     expect(mockInvoke).not.toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
     expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
-    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSessionStore.getState().activeTabId).toBeNull();
     expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
   });
@@ -552,7 +556,8 @@ describe('Zustand stores', () => {
     };
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession()]]),
-      activeView: 'session-1',
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
       hostKeyChallenges: new Map([['session-1', challenge]]),
     });
     mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-gone' });
@@ -561,7 +566,7 @@ describe('Zustand stores', () => {
 
     expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
     expect(useSessionStore.getState().sessions.has('session-1')).toBe(true);
-    expect(useSessionStore.getState().activeView).toBe('session-1');
+    expect(useSessionStore.getState().activeTabId).toBe(terminalTabId('session-1'));
   });
 
   it('接受并保存成功：调用后端命令并清除确认卡', async () => {

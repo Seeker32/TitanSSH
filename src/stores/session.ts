@@ -17,7 +17,6 @@ interface SessionState {
   tabs: Map<string, TerminalTab>;
   /** 当前激活标签；null 表示无激活视图（空态） */
   activeTabId: string | null;
-  activeView: string | null;
   /** 按 sessionId 存储的连接生命周期投影（阶段 + 结构化错误）；Connected/Disconnected 后清除。 */
   connections: Map<string, SessionConnection>;
   /** 投影建立前到达的进度事件缓存（open_session 返回与首个 progress 事件的 IPC 竞态）；
@@ -31,8 +30,7 @@ interface SessionState {
   closeSession: (sessionId: string) => Promise<void>;
   writeTerminal: (sessionId: string, data: string) => Promise<void>;
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
-  setActiveView: (viewId: string | null) => void;
-  /** 切换激活标签（视图选择状态，标签语义）；null 表示无激活视图 */
+  /** 切换激活标签（视图选择状态，标签语义） */
   setActiveTab: (tabId: string) => void;
   /** 关闭标签：终端标签是会话锚点，关闭即触发 close_session 完整 teardown；
    *  纯视图标签（未来）仅移除自身，不影响会话生命周期 */
@@ -106,7 +104,6 @@ export const useSessionStore = create<SessionState>((set, get) => {
     sessions: new Map(),
     tabs: new Map(),
     activeTabId: null,
-    activeView: null,
     connections: new Map(),
     pendingProgress: new Map(),
     hostKeyChallenges: new Map(),
@@ -128,11 +125,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
         );
         const tabs = new Map(state.tabs);
         removedTabIds.forEach((tabId) => tabs.delete(tabId));
-        // 激活标签被移除时回到空态（与旧 activeView 语义一致）；后台标签关闭不影响激活态
+        // 激活标签被移除时回到空态（空态页）；后台标签关闭不影响激活态
         const activeTabId = state.activeTabId !== null && removedTabIds.has(state.activeTabId) ? null : state.activeTabId;
         return {
           sessions, connections, pendingProgress, tabs, activeTabId, ...projection,
-          activeView: activeTabId === null ? null : state.tabs.get(activeTabId)?.sessionId ?? null,
         };
       });
       useMonitorStore.getState().clearSession(sessionId);
@@ -159,7 +155,6 @@ export const useSessionStore = create<SessionState>((set, get) => {
           sessions: new Map(state.sessions).set(session.sessionId, session),
           tabs: new Map(state.tabs).set(tab.tabId, tab),
           activeTabId: tab.tabId,
-          activeView: session.sessionId,
           connections: new Map(state.connections).set(session.sessionId, { phase: pendingPhase, error: null }),
           pendingProgress,
         };
@@ -203,17 +198,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
       await invoke('resize_terminal', { sessionId, cols, rows });
     },
 
-    /** 切换当前会话视图；null 表示无会话（空态）。 */
-    setActiveView(activeView) {
-      set({ activeView });
-    },
-
     /** 切换激活标签（标签语义的视图选择）；标签栏点击、视图切换共用。 */
     setActiveTab(tabId) {
-      set((state) => ({
-        activeTabId: tabId,
-        activeView: state.tabs.get(tabId)?.sessionId ?? null,
-      }));
+      set({ activeTabId: tabId });
     },
 
     /** 关闭标签（ADR-0002）：终端标签是会话锚点，关闭即触发 close_session 完整
