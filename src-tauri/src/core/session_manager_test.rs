@@ -1,16 +1,19 @@
 #[cfg(test)]
 mod tests {
+    use crate::core::process_service::ProcessService;
     use crate::core::session_manager::*;
     use crate::core::shared_exec_registry::SharedExecRegistry;
     use crate::models::host::{AuthType, HostConfig};
 
     /// 创建共享运行时状态一致的 SessionManager。
     fn make_manager() -> SessionManager {
+        let registry = SharedExecRegistry::new();
         SessionManager::new(
-            MonitorService::new(SharedExecRegistry::new()),
+            MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             SftpService::new(),
             HostIdentityService::new(),
-            SharedExecRegistry::new(),
+            registry,
         )
     }
 
@@ -72,11 +75,13 @@ mod tests {
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError("unused".to_string().into()))
         });
+        let registry = SharedExecRegistry::new();
         let manager = SessionManager::new(
-            MonitorService::new(SharedExecRegistry::new()),
+            MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             sftp_service.clone(),
             HostIdentityService::new(),
-            SharedExecRegistry::new(),
+            registry,
         );
         for session_id in ["session-exit-a", "session-exit-b"] {
             manager.insert_session_for_test(session_id, make_host(session_id));
@@ -133,11 +138,13 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
+        let registry = SharedExecRegistry::new();
         let manager = SessionManager::new(
-            MonitorService::new(SharedExecRegistry::new()),
+            MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             sftp_service.clone(),
             HostIdentityService::new(),
-            SharedExecRegistry::new(),
+            registry,
         );
 
         let session = manager
@@ -160,11 +167,13 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
+        let registry = SharedExecRegistry::new();
         let manager = SessionManager::new(
-            MonitorService::new(SharedExecRegistry::new()),
+            MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             sftp_service.clone(),
             HostIdentityService::new(),
-            SharedExecRegistry::new(),
+            registry,
         );
         let mut host = make_host("host-terminal-startup-failure");
         host.password_ref = None;
@@ -199,11 +208,13 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
+        let registry = SharedExecRegistry::new();
         let manager = SessionManager::new(
-            MonitorService::new(SharedExecRegistry::new()),
+            MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             sftp_service,
             identity.clone(),
-            SharedExecRegistry::new(),
+            registry,
         );
         let session_id = "session-identity-close".to_string();
         let (command_tx, _command_rx) = mpsc::channel();
@@ -257,11 +268,14 @@ mod tests {
     #[test]
     fn close_session_tears_down_all_backend_work() {
         use crate::core::monitor_service::MonitorTaskHandle;
+        use crate::core::process_service::ProcessTaskHandle;
         use crate::models::monitor::{TaskInfo, TaskStatus};
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let monitor_service = MonitorService::new(SharedExecRegistry::new());
+        let registry = SharedExecRegistry::new();
+        let monitor_service = MonitorService::new(registry.clone());
+        let process_service = ProcessService::new(registry.clone());
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
                 "expected test failure".to_string().into(),
@@ -269,13 +283,15 @@ mod tests {
         });
         let manager = SessionManager::new(
             monitor_service.clone(),
+            process_service.clone(),
             sftp_service.clone(),
             HostIdentityService::new(),
-            SharedExecRegistry::new(),
+            registry,
         );
         let session_id = "session-close-all".to_string();
         let terminal_shutdown = Arc::new(AtomicBool::new(false));
         let monitor_shutdown = Arc::new(AtomicBool::new(false));
+        let process_shutdown = Arc::new(AtomicBool::new(false));
         let (command_tx, _command_rx) = mpsc::channel();
 
         manager.sessions.lock().unwrap().insert(
@@ -309,6 +325,19 @@ mod tests {
                 shutdown: monitor_shutdown.clone(),
             },
         );
+        process_service.tasks.lock().unwrap().insert(
+            "process-task".to_string(),
+            ProcessTaskHandle {
+                task_info: TaskInfo {
+                    task_id: "process-task".to_string(),
+                    task_type: "process".to_string(),
+                    session_id: Some(session_id.clone()),
+                    status: TaskStatus::Running,
+                    created_at: 1_710_000_000_000,
+                },
+                shutdown: process_shutdown.clone(),
+            },
+        );
         sftp_service.register_session(session_id.clone(), make_host("host-1"));
 
         manager
@@ -318,6 +347,8 @@ mod tests {
         assert!(terminal_shutdown.load(Ordering::Relaxed));
         assert!(monitor_shutdown.load(Ordering::Acquire));
         assert!(monitor_service.tasks.lock().unwrap().is_empty());
+        assert!(process_shutdown.load(Ordering::Acquire));
+        assert!(process_service.tasks.lock().unwrap().is_empty());
         assert!(!sftp_service.has_session(&session_id));
     }
 
@@ -368,6 +399,7 @@ mod tests {
 
         let manager = SessionManager::new(
             MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             SftpService::with_connector(|_, _| {
                 Err(AppError::SshConnectionError("unused".to_string().into()))
             }),
@@ -414,6 +446,7 @@ mod tests {
 
         let manager = SessionManager::new(
             MonitorService::new(registry.clone()),
+            ProcessService::new(registry.clone()),
             SftpService::with_connector(|_, _| {
                 Err(AppError::SshConnectionError("unused".to_string().into()))
             }),

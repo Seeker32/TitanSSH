@@ -3,6 +3,7 @@ mod tests {
     use crate::commands::monitor::{get_monitor_status, stop_monitoring};
     use crate::core::host_identity::HostIdentityService;
     use crate::core::monitor_service::{MonitorService, MonitorTaskHandle};
+    use crate::core::process_service::ProcessService;
     use crate::core::session_manager::SessionManager;
     use crate::core::sftp_service::SftpService;
     use crate::errors::app_error::AppErrorInfo;
@@ -35,6 +36,7 @@ mod tests {
         let service = MonitorService::new(exec_registry.clone());
         let session_manager = SessionManager::new(
             service.clone(),
+            ProcessService::new(exec_registry.clone()),
             SftpService::new(),
             HostIdentityService::new(),
             exec_registry,

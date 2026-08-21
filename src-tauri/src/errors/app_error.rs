@@ -170,6 +170,14 @@ pub enum AppError {
     #[error("监控采集输出无效: {0}")]
     MonitorCollectionError(ErrorDetail),
 
+    /// 进程任务不存在（从未创建、已停止或已过期）。
+    #[error("进程任务不存在: {0}")]
+    ProcessTaskNotFound(ErrorDetail),
+
+    /// 会话存在但尚无进程快照。
+    #[error("进程快照尚不可用: {0}")]
+    ProcessSnapshotUnavailable(ErrorDetail),
+
     /// 进程采集脚本输出无法解析或缺少必要的采样基准。
     #[error("进程采集输出无效: {0}")]
     ProcessCollectionError(ErrorDetail),
@@ -250,6 +258,8 @@ impl AppError {
             Self::MonitorTaskNotFound(_) => "MonitorTaskNotFound",
             Self::MonitorSnapshotUnavailable(_) => "MonitorSnapshotUnavailable",
             Self::MonitorCollectionError(_) => "MonitorCollectionError",
+            Self::ProcessTaskNotFound(_) => "ProcessTaskNotFound",
+            Self::ProcessSnapshotUnavailable(_) => "ProcessSnapshotUnavailable",
             Self::ProcessCollectionError(_) => "ProcessCollectionError",
             Self::ProcessMonitoringUnsupported(_) => "ProcessMonitoringUnsupported",
             Self::SftpTargetExists(_) => "SftpTargetExists",
@@ -306,6 +316,10 @@ impl AppError {
                 Self::MonitorSnapshotUnavailable(append(p, extra))
             }
             Self::MonitorCollectionError(p) => Self::MonitorCollectionError(append(p, extra)),
+            Self::ProcessTaskNotFound(p) => Self::ProcessTaskNotFound(append(p, extra)),
+            Self::ProcessSnapshotUnavailable(p) => {
+                Self::ProcessSnapshotUnavailable(append(p, extra))
+            }
             Self::ProcessCollectionError(p) => Self::ProcessCollectionError(append(p, extra)),
             Self::ProcessMonitoringUnsupported(p) => {
                 Self::ProcessMonitoringUnsupported(append(p, extra))
@@ -461,6 +475,8 @@ impl From<&AppError> for AppErrorInfo {
             | AppError::MonitorTaskNotFound(p)
             | AppError::MonitorSnapshotUnavailable(p)
             | AppError::MonitorCollectionError(p)
+            | AppError::ProcessTaskNotFound(p)
+            | AppError::ProcessSnapshotUnavailable(p)
             | AppError::ProcessCollectionError(p)
             | AppError::ProcessMonitoringUnsupported(p)
             | AppError::SftpTargetExists(p)

@@ -8,6 +8,7 @@ use crate::core::host_identity::HostIdentityService;
 use crate::core::host_service::SharedHostConfigService;
 use crate::core::logging;
 use crate::core::monitor_service::MonitorService;
+use crate::core::process_service::ProcessService;
 use crate::core::session_manager::SessionManager;
 use crate::core::sftp_service::SftpService;
 use crate::core::shared_exec_registry::SharedExecRegistry;
@@ -26,6 +27,7 @@ pub fn run() {
     // 共享 exec 连接注册表：monitor（及后续采样服务）与 session teardown 共享
     let exec_registry = SharedExecRegistry::new();
     let monitor_service = MonitorService::new(exec_registry.clone());
+    let process_service = ProcessService::new(exec_registry.clone());
     let sftp_service = SftpService::new();
     let identity_service = HostIdentityService::new();
 
@@ -47,11 +49,13 @@ pub fn run() {
         })
         .manage(SessionManager::new(
             monitor_service.clone(),
+            process_service.clone(),
             sftp_service.clone(),
             identity_service.clone(),
             exec_registry,
         ))
         .manage(monitor_service)
+        .manage(process_service)
         .manage(sftp_service)
         .manage(identity_service)
         .invoke_handler(tauri::generate_handler![
@@ -73,6 +77,9 @@ pub fn run() {
             commands::monitor::start_monitoring,
             commands::monitor::stop_monitoring,
             commands::monitor::get_monitor_status,
+            commands::process::start_process_monitoring,
+            commands::process::stop_process_monitoring,
+            commands::process::get_process_status,
             commands::sftp::sftp_list_dir,
             commands::sftp::sftp_download,
             commands::sftp::sftp_upload,
