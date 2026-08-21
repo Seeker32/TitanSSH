@@ -32,20 +32,24 @@ export default function HomePage() {
   const searchQuery = useHostStore((state) => state.searchQuery);
   const selectedHostId = useHostStore((state) => state.selectedHostId);
   const sessionsMap = useSessionStore((state) => state.sessions);
-  const activeView = useSessionStore((state) => state.activeView);
+  const tabsMap = useSessionStore((state) => state.tabs);
+  const activeTabId = useSessionStore((state) => state.activeTabId);
   const connections = useSessionStore((state) => state.connections);
   const hostKeyChallenges = useSessionStore((state) => state.hostKeyChallenges);
   const hostKeySaveErrors = useSessionStore((state) => state.hostKeySaveErrors);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
-  const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
-  const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
   const sftpStates = useSftpStore((state) => state.sessionStates);
   const recentTransfers = useSftpStore((state) => state.recentTransfers);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
   const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
   const monitorCollapsed = useLayoutStore((state) => state.monitorCollapsed);
   const theme = useThemeStore((state) => state.theme);
-  const sessions = useMemo(() => [...sessionsMap.values()], [sessionsMap]);
+  // 标签视图模型（ADR-0002）：标签栏与内容区从标签列表渲染；激活会话由激活标签派生
+  const tabs = useMemo(() => [...tabsMap.values()], [tabsMap]);
+  const activeTab = activeTabId === null ? null : tabsMap.get(activeTabId) ?? null;
+  const activeView = activeTab === null ? null : activeTab.sessionId;
+  const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
+  const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
   const snapshot = activeView === null ? null : monitorSnapshots.get(activeView) ?? null;
   const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
@@ -95,11 +99,6 @@ export default function HomePage() {
   /** 打开指定主机的 SSH 会话。 */
   async function openSession(hostId: string) {
     await useSessionStore.getState().openSession(hostId);
-  }
-
-  /** 关闭 SSH 会话：标签栏与终端错误覆盖层共用同一入口。 */
-  async function closeSession(sessionId: string) {
-    await useSessionStore.getState().closeSession(sessionId);
   }
 
   /** 打开新建主机表单。 */
@@ -222,16 +221,16 @@ export default function HomePage() {
       </div>
     </aside>
     <section className="main-panel">
-      {sessions.length > 0 && <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
-        onActivate={(view) => useSessionStore.getState().setActiveView(view)}
-        onClose={closeSession} /></div>}
+      {tabs.length > 0 && <div className="tabs-area"><TerminalTabs tabs={tabs} sessions={sessionsMap} activeTabId={activeTabId}
+        onActivate={(tabId) => useSessionStore.getState().setActiveTab(tabId)}
+        onClose={(tabId) => useSessionStore.getState().closeTab(tabId)} /></div>}
       <div className="content-area">
-        <TerminalPane sessions={sessions} activeView={activeView} connections={connections}
+        <TerminalPane tabs={tabs} sessions={sessionsMap} activeTabId={activeTabId} connections={connections}
           challenges={hostKeyChallenges} saveErrors={hostKeySaveErrors}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
           onCreateHost={createHost}
-          onCloseTab={closeSession}
+          onCloseTab={(tabId) => useSessionStore.getState().closeTab(tabId)}
           onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
           onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
           onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />

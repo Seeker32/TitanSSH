@@ -1,5 +1,6 @@
 import type { HostIdentityChallenge, SessionConnection, SessionInfo } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
+import type { TerminalTab } from '@/types/tab';
 import { connectionLabel, overlayStatus, progressLabel } from '@/stores/session';
 import type { AppErrorInfo } from '@/i18n';
 import EmptyState from '@/components/shell/EmptyState';
@@ -8,8 +9,12 @@ import TerminalOverlay from './TerminalOverlay';
 import XtermView from './XtermView';
 
 interface Props {
-  sessions: SessionInfo[];
-  activeView: string | null;
+  /** 标签列表（渲染源）：终端标签驱动的视图集合，每个终端标签对应一个常驻终端实例 */
+  tabs: TerminalTab[];
+  /** 按 sessionId 索引的会话投影；终端视图据此解析所属会话 */
+  sessions: Map<string, SessionInfo>;
+  /** 激活标签；null 表示无激活视图（空态） */
+  activeTabId: string | null;
   /** 按 sessionId 存储的连接生命周期投影（阶段 + 结构化错误）。 */
   connections: Map<string, SessionConnection>;
   /** 按 sessionId 存储的主机身份确认投影；存在时终端区域显示内联确认卡。 */
@@ -19,30 +24,35 @@ interface Props {
   onInput: (event: { sessionId: string; data: string }) => void;
   onResize: (event: { sessionId: string; cols: number; rows: number }) => void;
   onCreateHost: () => void;
-  onCloseTab: (sessionId: string) => void;
+  /** 关闭标签（终端标签 = 会话锚点，由上层触发完整 teardown）。 */
+  onCloseTab: (tabId: string) => void;
   onSaveIdentity: (sessionId: string) => void;
   onAcceptIdentity: (sessionId: string) => void;
   onRejectIdentity: (sessionId: string) => void;
 }
 
-/** 在空态页与各真实终端视图之间切换；会话实例常驻，仅切换显隐。
+/** 在空态页与各终端标签视图之间切换；终端实例常驻，仅切换显隐。
  *  每个标签独立呈现连接生命周期：主机身份确认卡 > 连接/错误覆盖层。 */
-export default function TerminalPane({ sessions, activeView, connections, challenges, saveErrors, onInput, onResize, onCreateHost, onCloseTab, onSaveIdentity, onAcceptIdentity, onRejectIdentity }: Props) {
+export default function TerminalPane({ tabs, sessions, activeTabId, connections, challenges, saveErrors, onInput, onResize, onCreateHost, onCloseTab, onSaveIdentity, onAcceptIdentity, onRejectIdentity }: Props) {
   return (
     <section className="terminal-pane">
       <div className="viewport">
-        {activeView === null && <EmptyState onCreateHost={onCreateHost} />}
-        {sessions.map((session) => {
+        {activeTabId === null && <EmptyState onCreateHost={onCreateHost} />}
+        {tabs.map((tab) => {
+          const session = sessions.get(tab.sessionId);
+          // 标签与其会话投影同生命周期，缺投影时不渲染该视图
+          if (!session) return null;
           const challenge = challenges.get(session.sessionId);
           const connection = connections.get(session.sessionId);
           // 等待确认期间在确认卡内展示主机身份验证阶段（不渲染独立覆盖层）
           const phaseLabel = connection?.phase === ConnectionPhase.VerifyingHostKey
             ? progressLabel(connection.phase)
             : null;
+          const active = activeTabId === tab.tabId;
           return (
-            <div key={session.sessionId} className="terminal-session" hidden={activeView !== session.sessionId}>
+            <div key={tab.tabId} className="terminal-session" hidden={!active}>
               <XtermView sessionId={session.sessionId}
-                active={activeView === session.sessionId}
+                active={active}
                 interactive={session.status === SessionStatus.Connected}
                 onInput={onInput} onResize={onResize} />
               {challenge ? (
@@ -54,7 +64,7 @@ export default function TerminalPane({ sessions, activeView, connections, challe
               ) : overlayStatus(session.status) && (
                 <TerminalOverlay status={session.status}
                   message={connectionLabel(session, connection)}
-                  onClose={() => onCloseTab(session.sessionId)} />
+                  onClose={() => onCloseTab(tab.tabId)} />
               )}
             </div>
           );

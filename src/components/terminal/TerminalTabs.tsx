@@ -1,14 +1,18 @@
 import { X } from 'lucide-react';
 import type { MouseEvent } from 'react';
 import type { SessionInfo } from '@/types/session';
+import type { TerminalTab } from '@/types/tab';
 import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 
 interface Props {
-  sessions: SessionInfo[];
-  activeView: string | null;
-  onActivate: (viewId: string) => void;
-  onClose: (sessionId: string) => void;
+  /** 标签列表（渲染源）：标签引用会话但不拥有连接；按插入顺序渲染 */
+  tabs: TerminalTab[];
+  /** 按 sessionId 索引的会话投影；标签据此解析标题文案与状态圆点 */
+  sessions: Map<string, SessionInfo>;
+  activeTabId: string | null;
+  onActivate: (tabId: string) => void;
+  onClose: (tabId: string) => void;
 }
 
 /** 根据会话状态返回状态圆点样式。 */
@@ -19,26 +23,31 @@ function statusDot(status: string) {
   return 'dot-offline';
 }
 
-/** 渲染真实 SSH 会话标签栏（无会话时整栏隐藏）。 */
-export default function TerminalTabs({ sessions, activeView, onActivate, onClose }: Props) {
+/** 渲染标签栏（无标签时整栏隐藏）：渲染源为标签列表，标签从会话投影解析展示信息。 */
+export default function TerminalTabs({ tabs, sessions, activeTabId, onActivate, onClose }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   /** 关闭标签且不触发激活。 */
-  function closeTab(event: MouseEvent, sessionId: string) {
+  function closeTab(event: MouseEvent, tab: TerminalTab) {
     event.stopPropagation();
-    onClose(sessionId);
+    onClose(tab.tabId);
   }
 
   return (
     <div className="tab-bar" role="tablist">
-      {sessions.map((session) => (
-        <div key={session.sessionId} className={`tab ${activeView === session.sessionId ? 'active' : ''}`}
-          role="tab" aria-selected={activeView === session.sessionId} onClick={() => onActivate(session.sessionId)}>
-          <span className={`status-dot ${statusDot(session.status)}`} />
-          <span className="tab-label">{session.username}@{session.host}</span>
-          <button type="button" className="close-btn" aria-label={translate(locale, 'tab.close', { name: `${session.username}@${session.host}` })}
-            onClick={(event) => closeTab(event, session.sessionId)}><X size={11} /></button>
-        </div>
-      ))}
+      {tabs.map((tab) => {
+        // 标签与其会话投影同生命周期（removeSessionProjection 一并移除），缺投影时不渲染
+        const session = sessions.get(tab.sessionId);
+        if (!session) return null;
+        return (
+          <div key={tab.tabId} className={`tab ${activeTabId === tab.tabId ? 'active' : ''}`}
+            role="tab" aria-selected={activeTabId === tab.tabId} onClick={() => onActivate(tab.tabId)}>
+            <span className={`status-dot ${statusDot(session.status)}`} />
+            <span className="tab-label">{session.username}@{session.host}</span>
+            <button type="button" className="close-btn" aria-label={translate(locale, 'tab.close', { name: `${session.username}@${session.host}` })}
+              onClick={(event) => closeTab(event, tab)}><X size={11} /></button>
+          </div>
+        );
+      })}
     </div>
   );
 }

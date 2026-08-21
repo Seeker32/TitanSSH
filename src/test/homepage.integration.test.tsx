@@ -14,7 +14,8 @@ import { useLogLevelStore } from '@/stores/log-level';
 import { useLogsStore } from '@/stores/logs';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
-import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
+import { terminalTabId } from '@/types/tab';
+import { makeHost, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({ default: () => <div data-testid="xterm" /> }));
 const mockInvoke = vi.mocked(invoke);
@@ -93,7 +94,10 @@ describe('HomePage integration', () => {
     act(() => useSessionStore.setState({ sessions: new Map([
       ['session-1', makeSession()],
       ['session-2', makeSession({ sessionId: 'session-2' })],
-    ]), activeView: 'session-1' }));
+    ]), tabs: new Map([
+      [terminalTabId('session-1'), makeTerminalTab()],
+      [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
+    ]), activeTabId: terminalTabId('session-1') }));
     await act(async () => {
       emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
         available: true,
@@ -108,9 +112,9 @@ describe('HomePage integration', () => {
       } }));
     });
     await user.selectOptions(screen.getByLabelText('网卡接口'), 'eth1');
-    act(() => useSessionStore.getState().setActiveView('session-2'));
+    act(() => useSessionStore.getState().setActiveTab(terminalTabId('session-2')));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('ens5');
-    act(() => useSessionStore.getState().setActiveView('session-1'));
+    act(() => useSessionStore.getState().setActiveTab(terminalTabId('session-1')));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('eth1');
   });
 
@@ -126,10 +130,16 @@ describe('HomePage integration', () => {
     });
     expect(screen.getByRole('status')).toHaveTextContent('正在请求终端 PTY...');
 
-    act(() => useSessionStore.setState({ sessions: new Map([
-      ...useSessionStore.getState().sessions,
-      ['session-2', makeSession({ sessionId: 'session-2' })],
-    ]) }));
+    act(() => useSessionStore.setState({
+      sessions: new Map([
+        ...useSessionStore.getState().sessions,
+        ['session-2', makeSession({ sessionId: 'session-2' })],
+      ]),
+      tabs: new Map([
+        ...useSessionStore.getState().tabs,
+        [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
+      ]),
+    }));
     await act(async () => {
       emitMockEvent('session:status', { sessionId: 'session-2', status: SessionStatus.AuthFailed, error: null });
     });
