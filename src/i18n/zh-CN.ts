@@ -98,6 +98,9 @@ export const zhCN = {
   'sftp.failed': '失败',
   'sftp.cancelled': '已取消',
   'sftp.clearTerminal': '清除已结束',
+  'sftp.recentTransfers': '近期传输',
+  'sftp.noRecentTransfers': '暂无关闭会话的传输结果',
+  'sftp.clearRecentTransfers': '清空近期记录',
   'sftp.defaultDownload': '下载',
 
   // 服务器监控
@@ -196,4 +199,3 @@ export const zhCN = {
   'error.Unknown': '未知错误',
   'error.Timeout': '连接超时',
 } as const;
-

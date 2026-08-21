@@ -1003,10 +1003,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("迟到传输连接应立即释放");
         assert!(!service.has_session("session-1"));
-        assert!(
-            service.tasks.lock().unwrap().is_empty(),
-            "关闭后迟到 worker 不得残留任务"
-        );
+        wait_until(
+            || service.task_snapshot("session-1").is_empty().then_some(()),
+            Duration::from_secs(1),
+        )
+        .expect("迟到 worker 应发布 Cancelled 后清理任务");
         let _ = std::fs::remove_file(&local_path);
     }
 
@@ -1604,12 +1605,12 @@ mod tests {
         .expect("五路 Running、一路 Pending");
         assert_eq!(live.load(Ordering::SeqCst), 5);
 
-        // 关闭 Session：等待 checkout 的 worker 被唤醒终止，任务整体清除
+        // 关闭 Session：等待 checkout 的 worker 被唤醒终止；忙碌任务保留至真实终态。
         service.cleanup_session("session-1", &app.handle().clone());
         assert!(!service.has_session("session-1"));
         assert!(
-            service.tasks.lock().unwrap().is_empty(),
-            "关闭后不得残留任务"
+            !service.tasks.lock().unwrap().is_empty(),
+            "关闭后 busy worker 应保留任务直到最终结案"
         );
 
         // 放行 busy 传输：capability 全部释放
@@ -1618,10 +1619,13 @@ mod tests {
             gate.open();
         }
         wait_until(
-            || (live.load(Ordering::SeqCst) == 0).then_some(()),
+            || {
+                (live.load(Ordering::SeqCst) == 0 && service.task_snapshot("session-1").is_empty())
+                    .then_some(())
+            },
             Duration::from_secs(5),
         )
-        .expect("关闭后全部传输连接应释放");
+        .expect("关闭后 worker 应结案并释放全部传输连接");
         for path in &local_paths {
             let _ = std::fs::remove_file(path);
         }
@@ -2383,12 +2387,12 @@ mod tests {
         )
         .expect("20 个 Running 与持名额等待的 E 各持一条连接，A 积压任务无连接");
 
-        // 关闭 A：任务整体移除，迟到 worker 不得重新启动
+        // 关闭 A：禁止新 checkout，忙碌任务保留至实际终态。
         service.cleanup_session("session-a", &app.handle().clone());
         assert!(!service.has_session("session-a"));
         assert!(
-            service.task_snapshot("session-a").is_empty(),
-            "关闭后 A 的任务应立即移除"
+            !service.task_snapshot("session-a").is_empty(),
+            "关闭后 A 的忙碌任务应等待实际终态"
         );
 
         // 放行 A 的 busy 传输：归还连接（池已关闭直接释放）并释放全局 permit
@@ -2563,6 +2567,17 @@ mod tests {
         let cloned = token.clone();
         token.cancel();
         assert!(cloned.is_cancelled(), "clone 应共享取消状态");
+    }
+
+    /// 安全发布已开始后，迟到的取消不得把实际已发布的传输改写为 Cancelled。
+    #[test]
+    fn cancel_token_commit_wins_over_late_cancellation() {
+        let token = CancelToken::new();
+
+        assert!(token.try_commit());
+        token.cancel();
+
+        assert!(!token.is_cancelled());
     }
 
     // ─── 权限格式化测试 ──────────────────────────────────────────────────────
@@ -2802,6 +2817,24 @@ mod tests {
         captured
     }
 
+    /// 订阅 sftp:task_finished 并收集完整任务快照，供关闭后近期记录消费。
+    fn capture_finished_task_events<R: Runtime>(
+        app: &AppHandle<R>,
+    ) -> Arc<std::sync::Mutex<Vec<TransferTask>>> {
+        use tauri::Listener;
+
+        let captured: Arc<std::sync::Mutex<Vec<TransferTask>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_ref = captured.clone();
+        app.listen("sftp:task_finished", move |event| {
+            captured_ref.lock().unwrap().push(
+                serde_json::from_str(event.payload())
+                    .expect("完成事件 payload 应为完整 TransferTask"),
+            );
+        });
+        captured
+    }
+
     /// 构造测试用 TransferTask 字面量（registry 直写的统一入口）。
     fn make_task(
         session_id: &str,
@@ -2928,6 +2961,37 @@ mod tests {
             "终态后取消令牌应从 handles 移除"
         );
         assert!(!token.is_cancelled());
+    }
+
+    /// 每个终态都发布完整任务快照，供已关闭 Session 的前端记录权威结果。
+    #[test]
+    fn terminal_transition_emits_complete_task_snapshot() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = make_service();
+        service.register_session("session-1".to_string(), make_host());
+        insert_task(&service, "task-finished", SftpTaskStatus::Pending);
+        let finished = capture_finished_task_events(&app.handle());
+
+        assert!(service.transition_task(
+            &app.handle(),
+            "task-finished",
+            "session-1",
+            SftpTaskStatus::Failed,
+            Some(AppErrorInfo::from(AppError::SftpTransferError(
+                "closed".to_string().into()
+            ))),
+        ));
+
+        let events = finished.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].task_id, "task-finished");
+        assert_eq!(events[0].status, SftpTaskStatus::Failed);
+        assert_eq!(
+            events[0].error.as_ref().map(|error| error.code.as_str()),
+            Some("SftpTransferError")
+        );
     }
 
     /// 终态任务拒绝继续迁移，且不得再发事件。
@@ -3063,7 +3127,7 @@ mod tests {
         );
     }
 
-    /// cleanup_session 对非终态任务：触发令牌、迁移到 Cancelled 并发事件。
+    /// cleanup_session 对非终态任务：只触发令牌，worker 结案前不伪造终态事件。
     #[test]
     fn cleanup_session_cancels_active_task_with_event() {
         use std::sync::atomic::AtomicUsize;
@@ -3083,11 +3147,20 @@ mod tests {
         service.cleanup_session("session-1", &app.handle().clone());
 
         assert!(token.is_cancelled(), "非终态任务的令牌应被 cleanup 触发");
-        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+        assert_eq!(emitted.load(Ordering::Relaxed), 0);
         assert!(
-            !service.tasks.lock().unwrap().contains_key("task-1"),
-            "cleanup 后 registry 不应保留该 session 的任务"
+            service.tasks.lock().unwrap().contains_key("task-1"),
+            "cleanup 后任务应保留至 worker 结案"
         );
+        assert!(service.transition_task(
+            &app.handle(),
+            "task-1",
+            "session-1",
+            SftpTaskStatus::Cancelled,
+            None,
+        ));
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+        assert!(service.tasks.lock().unwrap().is_empty());
     }
 
     // ─── worker 更新 registry 的全链路测试 ─────────────────────────────────
@@ -3703,6 +3776,43 @@ mod tests {
         assert!(!local_path.exists(), "预取消不得写入最终目标");
     }
 
+    /// 安全发布已抢占后，即使关闭 Session 请求取消，实际发布仍必须报告 Done。
+    #[test]
+    fn download_committed_before_close_publishes_target() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let service = SftpService::with_connector(|_, _| Ok(memory_sftp(vec![9u8; 16])));
+        service.register_session("session-1".to_string(), make_host());
+        let checkout = service
+            .handle("session-1")
+            .unwrap()
+            .transfer_pool
+            .checkout(0)
+            .unwrap();
+        let local_path = std::env::temp_dir().join(format!("titan-commit-{}.bin", Uuid::new_v4()));
+        let token = CancelToken::new();
+
+        assert!(token.try_commit());
+        assert!(!token.cancel(), "提交权抢占后关闭取消不得覆盖结果");
+        let outcome = run_transfer_blocking(
+            "task-committed",
+            "session-1",
+            "/remote/file.bin",
+            &local_path.to_string_lossy(),
+            16,
+            &TransferType::Download,
+            Some(ConflictStrategy::Reject),
+            &checkout.transport,
+            &token,
+            app.handle(),
+        );
+
+        assert!(matches!(outcome, TransferOutcome::Done));
+        assert_eq!(std::fs::read(&local_path).unwrap(), vec![9u8; 16]);
+        let _ = std::fs::remove_file(&local_path);
+    }
+
     /// 清理临时文件失败：错误 detail 必须包含临时文件路径。
     #[test]
     fn cleanup_download_temp_failure_includes_temp_path() {
@@ -4127,7 +4237,7 @@ mod tests {
         assert_eq!(service.tasks.lock().unwrap().len(), 3, "重复清除应幂等");
     }
 
-    /// Session 关闭清空 registry 后，迟到 worker 的终态迁移因任务不存在被拒绝。
+    /// Session 关闭保留活任务，迟到 worker 的唯一终态仍必须结案并移除任务。
     #[test]
     fn session_close_clears_registry_and_rejects_late_worker_updates() {
         use tauri::test::mock_app;
@@ -4140,19 +4250,20 @@ mod tests {
 
         assert!(token.is_cancelled());
         assert!(
-            service.tasks.lock().unwrap().is_empty(),
-            "关闭后 registry 应整体清空"
+            service.tasks.lock().unwrap().contains_key("task-late"),
+            "关闭后活任务应保留到真实终态"
         );
         assert!(
-            !service.transition_task(
+            service.transition_task(
                 &app.handle(),
                 "task-late",
                 "session-1",
-                SftpTaskStatus::Done,
+                SftpTaskStatus::Cancelled,
                 None
             ),
-            "迟到 worker 更新必须被拒绝"
+            "迟到 worker 必须发布最终 Cancelled"
         );
+        assert!(service.tasks.lock().unwrap().is_empty());
     }
 
     // ─── 上传临时文件路径（发布目标目录）──────────────────────────────────

@@ -117,6 +117,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         activeView: session.sessionId,
         connections: new Map(state.connections).set(session.sessionId, { phase: null, error: null }),
       }));
+      useSftpStore.getState().ensureState(session.sessionId);
       void useSftpStore.getState().listDir(session.sessionId, '/');
       void useSftpStore.getState().loadTaskSnapshot(session.sessionId);
       try {
@@ -129,8 +130,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
     /** 关闭 SSH 会话；后端统一 teardown，前端只清理 projection。 */
     async closeSession(sessionId) {
-      await invoke('close_session', { sessionId });
-      get().removeSessionProjection(sessionId);
+      useSftpStore.getState().markSessionClosing(sessionId);
+      try {
+        await invoke('close_session', { sessionId });
+        get().removeSessionProjection(sessionId);
+      } finally {
+        useSftpStore.getState().finishSessionClosing(sessionId);
+      }
     },
 
     /** 将用户输入写入指定终端会话。 */

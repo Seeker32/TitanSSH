@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import FileExplorer from '@/components/sftp/FileExplorer';
+import RecentTransfers from '@/components/sftp/RecentTransfers';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
 import { groupHosts } from '@/stores/host';
@@ -24,6 +25,19 @@ vi.mock('@/components/terminal/XtermView', () => ({
 }));
 
 describe('React components', () => {
+  it('近期传输默认折叠，展开显示终态并可清空', async () => {
+    const user = userEvent.setup();
+    const onClear = vi.fn();
+    render(<RecentTransfers tasks={[makeTransferTask({ status: 'Failed', error: { code: 'SftpTransferError', detail: 'closed' } })]} onClear={onClear} />);
+
+    expect(screen.queryByText('syslog')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /近期传输/ }));
+    expect(screen.getByText('syslog')).toBeInTheDocument();
+    expect(screen.getByText('失败')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /清空近期记录/ }));
+    expect(onClear).toHaveBeenCalledOnce();
+  });
+
   it('侧栏主机卡片渲染服务器图标，单击选中、双击连接', async () => {
     const user = userEvent.setup();
     const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };

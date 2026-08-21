@@ -6,6 +6,7 @@ import { LOG_LEVELS, useLogLevelStore, type LogLevel } from '@/stores/log-level'
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
 import SftpPanel from '@/components/sftp/SftpPanel';
+import RecentTransfers from '@/components/sftp/RecentTransfers';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
@@ -39,6 +40,7 @@ export default function HomePage() {
   const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
   const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
   const sftpStates = useSftpStore((state) => state.sessionStates);
+  const recentTransfers = useSftpStore((state) => state.recentTransfers);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
   const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
   const monitorCollapsed = useLayoutStore((state) => state.monitorCollapsed);
@@ -198,6 +200,7 @@ export default function HomePage() {
         onSearchChange={(query) => useHostStore.getState().setSearchQuery(query)}
         onSelect={(hostId) => useHostStore.getState().selectHost(hostId)}
         onOpen={openSession} onCreate={createHost} />
+      <RecentTransfers tasks={recentTransfers} onClear={() => useSftpStore.getState().clearRecentTransfers()} />
       <div className="sidebar-footer">
         {monitorCollapsed ? (
           <div className="sidebar-footer-row">

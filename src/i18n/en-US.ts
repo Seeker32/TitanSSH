@@ -101,6 +101,9 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'sftp.failed': 'Failed',
   'sftp.cancelled': 'Cancelled',
   'sftp.clearTerminal': 'Clear finished',
+  'sftp.recentTransfers': 'Recent transfers',
+  'sftp.noRecentTransfers': 'No closed-session transfer results',
+  'sftp.clearRecentTransfers': 'Clear recent transfers',
   'sftp.defaultDownload': 'download',
 
   // Server monitoring
@@ -199,4 +202,3 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.Unknown': 'Unknown error',
   'error.Timeout': 'Connection timed out',
 };
-

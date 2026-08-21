@@ -353,7 +353,7 @@ fn cleanup_registered_session<R: Runtime>(
     }
     // 停止该会话的全部监控任务（每个任务补发 Done 终态事件）
     monitor_service.stop_session(app, session_id);
-    // 清理 SFTP 状态，取消所有 Pending/Running 任务并推送 sftp:task_status = Cancelled
+    // 关闭 SFTP capability 并请求取消；worker 随后发布唯一的真实终态
     sftp_service.cleanup_session(session_id, app);
     true
 }

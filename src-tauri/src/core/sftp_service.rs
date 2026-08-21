@@ -11,9 +11,9 @@ use crate::models::sftp::{
 };
 use crate::storage::secure_store;
 use log::warn;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -43,29 +43,57 @@ fn get_semaphore() -> Arc<Semaphore> {
 /// 使等待全局 permit 的任务也能即时终止。
 #[derive(Clone)]
 pub struct CancelToken {
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<AtomicU8>,
     notified: Arc<tokio::sync::Notify>,
 }
+
+const CANCEL_ACTIVE: u8 = 0;
+const CANCELLED: u8 = 1;
+const COMMITTING: u8 = 2;
 
 impl CancelToken {
     /// 创建新的取消令牌
     pub fn new() -> Self {
         Self {
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: Arc::new(AtomicU8::new(CANCEL_ACTIVE)),
             notified: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// 触发取消并唤醒所有等待方；重复调用幂等
-    pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.notified.notify_one();
+    /// 请求取消；安全发布已开始时返回 false，最终结果交由发布实际结果决定。
+    pub fn cancel(&self) -> bool {
+        match self.state.compare_exchange(
+            CANCEL_ACTIVE,
+            CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.notified.notify_one();
+                true
+            }
+            Err(CANCELLED) => true,
+            Err(COMMITTING) => false,
+            Err(_) => false,
+        }
     }
 
     /// 检查是否已取消
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+        self.state.load(Ordering::Acquire) == CANCELLED
+    }
+
+    /// 抢占安全发布权：成功后取消请求不再生效，终态只能由发布结果决定。
+    pub fn try_commit(&self) -> bool {
+        match self.state.compare_exchange(
+            CANCEL_ACTIVE,
+            COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(COMMITTING) => true,
+            Err(_) => false,
+        }
     }
 
     /// 异步等待取消：已取消立即返回，未取消阻塞到 cancel() 触发。
@@ -305,6 +333,8 @@ impl SftpHandle {
 pub struct SftpService {
     handles: Arc<Mutex<HashMap<String, Arc<SftpHandle>>>>,
     tasks: Arc<Mutex<HashMap<String, TransferTask>>>,
+    /// 已关闭但仍有 worker 正在收敛终态的 Session；任务最终结案后立即移除。
+    closing_sessions: Arc<Mutex<HashSet<String>>>,
     connector: SftpConnector,
     /// 传输连接池的单调时间源
     clock: Arc<TransferClock>,
@@ -393,6 +423,7 @@ impl SftpService {
         Self {
             handles: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            closing_sessions: Arc::new(Mutex::new(HashSet::new())),
             connector: Arc::new(connector),
             clock: Arc::new(clock),
             idle_timeout,
@@ -830,6 +861,7 @@ impl SftpService {
         }
         task.status = status.clone();
         task.error = error.clone();
+        let terminal_task = is_terminal(&status).then(|| task.clone());
         // 终态迁移在 registry 同一临界区内执行淘汰：不暴露超限中间状态
         if is_terminal(&status) {
             evict_old_terminal_tasks(&mut tasks, session_id);
@@ -861,15 +893,61 @@ impl SftpService {
                 session_id, task_id, status, emit_error
             );
         }
+        if let Some(task) = terminal_task {
+            if let Err(emit_error) = app.emit("sftp:task_finished", task) {
+                warn!(
+                    "[session:{}][task:{}][diagnostic] Failed to emit SFTP completion: {}",
+                    session_id, task_id, emit_error
+                );
+            }
+            self.remove_closed_task(task_id, session_id);
+        }
         true
+    }
+
+    /// 移除已关闭 Session 的已结案任务；最后一条任务完成后同步撤下关闭标记。
+    fn remove_closed_task(&self, task_id: &str, session_id: &str) {
+        if !self
+            .closing_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session_id)
+        {
+            return;
+        }
+        let empty = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.remove(task_id);
+            !tasks.values().any(|task| task.session_id == session_id)
+        };
+        if empty {
+            self.closing_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id);
+        }
+    }
+
+    /// 判断 Session 是否正在关闭；worker 据此把迟到 checkout 归为取消而非连接失败。
+    fn is_closing_session(&self, session_id: &str) -> bool {
+        self.closing_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session_id)
     }
 
     /// 清理指定 session 的所有任务（session 关闭时调用）
     ///
-    /// 只取消并迁移尚未终态的任务（registry 为权威状态），推送一次
-    /// sftp:task_status = Cancelled；终态任务不再重复取消或发矛盾事件。
-    /// 清理完成后该 session 的任务从 registry 整体移除。
-    pub fn cleanup_session<R: Runtime>(&self, session_id: &str, app: &AppHandle<R>) {
+    /// 立即关闭 capability 并请求取消；不等待阻塞 worker，worker 自行收敛为唯一终态。
+    pub fn cleanup_session<R: Runtime>(&self, session_id: &str, _app: &AppHandle<R>) {
+        // 先标记关闭再移除 handle，避免 worker 在两者之间把“已关闭”误报为连接失败。
+        self.closing_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.to_string());
         let handle = self
             .handles
             .lock()
@@ -898,15 +976,30 @@ impl SftpService {
                     .map(|(task_id, entry)| (task_id.clone(), entry.token.clone()))
                     .collect()
             };
-            for (task_id, token) in active {
+            for (_, token) in active {
                 token.cancel();
-                self.transition_task(app, &task_id, session_id, SftpTaskStatus::Cancelled, None);
             }
-            // registry 只保留活任务：session 关闭后整体移除，迟到的 worker 迁移因任务不存在被拒绝
-            self.tasks
+            // 已在关闭前结案的记录无需等待 worker；活任务保留至其真实终态事件发出。
+            let empty = {
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tasks.retain(|_, task| task.session_id != session_id || !is_terminal(&task.status));
+                !tasks.values().any(|task| task.session_id == session_id)
+            };
+            if empty {
+                self.closing_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(session_id);
+            }
+        } else {
+            // 幂等关闭：未注册 session 不应遗留关闭标记。
+            self.closing_sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .retain(|_, task| task.session_id != session_id);
+                .remove(session_id);
         }
     }
 
@@ -931,7 +1024,7 @@ impl SftpService {
     /// 返回指定 Session 的权威任务快照，按 createdAt 最新优先排序。
     ///
     /// 前端用快照重建投影以恢复错过的事件，后续事件继续增量更新；
-    /// Session 关闭后 registry 已整体清空，快照返回空列表。
+    /// Session 关闭时活任务会暂存至 worker 发布真实终态，前端关闭 projection 后不再请求快照。
     ///
     /// # 参数
     /// - `session_id`: 关联会话 ID
@@ -1005,6 +1098,9 @@ impl SftpService {
                 let session_id = session_id.clone();
                 tokio::task::spawn_blocking(move || match service.handle(&session_id) {
                     Ok(handle) => handle.transfer_pool.checkout(queue_seq),
+                    Err(_) if service.is_closing_session(&session_id) => {
+                        Err(CheckoutError::Cancelled)
+                    }
                     Err(error) => Err(CheckoutError::Connect(error)),
                 })
                 .await
@@ -1023,8 +1119,14 @@ impl SftpService {
                     return;
                 }
                 Ok(Err(CheckoutError::Closed)) => {
-                    // Session 已关闭：cleanup 已迁移任务并整体移除 registry，
-                    // 迟到 worker 静默终止，不重复发事件
+                    // Session 已关闭：任务仍在 registry 中，必须发布权威 Cancelled 终态。
+                    service.transition_task(
+                        &app,
+                        &task_id,
+                        &session_id,
+                        SftpTaskStatus::Cancelled,
+                        None,
+                    );
                     return;
                 }
                 Ok(Err(CheckoutError::Connect(error))) => {
@@ -1085,8 +1187,7 @@ impl SftpService {
                 }
             };
 
-            // ③ select 随机分支可能已错过并发取消：迁移 Running 前再确认一次；
-            //    若已由 cleanup 迁移则被拒绝
+            // ③ select 随机分支可能已错过并发取消：迁移 Running 前再确认一次。
             if cancel_token.is_cancelled() {
                 service.release_transfer_connection(&session_id, checkout, true);
                 service.transition_task(
@@ -1405,8 +1506,9 @@ fn run_transfer_blocking<R: Runtime>(
             }
             drop(local_file);
 
-            // 发布前再次检查取消：已取消的传输不得发布最终文件
-            if cancel_token.is_cancelled() {
+            // 以原子仲裁锁定安全发布：取消先到则清理临时文件；提交先到则最终结果
+            // 必须由实际发布决定，关闭 Session 不得再伪造 Cancelled。
+            if !cancel_token.try_commit() {
                 return TransferOutcome::Cancelled(cleanup_download_temp(&temp_path).err());
             }
 
@@ -1491,8 +1593,9 @@ fn run_transfer_blocking<R: Runtime>(
             }
             drop(remote_file);
 
-            // 发布前再次检查取消：已取消的传输不得发布最终文件
-            if cancel_token.is_cancelled() {
+            // 以原子仲裁锁定安全发布：取消先到则清理临时文件；提交先到则最终结果
+            // 必须由实际发布决定，关闭 Session 不得再伪造 Cancelled。
+            if !cancel_token.try_commit() {
                 return TransferOutcome::Cancelled(
                     cleanup_upload_temp(&mut sftp, &temp_path_str).err(),
                 );

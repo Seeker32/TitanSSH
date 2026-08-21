@@ -75,6 +75,17 @@ button { cursor: pointer; }
 .sidebar-empty-msg { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 24px 8px;
   color: var(--color-text-tertiary); font-size: 12px; text-align: center; }
 .sidebar-empty-icon { color: var(--color-text-tertiary); }
+.recent-transfers { flex-shrink: 0; border-top: 1px solid var(--color-border); padding-top: 6px; }
+.recent-transfers-header, .recent-transfers-clear { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: var(--color-text-secondary); font-size: 11px; }
+.recent-transfers-header { width: 100%; padding: 3px 0; text-align: left; }
+.recent-transfers-count { margin-left: auto; color: var(--color-text-tertiary); }
+.recent-transfers-chevron--collapsed { transform: rotate(-90deg); }
+.recent-transfers-body { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; padding-top: 4px; }
+.recent-transfers-clear { align-self: flex-end; padding: 2px; }
+.recent-transfers-empty { padding: 6px 0; color: var(--color-text-tertiary); font-size: 11px; }
+.recent-transfer-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 5px; padding: 4px; border-radius: 4px; background: var(--color-card-bg); font-size: 11px; }
+.recent-transfer-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-transfer-error { grid-column: 2 / -1; color: var(--color-danger); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-create-btn { padding: 4px 14px; border: 1px solid var(--color-border); border-radius: 6px;
   background: var(--color-card-bg); color: var(--color-accent); font-size: 12px; }
 .sidebar-create-btn:hover { border-color: var(--color-border-focus); background: var(--color-card-bg-hover); }

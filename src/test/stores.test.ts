@@ -20,6 +20,7 @@ function resetStores() {
   useMonitorStore.setState(useMonitorStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
+  useSftpStore.getState().ensureState('session-1');
 }
 
 beforeEach(() => {
@@ -725,6 +726,8 @@ describe('Zustand stores', () => {
 
   it('SFTP 多会话状态互不影响', async () => {
     mockInvoke.mockResolvedValueOnce([makeRemoteEntry()]).mockResolvedValueOnce([]);
+    useSftpStore.getState().ensureState('a');
+    useSftpStore.getState().ensureState('b');
     await useSftpStore.getState().listDir('a', '/a');
     await useSftpStore.getState().listDir('b', '/b');
     expect(useSftpStore.getState().getState('a')?.entries).toHaveLength(1);
@@ -836,6 +839,9 @@ describe('Zustand stores', () => {
       .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveAOld = resolve; }))
       .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveB = resolve; }))
       .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveANew = resolve; }));
+
+    useSftpStore.getState().ensureState('a');
+    useSftpStore.getState().ensureState('b');
 
     const aOld = useSftpStore.getState().listDir('a', '/a-old');
     const b = useSftpStore.getState().listDir('b', '/b');
@@ -1114,6 +1120,28 @@ describe('Zustand stores', () => {
     // 关闭后到达的迟到状态事件（后端 cleanup 的 Cancelled）直接丢弃，不再落回缓存
     useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Cancelled', error: null });
     expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
+  });
+
+  it('关闭后迟到的目录失败不得重新创建 SFTP projection', async () => {
+    let rejectRequest!: (error: unknown) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<RemoteEntry[]>((_, reject) => { rejectRequest = reject; }));
+    useSftpStore.getState().ensureState('session-1');
+
+    const request = useSftpStore.getState().listDir('session-1', '/');
+    useSftpStore.getState().clearSession('session-1');
+    rejectRequest({ code: 'SessionNotFound', detail: 'session-1' });
+    await request;
+
+    expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
+  });
+
+  it('关闭中的会话终态进入有界近期传输记录', () => {
+    useSftpStore.getState().ensureState('session-1');
+    useSftpStore.getState().markSessionClosing('session-1');
+    useSftpStore.getState().applyFinishedTask(makeTransferTask({ status: 'Done' }));
+
+    expect(useSftpStore.getState().recentTransfers).toHaveLength(1);
+    expect(useSftpStore.getState().recentTransfers[0]?.status).toBe('Done');
   });
 
   it('打开会话时从后端权威快照恢复任务投影', async () => {
