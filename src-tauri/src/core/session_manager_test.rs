@@ -1,14 +1,16 @@
 #[cfg(test)]
 mod tests {
     use crate::core::session_manager::*;
+    use crate::core::shared_exec_registry::SharedExecRegistry;
     use crate::models::host::{AuthType, HostConfig};
 
     /// 创建共享运行时状态一致的 SessionManager。
     fn make_manager() -> SessionManager {
         SessionManager::new(
-            MonitorService::new(),
+            MonitorService::new(SharedExecRegistry::new()),
             SftpService::new(),
             HostIdentityService::new(),
+            SharedExecRegistry::new(),
         )
     }
 
@@ -71,9 +73,10 @@ mod tests {
             Err(AppError::SshConnectionError("unused".to_string().into()))
         });
         let manager = SessionManager::new(
-            MonitorService::new(),
+            MonitorService::new(SharedExecRegistry::new()),
             sftp_service.clone(),
             HostIdentityService::new(),
+            SharedExecRegistry::new(),
         );
         for session_id in ["session-exit-a", "session-exit-b"] {
             manager.insert_session_for_test(session_id, make_host(session_id));
@@ -131,9 +134,10 @@ mod tests {
             ))
         });
         let manager = SessionManager::new(
-            MonitorService::new(),
+            MonitorService::new(SharedExecRegistry::new()),
             sftp_service.clone(),
             HostIdentityService::new(),
+            SharedExecRegistry::new(),
         );
 
         let session = manager
@@ -157,9 +161,10 @@ mod tests {
             ))
         });
         let manager = SessionManager::new(
-            MonitorService::new(),
+            MonitorService::new(SharedExecRegistry::new()),
             sftp_service.clone(),
             HostIdentityService::new(),
+            SharedExecRegistry::new(),
         );
         let mut host = make_host("host-terminal-startup-failure");
         host.password_ref = None;
@@ -194,7 +199,12 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
-        let manager = SessionManager::new(MonitorService::new(), sftp_service, identity.clone());
+        let manager = SessionManager::new(
+            MonitorService::new(SharedExecRegistry::new()),
+            sftp_service,
+            identity.clone(),
+            SharedExecRegistry::new(),
+        );
         let session_id = "session-identity-close".to_string();
         let (command_tx, _command_rx) = mpsc::channel();
 
@@ -251,7 +261,7 @@ mod tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let monitor_service = MonitorService::new();
+        let monitor_service = MonitorService::new(SharedExecRegistry::new());
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
                 "expected test failure".to_string().into(),
@@ -261,6 +271,7 @@ mod tests {
             monitor_service.clone(),
             sftp_service.clone(),
             HostIdentityService::new(),
+            SharedExecRegistry::new(),
         );
         let session_id = "session-close-all".to_string();
         let terminal_shutdown = Arc::new(AtomicBool::new(false));
@@ -308,5 +319,113 @@ mod tests {
         assert!(monitor_shutdown.load(Ordering::Acquire));
         assert!(monitor_service.tasks.lock().unwrap().is_empty());
         assert!(!sftp_service.has_session(&session_id));
+    }
+
+    /// 带释放信号的内存共享连接条目，供 teardown 回收断言。
+    struct DroppingEntry {
+        dropped: std::sync::mpsc::Sender<()>,
+    }
+
+    impl crate::core::shared_exec_registry::ExecConnectionEntry for DroppingEntry {
+        /// 派生固定输出 capability（teardown 测试不执行采集）。
+        fn exec_transport(&self) -> crate::core::ssh_transport::ExecTransport {
+            crate::core::ssh_transport::test_support::repeating_exec("METRIC=1".to_string())
+        }
+    }
+
+    impl Drop for DroppingEntry {
+        /// 最后一个引用消失时通知测试。
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    /// session teardown 必须回收共享 exec 注册表中的连接：条目释放、无泄漏；
+    /// 其他会话的连接不受影响。
+    #[test]
+    fn close_session_recycles_shared_exec_connection() {
+        use crate::core::shared_exec_registry::SharedExecRegistry;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let registry = SharedExecRegistry::new();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let (other_tx, other_rx) = std::sync::mpsc::channel();
+
+        // 预置目标会话与其他会话的共享连接
+        registry
+            .resolve("session-close-exec", || {
+                Ok(DroppingEntry {
+                    dropped: dropped_tx,
+                })
+            })
+            .expect("预置目标会话连接应成功");
+        registry
+            .resolve("session-other-exec", || {
+                Ok(DroppingEntry { dropped: other_tx })
+            })
+            .expect("预置其他会话连接应成功");
+
+        let manager = SessionManager::new(
+            MonitorService::new(registry.clone()),
+            SftpService::with_connector(|_, _| {
+                Err(AppError::SshConnectionError("unused".to_string().into()))
+            }),
+            HostIdentityService::new(),
+            registry.clone(),
+        );
+        manager.insert_session_for_test("session-close-exec", make_host("host-1"));
+
+        manager
+            .close_session("session-close-exec", &app.handle().clone())
+            .unwrap();
+
+        assert!(
+            !registry.contains("session-close-exec"),
+            "teardown 后不得残留连接条目"
+        );
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("teardown 必须释放共享连接（无泄漏）");
+        assert!(
+            registry.contains("session-other-exec"),
+            "回收不得影响其他会话的连接"
+        );
+        assert!(other_rx.try_recv().is_err(), "其他会话连接不得被释放");
+    }
+
+    /// 应用退出时除逐会话回收外，还需清空注册表：不在 sessions 索引中的
+    /// 残留条目（如回收后才插入的迟来连接）也不得泄漏。
+    #[test]
+    fn shutdown_all_clears_leftover_shared_exec_entries() {
+        use crate::core::shared_exec_registry::SharedExecRegistry;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let registry = SharedExecRegistry::new();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        registry
+            .resolve("session-orphan-exec", || {
+                Ok(DroppingEntry {
+                    dropped: dropped_tx,
+                })
+            })
+            .expect("预置孤立条目应成功");
+
+        let manager = SessionManager::new(
+            MonitorService::new(registry.clone()),
+            SftpService::with_connector(|_, _| {
+                Err(AppError::SshConnectionError("unused".to_string().into()))
+            }),
+            HostIdentityService::new(),
+            registry.clone(),
+        );
+
+        manager.shutdown_all(app.handle());
+
+        assert!(!registry.contains("session-orphan-exec"));
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("退出兜底必须清空全部残留条目");
     }
 }

@@ -31,11 +31,13 @@ mod tests {
     /// 构造已注册监控命令的 mock 应用；MonitorService 与 SessionManager
     /// 共享同一监控服务实例，返回句柄用于构建 webview。
     fn test_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<MonitorService>) {
-        let service = MonitorService::new();
+        let exec_registry = crate::core::shared_exec_registry::SharedExecRegistry::new();
+        let service = MonitorService::new(exec_registry.clone());
         let session_manager = SessionManager::new(
             service.clone(),
             SftpService::new(),
             HostIdentityService::new(),
+            exec_registry,
         );
         let app = mock_builder()
             .manage(service.clone())

@@ -2,6 +2,7 @@
 mod service_tests {
     use crate::core::host_identity::HostKeyVerifier;
     use crate::core::monitor_service::*;
+    use crate::core::shared_exec_registry::SharedExecRegistry;
     use crate::models::host::{AuthType, HostConfig};
     use std::sync::Arc;
 
@@ -35,7 +36,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         let mut host = make_host();
         host.auth_type = AuthType::Password;
         host.password_ref = None;
@@ -62,7 +63,7 @@ mod service_tests {
     fn start_monitoring_initial_task_is_pending() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         let task = service
             .start_monitoring(
                 "session-1".to_string(),
@@ -76,12 +77,69 @@ mod service_tests {
         assert_eq!(task.session_id, Some("session-1".to_string()));
     }
 
+    /// 生产链路验证：start_monitoring 的共享连接来源是服务持有的共享 exec
+    /// 注册表——预置内存连接后监控任务照常产出快照，全程不拨真实网络。
+    /// 固定输出带满全部指标键，避免退化快照校验误报。
+    #[test]
+    fn start_monitoring_collects_through_shared_exec_registry() {
+        use crate::core::shared_exec_registry::{ExecConnectionEntry, SharedExecRegistry};
+        use crate::core::ssh_transport::ExecTransport;
+        use crate::core::ssh_transport::test_support::repeating_exec;
+        use std::time::{Duration, Instant};
+        use tauri::test::mock_app;
+
+        struct SeededEntry;
+        impl ExecConnectionEntry for SeededEntry {
+            /// 每次采集返回固定指标输出，模拟持续可用的共享连接。
+            fn exec_transport(&self) -> ExecTransport {
+                repeating_exec(
+                    "CPU_TOTAL=100\nCPU_IDLE=20\nMEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=500\nDISK=25\nDISK_AVAIL=750\nDISK_TOTAL=1000".to_string(),
+                )
+            }
+        }
+
+        let app = mock_app();
+        let registry = SharedExecRegistry::new();
+        registry
+            .resolve("session-1", || Ok(SeededEntry))
+            .expect("预置共享连接应成功");
+        let service = MonitorService::new(registry);
+
+        let task = service
+            .start_monitoring(
+                "session-1".to_string(),
+                make_host(),
+                test_allow_all_verifier(),
+                app.handle().clone(),
+            )
+            .expect("监控任务应启动");
+
+        // 后台线程异步采集：有界轮询等待首个快照落缓存
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            if let Some(snapshot) = service.get_monitor_status("session-1") {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "5 秒内应产出首个快照（共享连接应被复用）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(snapshot.session_id, "session-1");
+        assert_eq!(snapshot.disk_usage, Some(25.0));
+
+        // 停止后任务句柄移除；重复 stop 区分「已停止」
+        assert!(service.stop_monitoring(app.handle(), &task.task_id));
+        assert!(!service.stop_monitoring(app.handle(), &task.task_id));
+    }
+
     /// stop_monitoring 设置关闭标志后任务从 HashMap 中移除，并返回 true 表示确实移除
     #[test]
     fn stop_monitoring_removes_task_handle() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         let task = service
             .start_monitoring(
                 "session-1".to_string(),
@@ -104,7 +162,7 @@ mod service_tests {
     fn stop_monitoring_unknown_task_returns_false() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         assert!(
             !service.stop_monitoring(app.handle(), "task-never-existed"),
             "未知任务 stop 应返回 false"
@@ -138,7 +196,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Pending);
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_ref = emitted.clone();
@@ -175,7 +233,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_ref = emitted.clone();
@@ -232,7 +290,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_ref = emitted.clone();
         app.listen("task:status", move |_| {
@@ -255,7 +313,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Pending);
 
         assert!(!transition_task_status(
@@ -293,7 +351,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_ref = emitted.clone();
@@ -319,7 +377,7 @@ mod service_tests {
     fn stop_session_cleans_only_matching_monitor_state() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         let target_shutdown = Arc::new(AtomicBool::new(false));
         let other_shutdown = Arc::new(AtomicBool::new(false));
 
@@ -378,7 +436,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let captured_ref = captured.clone();
@@ -405,7 +463,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Failed);
         let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let captured_ref = captured.clone();
@@ -431,7 +489,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         insert_task(&service, "task-2", "session-1", TaskStatus::Running);
         insert_task(&service, "task-other", "session-2", TaskStatus::Running);
@@ -494,7 +552,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let snapshot = make_snapshot("session-1");
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -545,7 +603,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let shutdown = Arc::new(AtomicBool::new(false));
         let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
@@ -595,7 +653,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let captured_ref = captured.clone();
@@ -634,7 +692,7 @@ mod service_tests {
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let captured_ref = captured.clone();
@@ -670,7 +728,7 @@ mod service_tests {
     fn service_entries_tolerate_poisoned_mutexes() {
         use tauri::test::mock_app;
         let app = mock_app();
-        let service = MonitorService::new();
+        let service = MonitorService::new(SharedExecRegistry::new());
         insert_task(&service, "task-1", "session-1", TaskStatus::Running);
         service.insert_snapshot_for_test(make_snapshot("session-1"));
 

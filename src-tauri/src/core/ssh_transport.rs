@@ -8,6 +8,7 @@ use ssh2::{Channel, Session, Sftp};
 use std::io::{self, Read, Write};
 use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -464,13 +465,20 @@ impl SftpOps for Ssh2Sftp {
 }
 
 struct Ssh2Exec {
-    session: Session,
+    session: Arc<Mutex<Session>>,
 }
 
 impl ExecOps for Ssh2Exec {
-    /// 通过独立 ssh2 Session 执行命令并读取合并后的 stdout/stderr。
+    /// 通过共享 ssh2 Session 执行命令并读取合并后的 stdout/stderr。
+    ///
+    /// 底层 Session 被多个采样 capability 共享（ssh2 Session 是 Send 非 Sync），
+    /// 所有 execute 经互斥锁串行化；单个 channel 的读取流程与独占连接一致。
     fn execute(&mut self, command: &str) -> Result<String, AppError> {
-        let mut channel = self.session.channel_session().map_err(protocol_error)?;
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut channel = session.channel_session().map_err(protocol_error)?;
         // 合并 stderr 后以单一流读取，防止 stderr 填满 SSH channel window 使远端
         // 阻塞、stdout 永不 EOF。必须在 exec 前设置，确保整个命令生命周期生效。
         channel
@@ -482,6 +490,35 @@ impl ExecOps for Ssh2Exec {
         channel.wait_close().map_err(protocol_error)?;
         let exit_status = channel.exit_status().map_err(protocol_error)?;
         decode_exec_output(&output, exit_status)
+    }
+}
+
+/// 共享 exec 连接：监控/进程采样共用的传输层连接（注册表条目）。
+///
+/// 底层 `Arc<Mutex<Session>>` 串行化 execute；`exec_transport` 可反复派生
+/// 共享同一连接的 capability，连接断开时全部引用者同步感知失败（共享命运）。
+pub struct SharedExecConnection {
+    session: Arc<Mutex<Session>>,
+}
+
+impl SharedExecConnection {
+    /// 建立共享 exec 专用 SSH 连接；raw Session 不离开 transport 层组合。
+    ///
+    /// 与其他 capability 一样经统一主机身份校验：握手后、认证前生效。
+    fn from_session(session: Session) -> Self {
+        clear_long_lived_session_timeout(&session);
+        Self {
+            session: Arc::new(Mutex::new(session)),
+        }
+    }
+}
+
+impl crate::core::shared_exec_registry::ExecConnectionEntry for SharedExecConnection {
+    /// 派生共享同一底层 Session 的 exec capability。
+    fn exec_transport(&self) -> ExecTransport {
+        ExecTransport::from_backend(Ssh2Exec {
+            session: Arc::clone(&self.session),
+        })
     }
 }
 
@@ -545,16 +582,18 @@ pub fn connect_sftp(
     Ok(SftpTransport::from_backend(Ssh2Sftp { sftp }))
 }
 
-/// 建立 Monitoring exec 专用 SSH 连接。
-pub fn connect_exec(
+/// 建立共享 exec 连接（监控/进程采样的共享传输；注册表条目类型）。
+///
+/// 连接本身是纯基础设施：调用方把它插入 SharedExecRegistry 供多个采样
+/// 服务共享，不再各自建立专用连接。
+pub fn connect_shared_exec(
     host: &HostConfig,
     password: Option<&str>,
     passphrase: Option<&str>,
     verifier: &HostKeyVerifier,
-) -> Result<ExecTransport, AppError> {
+) -> Result<SharedExecConnection, AppError> {
     let session = connect_session(host, password, passphrase, verifier, &mut |_| {})?;
-    clear_long_lived_session_timeout(&session);
-    Ok(ExecTransport::from_backend(Ssh2Exec { session }))
+    Ok(SharedExecConnection::from_session(session))
 }
 
 /// 清除已认证长生命周期连接的 libssh2 阻塞超时。
@@ -1911,6 +1950,39 @@ pub(crate) mod test_support {
     /// 创建只返回一轮 stdout 的 Exec 测试 capability。
     pub(crate) fn one_shot_exec(output: String, shutdown: Arc<AtomicBool>) -> ExecTransport {
         ExecTransport::from_backend(OneShotExec { output, shutdown })
+    }
+
+    /// 创建每次执行都返回同一输出的 Exec 测试 capability，供服务级集成测试
+    /// 驱动持续采样（循环由任务关闭标志终止，不由 capability 终止）。
+    pub(crate) fn repeating_exec(output: String) -> ExecTransport {
+        struct RepeatingExec {
+            output: String,
+        }
+
+        impl ExecOps for RepeatingExec {
+            /// 永远返回固定 stdout，模拟持续可用的共享采集连接。
+            fn execute(&mut self, _command: &str) -> Result<String, AppError> {
+                Ok(self.output.clone())
+            }
+        }
+
+        ExecTransport::from_backend(RepeatingExec { output })
+    }
+
+    /// 创建持续返回连接错误的 Exec 测试 capability，模拟共享连接已断开。
+    pub(crate) fn failing_exec() -> ExecTransport {
+        struct FailingExec;
+
+        impl ExecOps for FailingExec {
+            /// 每次执行都返回连接错误，驱动监控循环的失败路径。
+            fn execute(&mut self, _command: &str) -> Result<String, AppError> {
+                Err(AppError::SshConnectionError(
+                    "mock 连接已断开".to_string().into(),
+                ))
+            }
+        }
+
+        ExecTransport::from_backend(FailingExec)
     }
 
     /// 创建在释放时发送信号的 SFTP 测试 capability。

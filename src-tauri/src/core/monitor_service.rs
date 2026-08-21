@@ -1,5 +1,6 @@
 use crate::core::host_identity::HostKeyVerifier;
 use crate::core::monitor_worker;
+use crate::core::shared_exec_registry::SharedExecRegistry;
 use crate::errors::app_error::AppErrorInfo;
 use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, HostConfig};
@@ -31,21 +32,28 @@ pub struct MonitorService {
     pub(crate) tasks: Arc<Mutex<HashMap<String, MonitorTaskHandle>>>,
     /// 最新监控快照的 HashMap，键为 session_id
     snapshots: Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    /// 共享 exec 连接注册表：采样连接的来源（按 sessionId 解析，随 session 回收）
+    exec_registry: SharedExecRegistry,
 }
 
 impl MonitorService {
     /// 创建新的监控服务实例
-    pub fn new() -> Self {
+    ///
+    /// # 参数
+    /// - `exec_registry`: 共享 exec 连接注册表；必须与 SessionManager 的 teardown
+    ///   回收方共享同一实例
+    pub fn new(exec_registry: SharedExecRegistry) -> Self {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             snapshots: Arc::new(Mutex::new(HashMap::new())),
+            exec_registry,
         }
     }
 
     /// 为指定会话启动监控任务（真实 SSH 采集）
     ///
     /// 生成唯一 task_id，创建 TaskInfo（初始状态为 Pending），
-    /// 启动后台工作线程通过独立 SSH 连接定期采集快照并推送事件。
+    /// 启动后台工作线程通过共享 exec 连接定期采集快照并推送事件。
     ///
     /// # 参数
     /// - `session_id`: 关联的会话 ID
@@ -109,6 +117,8 @@ impl MonitorService {
         // 克隆共享状态引用，供工作线程使用
         let tasks_ref = Arc::clone(&self.tasks);
         let snapshots_ref = Arc::clone(&self.snapshots);
+        // 共享连接注册表句柄随 worker 线程下沉：连接在循环内按需解析
+        let exec_registry = self.exec_registry.clone();
 
         // 派发 Pending 状态事件
         emit_task_status(&app, &task_id, TaskStatus::Pending, None);
@@ -132,6 +142,7 @@ impl MonitorService {
             // 任务不得卡死在 Running 的幽灵状态（见 run_loop_with_panic_guard）
             run_loop_with_panic_guard(&tasks_ref, &app, &task_id, move || {
                 monitor_worker::run_monitor_loop(
+                    exec_registry.clone(),
                     verifier,
                     monitor_worker::MonitorLoopParams {
                         host,

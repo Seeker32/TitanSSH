@@ -5,6 +5,7 @@ pub mod monitor_service;
 pub mod monitor_worker;
 pub mod session_manager;
 pub mod sftp_service;
+pub mod shared_exec_registry;
 pub mod ssh_transport;
 pub mod terminal_service;
 mod transfer_pool;

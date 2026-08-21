@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::core::shared_exec_registry::ExecConnectionEntry;
     use crate::core::ssh_transport::test_support::allow_all_verifier;
     use crate::core::ssh_transport::{
         ConnectPhase, LIBSSH2_ERROR_EAGAIN, RemoteFile, SSH_PROTOCOL_TIMEOUT_MS, SftpEntry,
@@ -624,13 +625,14 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let (host, password, passphrase) = e2e_host();
-        let mut exec = crate::core::ssh_transport::connect_exec(
+        let mut exec = crate::core::ssh_transport::connect_shared_exec(
             &host,
             password.as_deref(),
             passphrase.as_deref(),
             &allow_all_verifier(),
         )
-        .expect("Exec transport 应连接成功");
+        .expect("Exec transport 应连接成功")
+        .exec_transport();
         let remote_path = format!("/tmp/titan-transport-{}.bin", uuid::Uuid::new_v4());
         exec.execute(&format!(
             "dd if=/dev/zero of={} bs=1048576 count=8 2>/dev/null",
@@ -730,13 +732,14 @@ mod tests {
             Ok(())
         });
         {
-            let mut exec = crate::core::ssh_transport::connect_exec(
+            let mut exec = crate::core::ssh_transport::connect_shared_exec(
                 &host,
                 password.as_deref(),
                 passphrase.as_deref(),
                 &capture_verifier,
             )
-            .expect("采集连接应成功");
+            .expect("采集连接应成功")
+            .exec_transport();
             exec.execute("true").expect("采集连接应可执行命令");
         }
         let presented = captured
@@ -823,13 +826,14 @@ mod tests {
         drop(sftp);
 
         // 5. Monitoring：Exec transport 执行采集命令并返回非空输出
-        let mut exec = crate::core::ssh_transport::connect_exec(
+        let mut exec = crate::core::ssh_transport::connect_shared_exec(
             &host,
             password.as_deref(),
             passphrase.as_deref(),
             &verifier,
         )
-        .expect("Exec 应连接成功");
+        .expect("Exec 应连接成功")
+        .exec_transport();
         let monitor_output = exec
             .execute("head -n 1 /proc/meminfo 2>/dev/null || vm_stat | head -n 1")
             .expect("监控采集命令应执行成功");

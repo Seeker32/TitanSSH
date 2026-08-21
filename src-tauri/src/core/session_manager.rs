@@ -1,6 +1,7 @@
 use crate::core::host_identity::{HostIdentityService, HostKeyVerifier};
 use crate::core::monitor_service::MonitorService;
 use crate::core::sftp_service::SftpService;
+use crate::core::shared_exec_registry::SharedExecRegistry;
 use crate::core::terminal_service;
 use crate::core::terminal_service::TerminalCommand;
 use crate::errors::app_error::AppError;
@@ -42,21 +43,29 @@ pub struct SessionManager {
     monitor_service: MonitorService,
     /// File Transfer module，共享 clone 只复制内部 registry 引用。
     sftp_service: SftpService,
+    /// 共享 exec 连接注册表：session teardown 时回收采样共享连接
+    exec_registry: SharedExecRegistry,
     /// 主机身份确认服务：临时信任与 pending challenge 的单一后端权威
     identity_service: HostIdentityService,
 }
 
 impl SessionManager {
-    /// 使用共享 Monitoring、File Transfer 与主机身份确认状态创建会话管理器实例
+    /// 使用共享 Monitoring、File Transfer、共享采样连接与主机身份确认状态创建会话管理器实例
+    ///
+    /// # 参数
+    /// - `monitor_service`: 必须与本实例的 `exec_registry` 共享同一注册表，
+    ///   否则监控任务解析的连接无法被 teardown 回收
     pub fn new(
         monitor_service: MonitorService,
         sftp_service: SftpService,
         identity_service: HostIdentityService,
+        exec_registry: SharedExecRegistry,
     ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             monitor_service,
             sftp_service,
+            exec_registry,
             identity_service,
         }
     }
@@ -133,6 +142,7 @@ impl SessionManager {
         let sessions_for_cleanup = Arc::clone(&self.sessions);
         let monitor_service_for_cleanup = self.monitor_service.clone();
         let sftp_service_for_cleanup = self.sftp_service.clone();
+        let exec_registry_for_cleanup = self.exec_registry.clone();
         let identity_service_for_cleanup = self.identity_service.clone();
         let app_for_cleanup = app.clone();
         let session_id_for_cleanup = session_id.clone();
@@ -149,6 +159,7 @@ impl SessionManager {
                     &sessions_for_cleanup,
                     &monitor_service_for_cleanup,
                     &sftp_service_for_cleanup,
+                    &exec_registry_for_cleanup,
                     &identity_service_for_cleanup,
                     &session_id_for_cleanup,
                     &app_for_cleanup,
@@ -210,6 +221,7 @@ impl SessionManager {
             &self.sessions,
             &self.monitor_service,
             &self.sftp_service,
+            &self.exec_registry,
             &self.identity_service,
             session_id,
             app,
@@ -236,6 +248,7 @@ impl SessionManager {
                 &self.sessions,
                 &self.monitor_service,
                 &self.sftp_service,
+                &self.exec_registry,
                 &self.identity_service,
                 &session_id,
                 app,
@@ -244,6 +257,8 @@ impl SessionManager {
         self.monitor_service.stop_all(app);
         self.sftp_service.cleanup_all(app);
         self.identity_service.cancel_all(app);
+        // 兜底清空共享采样连接注册表：逐会话回收后才插入的迟来条目也不得泄漏
+        self.exec_registry.clear();
     }
 
     /// 获取所有活跃会话的列表
@@ -324,10 +339,12 @@ impl SessionManager {
 ///
 /// 显式关闭和终端工作线程退出共享这一路径；若另一方已先完成回收，返回 false，
 /// 以保证并发 teardown 幂等且不会重复推送取消事件。
+#[allow(clippy::too_many_arguments)]
 fn cleanup_registered_session<R: Runtime>(
     sessions: &Arc<Mutex<HashMap<String, SessionHandle>>>,
     monitor_service: &MonitorService,
     sftp_service: &SftpService,
+    exec_registry: &SharedExecRegistry,
     identity_service: &HostIdentityService,
     session_id: &str,
     app: &AppHandle<R>,
@@ -353,6 +370,8 @@ fn cleanup_registered_session<R: Runtime>(
     }
     // 停止该会话的全部监控任务（每个任务补发 Done 终态事件）
     monitor_service.stop_session(app, session_id);
+    // 回收该会话的共享采样连接；在途 capability 释放时底层连接才真正关闭
+    exec_registry.remove(session_id);
     // 关闭 SFTP capability 并请求取消；worker 随后发布唯一的真实终态
     sftp_service.cleanup_session(session_id, app);
     true
