@@ -128,13 +128,20 @@ export const useSessionStore = create<SessionState>((set, get) => {
       return session;
     },
 
-    /** 关闭 SSH 会话；后端统一 teardown，前端只清理 projection。 */
+    /** 关闭 SSH 会话：请求后端统一 teardown，无论后端结果如何都移除前端 projection。
+     *
+     * 连接失败（如凭据不存在）或断连后，终端工作线程退出时 TerminalExitGuard 已完成后端
+     * teardown，close_session 会返回 SessionNotFound —— 标签是纯视图，关闭视图是本地操作，
+     * 不得被后端会话状态阻塞；其他后端错误同样只记录诊断，不阻塞投影清理。
+     */
     async closeSession(sessionId) {
       useSftpStore.getState().markSessionClosing(sessionId);
       try {
         await invoke('close_session', { sessionId });
-        get().removeSessionProjection(sessionId);
+      } catch (error) {
+        console.warn('[session] close_session rejected, removing projection anyway:', sessionId, error);
       } finally {
+        get().removeSessionProjection(sessionId);
         useSftpStore.getState().finishSessionClosing(sessionId);
       }
     },

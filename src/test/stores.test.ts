@@ -341,6 +341,27 @@ describe('Zustand stores', () => {
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
   });
 
+  it('连接失败后端已自动 teardown：close_session 返回 SessionNotFound 时仍清理投影，标签始终可关闭', async () => {
+    // 复现凭据不存在场景：worker 退出触发 TerminalExitGuard 清理会话，
+    // 前端投影保留 Error 状态与覆盖层，用户点击关闭时后端返回 SessionNotFound
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession({ status: SessionStatus.Error })]]),
+      activeView: 'session-1',
+      connections: new Map([['session-1', {
+        phase: null,
+        error: { code: 'CredentialNotFound', detail: '凭据不存在: titanssh-xxx-password' },
+      }]]),
+    });
+    mockInvoke.mockRejectedValueOnce({ code: 'SessionNotFound', detail: 'Session not found: session-1' });
+
+    // 关闭视图是本地操作：不得因后端会话已消失而抛出或残留投影
+    await expect(useSessionStore.getState().closeSession('session-1')).resolves.toBeUndefined();
+
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().activeView).toBeNull();
+  });
+
   it('后端撤销事件撤下对应确认卡，且不误删已被新 challenge 取代的投影', async () => {
     const oldChallenge = {
       challengeId: 'challenge-old', sessionId: 'session-1', host: '10.0.0.8', port: 22,
