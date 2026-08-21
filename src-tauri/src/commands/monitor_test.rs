@@ -73,6 +73,8 @@ mod tests {
             timestamp: 1_710_000_000_000,
             cpu_usage: Some(1.0),
             memory_usage: Some(2.0),
+            memory_total_bytes: Some(6),
+            memory_used_bytes: Some(7),
             disk_usage: Some(3.0),
             disk_available_bytes: Some(4),
             disk_total_bytes: Some(5),

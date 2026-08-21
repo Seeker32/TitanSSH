@@ -32,6 +32,10 @@ export interface MonitorSnapshot {
   cpuUsage: number | null;
   /** 0.0 ~ 100.0；MemTotal/MemAvailable 缺失时为 null（未知） */
   memoryUsage: number | null;
+  /** 内存总容量（字节）；后端未上报或采集缺失时为 null */
+  memoryTotalBytes: number | null;
+  /** 内存已用量（字节）；后端未上报或采集缺失时为 null */
+  memoryUsedBytes: number | null;
   /** 0.0 ~ 100.0；df 采集失败时为 null（未知） */
   diskUsage: number | null;
   /** 根分区剩余容量；df 采集失败时为 null */

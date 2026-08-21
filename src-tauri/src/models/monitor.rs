@@ -33,6 +33,11 @@ pub struct MonitorSnapshot {
     pub cpu_usage: Option<f64>,
     /// 内存使用率，0.0 ~ 100.0；MemTotal/MemAvailable 缺失时为 null（未知）
     pub memory_usage: Option<f64>,
+    /// 内存总容量，单位字节；MemTotal 缺失/非法时为 null（未知）
+    pub memory_total_bytes: Option<u64>,
+    /// 内存已用量（MemTotal-MemAvailable），单位字节；任一字段缺失时为 null，
+    /// MemAvailable 超出总量时按 0 已用处理，与使用率 clamp 语义一致
+    pub memory_used_bytes: Option<u64>,
     /// 磁盘使用率，0.0 ~ 100.0；df 采集失败时为 null（未知）
     pub disk_usage: Option<f64>,
     /// 根分区剩余容量，单位字节；df 采集失败时为 null

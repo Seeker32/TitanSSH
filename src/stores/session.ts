@@ -14,6 +14,9 @@ interface SessionState {
   activeView: string | null;
   /** 按 sessionId 存储的连接生命周期投影（阶段 + 结构化错误）；Connected/Disconnected 后清除。 */
   connections: Map<string, SessionConnection>;
+  /** 投影建立前到达的进度事件缓存（open_session 返回与首个 progress 事件的 IPC 竞态）；
+   *  openSession 建立投影时回放并清除，removeSessionProjection 一并丢弃。 */
+  pendingProgress: Map<string, SessionProgressEvent>;
   /** 按 sessionId 存储的主机身份确认投影；接受/拒绝后清除。 */
   hostKeyChallenges: Map<string, HostIdentityChallenge>;
   /** 按 sessionId 存储的"接受并保存"结构化失败；challenge 保持未决，改选或新 challenge 后清除。 */
@@ -92,6 +95,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     sessions: new Map(),
     activeView: null,
     connections: new Map(),
+    pendingProgress: new Map(),
     hostKeyChallenges: new Map(),
     hostKeySaveErrors: new Map(),
 
@@ -102,8 +106,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
         sessions.delete(sessionId);
         const connections = new Map(state.connections);
         connections.delete(sessionId);
+        const pendingProgress = new Map(state.pendingProgress);
+        pendingProgress.delete(sessionId);
         const projection = withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId);
-        return { sessions, connections, ...projection, activeView: state.activeView === sessionId ? null : state.activeView };
+        return { sessions, connections, pendingProgress, ...projection, activeView: state.activeView === sessionId ? null : state.activeView };
       });
       useMonitorStore.getState().clearSession(sessionId);
       useSftpStore.getState().clearSession(sessionId);
@@ -112,11 +118,19 @@ export const useSessionStore = create<SessionState>((set, get) => {
     /** 打开 SSH 会话，初始化文件传输并启动关联监控任务。 */
     async openSession(hostId) {
       const session = await invoke<SessionInfo>('open_session', { hostId });
-      set((state) => ({
-        sessions: new Map(state.sessions).set(session.sessionId, session),
-        activeView: session.sessionId,
-        connections: new Map(state.connections).set(session.sessionId, { phase: null, error: null }),
-      }));
+      set((state) => {
+        // 回放竞态期间缓存的进度事件：后端 worker 在 open_session 返回前
+        // 就可能已发出首个阶段事件，此时阶段不得丢回 null
+        const pendingPhase = state.pendingProgress.get(session.sessionId)?.phase ?? null;
+        const pendingProgress = new Map(state.pendingProgress);
+        pendingProgress.delete(session.sessionId);
+        return {
+          sessions: new Map(state.sessions).set(session.sessionId, session),
+          activeView: session.sessionId,
+          connections: new Map(state.connections).set(session.sessionId, { phase: pendingPhase, error: null }),
+          pendingProgress,
+        };
+      });
       useSftpStore.getState().ensureState(session.sessionId);
       void useSftpStore.getState().listDir(session.sessionId, '/');
       void useSftpStore.getState().loadTaskSnapshot(session.sessionId);
@@ -186,10 +200,18 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }));
     },
 
-    /** 仅在连接中应用阶段诊断信息，且只写入所属 session。 */
+    /** 仅在连接中应用阶段诊断信息；投影未建立时缓存待回放，而不是丢弃。 */
     applySessionProgress(payload) {
       const current = get().sessions.get(payload.sessionId);
-      if (current?.status !== SessionStatus.Connecting) return;
+      if (!current) {
+        // open_session 返回前 worker 已发出首个进度事件（IPC 竞态）：
+        // 缓存最新一条，投影建立时回放，避免标签永远显示通用“正在连接”
+        set((state) => ({
+          pendingProgress: new Map(state.pendingProgress).set(payload.sessionId, payload),
+        }));
+        return;
+      }
+      if (current.status !== SessionStatus.Connecting) return;
       set((state) => ({
         connections: new Map(state.connections).set(payload.sessionId, { phase: payload.phase, error: null }),
       }));

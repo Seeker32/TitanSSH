@@ -119,6 +119,9 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
           <Col span={index === 2 ? 24 : 12} key={label}>
             <Statistic title={label} value={formatPercent(value)} />
             <Progress percent={value ?? 0} strokeColor={snapshot ? progressColor(value ?? 0) : undefined} showInfo={false} />
+            {label === 'Memory' && <Typography.Text type="secondary" className="capacity">
+              {translate(locale, 'monitor.memoryCapacity', { used: formatBytes(snapshot?.memoryUsedBytes), total: formatBytes(snapshot?.memoryTotalBytes) })}
+            </Typography.Text>}
             {label === 'Disk' && <Typography.Text type="secondary" className="capacity">
               {translate(locale, 'monitor.capacity', { available: formatBytes(snapshot?.diskAvailableBytes), total: formatBytes(snapshot?.diskTotalBytes) })}
             </Typography.Text>}

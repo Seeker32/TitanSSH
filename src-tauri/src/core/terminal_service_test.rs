@@ -293,6 +293,134 @@ mod integration_tests {
         }
     }
 
+    /// 凭据读取永久挂起（如系统钥匙串授权框被遮挡、系统无响应）时，
+    /// 终端工作线程必须在独立的凭据预算内上报 Timeout 终态，
+    /// 不得无限期停留 Connecting 让标签永远转圈。
+    #[test]
+    fn credential_loading_hang_emits_timeout_within_budget() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        // 永不返回的凭据加载器：模拟钥匙串授权挂起
+        let (_hang_tx, hang_rx) = mpsc::channel::<()>();
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-credential-hang".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            move |_| {
+                // 阻塞直到发送端波 drop（未调用时永远挂起）
+                let _ = hang_rx.recv();
+                Ok((Some("password".to_string()), None))
+            },
+            test_allow_all_verifier(),
+            Box::new(|_host, _password, _passphrase, _verifier, _on_phase| {
+                panic!("凭据挂起期间连接函数不应被调用")
+            }),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Box::new(|| {}),
+        );
+
+        let status = wait_for_final_status(&runtime_status, Duration::from_secs(2));
+        assert_ne!(
+            status,
+            SessionStatus::Connecting,
+            "凭据读取挂起必须在有限预算内离开 Connecting"
+        );
+        assert_eq!(
+            status,
+            SessionStatus::Timeout,
+            "凭据读取挂起应上报 Timeout（文案：读取系统凭据超时）"
+        );
+    }
+
+    /// 凭据挂起期间会话被关闭时，终端工作线程必须在短轮询周期内退出，
+    /// 不得等完整个凭据预算（关闭可取消性）。
+    #[test]
+    fn shutdown_during_credential_wait_exits_promptly() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+        let (_hang_tx, hang_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::channel();
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-shutdown-during-credentials".to_string(),
+            command_rx,
+            shutdown.clone(),
+            runtime_status,
+            move |_| {
+                let _ = hang_rx.recv();
+                Ok((Some("password".to_string()), None))
+            },
+            test_allow_all_verifier(),
+            Box::new(|_host, _password, _passphrase, _verifier, _on_phase| {
+                panic!("凭据挂起期间连接函数不应被调用")
+            }),
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            Box::new(move || {
+                let _ = exit_tx.send(());
+            }),
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        exit_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("凭据挂起期间关闭应立即退出终端工作线程");
+    }
+
+    /// 凭据加载线程 panic 时，终端工作线程必须上报 Error 终态，
+    /// 不得静默退出让前端永远停留在 Connecting。
+    #[test]
+    fn credential_loader_panic_emits_error_status() {
+        use std::sync::mpsc;
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let (_command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime_status = Arc::new(Mutex::new(SessionStatus::Connecting));
+
+        start_terminal_session_with_parts(
+            app.handle().clone(),
+            make_password_host(Some("ref")),
+            "session-credential-panic".to_string(),
+            command_rx,
+            shutdown,
+            runtime_status.clone(),
+            |_| panic!("模拟凭据加载线程崩溃"),
+            test_allow_all_verifier(),
+            Box::new(|_host, _password, _passphrase, _verifier, _on_phase| {
+                panic!("凭据崩溃后连接函数不应被调用")
+            }),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Box::new(|| {}),
+        );
+
+        let status = wait_for_final_status(&runtime_status, Duration::from_secs(2));
+        assert_eq!(
+            status,
+            SessionStatus::Error,
+            "凭据加载线程 panic 必须上报 Error，不得永远 Connecting"
+        );
+    }
+
     /// 关闭发生在连接等待期间时，终端工作线程必须在下一次短轮询后退出，
     /// 而不是继续等待连接函数结束或消耗完整连接超时预算。
     #[test]
@@ -324,6 +452,7 @@ mod integration_tests {
                     "connection refused".to_string().into(),
                 ))
             }),
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Box::new(move || {
                 let _ = exit_tx.send(());
@@ -369,6 +498,7 @@ mod integration_tests {
                 thread::sleep(Duration::from_secs(2));
                 Ok(crate::core::ssh_transport::test_support::idle_terminal())
             }),
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Box::new(move || {
                 let _ = exit_tx.send(());
@@ -438,6 +568,7 @@ mod integration_tests {
             Box::new(|_host, _password, _passphrase, _verifier, _on_phase| {
                 Ok(crate::core::ssh_transport::test_support::write_failing_terminal())
             }),
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Box::new(move || {
                 let _ = exit_tx.send(());
@@ -525,6 +656,7 @@ mod integration_tests {
                 ))
             }),
             Duration::from_secs(1),
+            Duration::from_secs(1),
             Box::new(move || {
                 let _ = exit_tx.send(());
             }),
@@ -574,6 +706,7 @@ mod integration_tests {
                 blob: b"blob".to_vec(),
             }),
             // 预算远小于下方等待时长：验证等待期间不设独立自动超时
+            Duration::from_millis(300),
             Duration::from_millis(300),
             Box::new(|| {}),
         );
@@ -657,6 +790,7 @@ mod integration_tests {
             connect_fn,
             // 预算远小于验证等待时长：预算在等待期间耗尽
             Duration::from_millis(300),
+            Duration::from_millis(300),
             Box::new(|| {}),
         );
 
@@ -710,6 +844,7 @@ mod integration_tests {
                 blob: b"blob".to_vec(),
             }),
             Duration::from_secs(15),
+            Duration::from_secs(15),
             Box::new(|| {}),
         );
 
@@ -758,6 +893,7 @@ mod integration_tests {
                 fingerprint: "SHA256:terminal-cancel".to_string(),
                 blob: b"blob".to_vec(),
             }),
+            Duration::from_secs(15),
             Duration::from_secs(15),
             Box::new(|| {}),
         );
@@ -839,6 +975,7 @@ mod integration_tests {
                     "connection refused".to_string().into(),
                 ))
             }),
+            Duration::from_secs(15),
             Duration::from_secs(15),
             Box::new(|| {}),
         );

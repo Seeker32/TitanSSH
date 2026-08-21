@@ -315,6 +315,20 @@ describe('Zustand stores', () => {
     vi.useRealTimers();
   });
 
+  it('首个进度事件先于 open_session 返回到达时不丢弃，投影建立后回放阶段', async () => {
+    // 复现 IPC 竞态：worker 在 open_session 返回前就发出 LoadingCredentials 进度，
+    // 事件先到、投影后建。丢弃会让标签永远显示通用“正在连接”而非卡点提示。
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.LoadingCredentials, timestamp: 1 });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+
+    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? makeSession() : makeTaskInfo());
+    await useSessionStore.getState().openSession('host-1');
+
+    expect(useSessionStore.getState().connections.get('session-1')?.phase).toBe(ConnectionPhase.LoadingCredentials);
+    cleanup();
+  });
+
   it('关闭活动会话只调用后端 teardown 并清理前端 projection', async () => {
     const task = makeTaskInfo();
     useSessionStore.setState({

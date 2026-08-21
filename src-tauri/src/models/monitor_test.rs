@@ -49,6 +49,8 @@ mod tests {
             arb_millis_timestamp(),      // timestamp（毫秒）
             0.0f64..100.0f64,            // cpu_usage
             0.0f64..100.0f64,            // memory_usage
+            0u64..10_000_000_000_000u64, // memory_total_bytes
+            0u64..10_000_000_000_000u64, // memory_used_bytes
             0.0f64..100.0f64,            // disk_usage
             0u64..10_000_000_000_000u64, // disk_available_bytes
             0u64..10_000_000_000_000u64, // disk_total_bytes
@@ -59,6 +61,8 @@ mod tests {
                     timestamp,
                     cpu_usage,
                     memory_usage,
+                    memory_total_bytes,
+                    memory_used_bytes,
                     disk_usage,
                     disk_available_bytes,
                     disk_total_bytes,
@@ -67,6 +71,8 @@ mod tests {
                     timestamp,
                     cpu_usage: Some(cpu_usage),
                     memory_usage: Some(memory_usage),
+                    memory_total_bytes: Some(memory_total_bytes),
+                    memory_used_bytes: Some(memory_used_bytes),
                     disk_usage: Some(disk_usage),
                     disk_available_bytes: Some(disk_available_bytes),
                     disk_total_bytes: Some(disk_total_bytes),

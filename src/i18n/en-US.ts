@@ -113,6 +113,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'monitor.name': 'Monitor',
   'monitor.collapse': 'Collapse monitor',
   'monitor.capacity': 'Available {available} / Total {total}',
+  'monitor.memoryCapacity': 'Used {used} / Total {total}',
   'monitor.unavailable': 'Network data unavailable',
   'monitor.noInterface': 'No network interface available',
   'monitor.interface': 'Network interface',

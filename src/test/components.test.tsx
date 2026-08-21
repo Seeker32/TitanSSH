@@ -461,6 +461,21 @@ describe('React components', () => {
     expect(screen.queryByText(/^Updated:/)).not.toBeInTheDocument();
   });
 
+  it('内存指标同时显示已用与总量的字节数，缺失时降级为未知', () => {
+    const { rerender } = render(<ServerStatusPanel snapshot={makeSnapshot({
+      memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+      memoryTotalBytes: 8 * 1024 * 1024 * 1024,
+    })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText(/已用 2.0 GB \/ 总量 8.0 GB/)).toBeInTheDocument();
+
+    // 后端未上报（旧后端）或采集缺失时不得伪造 0 B，显示未知
+    rerender(<ServerStatusPanel snapshot={makeSnapshot({
+      memoryUsedBytes: null,
+      memoryTotalBytes: null,
+    })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText(/已用 -- \/ 总量 --/)).toBeInTheDocument();
+  });
+
   it('指标缺失时显示未知（--）而非伪造 0%', () => {
     render(<ServerStatusPanel snapshot={makeSnapshot({
       cpuUsage: null,
@@ -468,6 +483,8 @@ describe('React components', () => {
       diskUsage: null,
       diskAvailableBytes: null,
       diskTotalBytes: null,
+      memoryUsedBytes: null,
+      memoryTotalBytes: null,
     })} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getAllByText('--')).toHaveLength(3);
     expect(screen.queryByText('0.0%')).not.toBeInTheDocument();

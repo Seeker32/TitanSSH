@@ -57,6 +57,8 @@ export function makeSnapshot(overrides: Partial<MonitorSnapshot> = {}): MonitorS
     timestamp: 1_710_000_120_000,
     cpuUsage: 21.5,
     memoryUsage: 25.0,
+    memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+    memoryTotalBytes: 8 * 1024 * 1024 * 1024,
     diskUsage: 40.0,
     diskAvailableBytes: 300 * 1024 * 1024 * 1024,
     diskTotalBytes: 500 * 1024 * 1024 * 1024,

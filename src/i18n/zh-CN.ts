@@ -110,6 +110,7 @@ export const zhCN = {
   'monitor.name': '监控',
   'monitor.collapse': '折叠监视条',
   'monitor.capacity': '剩余 {available} / 总量 {total}',
+  'monitor.memoryCapacity': '已用 {used} / 总量 {total}',
   'monitor.unavailable': '网络数据不可用',
   'monitor.noInterface': '无可用网卡',
   'monitor.interface': '网卡接口',
