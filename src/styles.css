@@ -160,6 +160,9 @@ body.sftp-resizing { cursor: row-resize; }
 .status-panel { border: 1px solid var(--color-border) !important; border-radius: 16px !important; background: var(--color-card-bg) !important; }
 .status-panel .ant-card-head-title { display: flex; flex-direction: column; font-size: 12px; }
 .status-panel .capacity, .status-panel .updated { display: block; margin-top: 6px; font-size: 11px; }
+.monitor-tasks { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--color-border); padding-top: 8px; font-size: 11px; }
+.monitor-task { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+.monitor-task > [role="alert"] { grid-column: 1 / -1; color: var(--color-danger); overflow-wrap: anywhere; }
 .process-summary { border-top: 1px solid var(--color-border); padding-top: 10px; font-size: 11px; }
 .process-summary-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .process-summary-open { margin-left: auto; padding: 2px 6px; border: 0; background: transparent; color: var(--color-accent); font-size: 10px; }

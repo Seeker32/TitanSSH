@@ -126,6 +126,13 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'monitor.ago': '60 seconds ago',
   'monitor.now': 'Now',
   'monitor.empty': 'Server status refreshes here every 2 seconds after the connection is established',
+  'monitor.tasks': 'Sampling tasks',
+  'monitor.hostTask': 'Host monitoring',
+  'monitor.processTask': 'Process monitoring',
+  'monitor.pending': 'Pending',
+  'monitor.running': 'Running',
+  'monitor.done': 'Done',
+  'monitor.failed': 'Failed',
 
   // Process summary
   'process.title': 'Process summary',

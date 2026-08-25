@@ -12,6 +12,7 @@ test.beforeEach(async ({ page }) => {
     let hostsStore = [host, groupedHost];
     const session = { sessionId: 'session-1', hostId: 'host-1', host: '10.0.0.8', port: 22, username: 'root', status: 'Connecting', createdAt: Date.now() };
     const task = { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: 'Pending', createdAt: Date.now() };
+    const processTask = { taskId: 'process-task-1', taskType: 'process', sessionId: 'session-1', status: 'Pending', createdAt: Date.now() };
     // 与正式 typed event contract（src/types/sftp.ts TransferTask）一致：结构化 error 字段
     const transfer = { taskId: 'transfer-1', sessionId: 'session-1', transferType: 'Download', remotePath: '/syslog', localPath: '/tmp/syslog', fileName: 'syslog', totalBytes: 100, transferredBytes: 0, speedBps: 0, status: 'Pending', error: null, createdAt: Date.now() };
     // sftp_task_snapshot 的权威响应；测试可在打开会话前注入
@@ -238,6 +239,7 @@ test.beforeEach(async ({ page }) => {
             .map(({ host: recordHost, port, algorithm, fingerprint }) => ({ host: recordHost, port, algorithm, fingerprint }));
         }
         if (command === 'start_monitoring') return gateOnIdentity('start_monitoring', String(args.sessionId), () => task);
+        if (command === 'start_process_monitoring') return gateOnIdentity('start_process_monitoring', String(args.sessionId), () => processTask);
         if (command === 'sftp_list_dir') return gateOnIdentity('sftp_list_dir', String(args.sessionId), () => [{ name: 'syslog', path: '/syslog', isDir: false, size: 100, modifiedAt: Date.now(), permissions: 'rw-r--r--' }]);
         if (command === 'sftp_download') return transfer;
         if (command === 'sftp_upload') return { ...transfer, taskId: 'transfer-2', transferType: 'Upload', fileName: 'upload.txt' };
@@ -312,6 +314,11 @@ test.beforeEach(async ({ page }) => {
         /** 设置 sftp_task_snapshot 的权威响应（打开会话前注入）。 */
         setSnapshotTasks(tasks: unknown[]) {
           snapshotTasks = tasks;
+        },
+        /** 模拟共享 exec 连接断开：同一连接上的主机与进程采样任务共同失败。 */
+        disconnectSharedConnection(sessionId: string, error: { code: string; detail?: string }) {
+          if (sessionId !== 'session-1') return;
+          [task.taskId, processTask.taskId].forEach((taskId) => emitEvent('task:status', { taskId, status: 'Failed', error }));
         },
       },
     });
@@ -478,6 +485,68 @@ test('SSH、终端、监控与文件传输形成完整闭环', async ({ page }) 
   await expect(page.getByText('等待中')).toBeVisible();
   const commands = await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string }> } }).__TAURI_TEST__.calls.map((call) => call.command));
   expect(commands).toEqual(expect.arrayContaining(['open_session', 'start_monitoring', 'sftp_list_dir', 'sftp_download']));
+});
+
+test('进程监控闭环：快照到标签排序过滤，纯视图重开复用缓存且终端关闭 teardown', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('process:snapshot', {
+    sessionId: 'session-1', timestamp: Date.now(), totalCount: 6,
+    processes: [
+      { pid: 1, ppid: 0, user: 'root', command: 'shell', commandLine: 'shell --login', cpuPercent: 10, memoryBytes: 1024, state: 'S' },
+      { pid: 2, ppid: 1, user: 'deploy', command: 'worker', commandLine: 'worker --serve --port 8080', cpuPercent: 80, memoryBytes: 2048, state: 'R' },
+      { pid: 3, ppid: 1, user: 'root', command: 'cron', commandLine: 'cron', cpuPercent: 9, memoryBytes: 512, state: 'S' },
+      { pid: 4, ppid: 1, user: 'root', command: 'logger', commandLine: 'logger', cpuPercent: 8, memoryBytes: 512, state: 'S' },
+      { pid: 5, ppid: 1, user: 'root', command: 'sshd', commandLine: 'sshd', cpuPercent: 7, memoryBytes: 512, state: 'S' },
+      { pid: 6, ppid: 1, user: 'root', command: 'excluded', commandLine: 'excluded', cpuPercent: 6, memoryBytes: 512, state: 'S' },
+    ],
+  }));
+
+  const summary = page.getByTestId('process-summary');
+  await expect(summary.locator('li')).toHaveCount(5);
+  await expect(summary).toContainText('worker');
+  await expect(summary).not.toContainText('excluded');
+  await page.getByRole('button', { name: '查看全部进程' }).click();
+  const pane = page.locator('.process-tab-pane');
+  await expect(pane.getByText('worker --serve --port 8080')).toBeVisible();
+  const cpuHeader = pane.getByRole('columnheader', { name: 'CPU%' });
+  await cpuHeader.click();
+  await cpuHeader.click();
+  await expect(cpuHeader).toHaveAttribute('aria-sort', /ascending|descending/);
+  await expect(pane.locator('tbody tr').first()).toContainText('worker');
+  await pane.getByRole('searchbox', { name: '过滤进程' }).fill('deploy');
+  await expect(pane.getByText('worker')).toBeVisible();
+  await expect(pane.getByText('shell')).toHaveCount(0);
+
+  await page.getByRole('button', { name: '关闭 进程 · root@10.0.0.8' }).click();
+  await expect(page.locator('.process-tab-pane')).toHaveCount(0);
+  await page.getByRole('button', { name: '查看全部进程' }).click();
+  await expect(page.locator('.process-tab-pane').getByText('worker --serve --port 8080')).toBeVisible();
+
+  await page.locator('.tab').filter({ hasText: '进程 · root@10.0.0.8' }).getByRole('button').click();
+  await expect(page.getByRole('tab', { name: /root@10\.0\.0\.8/ })).toBeVisible();
+  await page.locator('.tab').filter({ hasText: 'root@10.0.0.8' }).getByRole('button').click();
+  await expect(page.locator('.empty-state')).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { emit: (name: string, payload: unknown) => void } }).__TAURI_TEST__.emit('process:snapshot', {
+    sessionId: 'session-1', timestamp: Date.now() + 1_000, totalCount: 1,
+    processes: [{ pid: 99, ppid: 1, user: 'root', command: 'late', commandLine: 'late', cpuPercent: 1, memoryBytes: 1, state: 'S' }],
+  }));
+  await expect(page.getByTestId('process-summary')).toContainText('进程快照尚未就绪');
+  const closeCalls = await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> } }).__TAURI_TEST__.calls
+    .filter((call) => call.command === 'close_session'));
+  expect(closeCalls).toEqual([{ command: 'close_session', args: { sessionId: 'session-1' } }]);
+});
+
+test('共享连接断开：主机监控与进程监控同时显示 Failed 及错误详情', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { disconnectSharedConnection: (sessionId: string, error: { code: string; detail?: string }) => void };
+  }).__TAURI_TEST__.disconnectSharedConnection('session-1', { code: 'MonitorError', detail: 'shared connection closed' }));
+  await expect(page.getByTestId('monitor-task-monitor')).toContainText('失败');
+  await expect(page.getByTestId('monitor-task-process')).toContainText('失败');
+  await expect(page.getByTestId('monitor-task-monitor')).toContainText('shared connection closed');
+  await expect(page.getByTestId('monitor-task-process')).toContainText('shared connection closed');
 });
 
 test('终端标签独立呈现连接生命周期：阶段、错误与关闭', async ({ page }) => {

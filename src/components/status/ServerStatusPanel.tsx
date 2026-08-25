@@ -1,9 +1,9 @@
 import { Card, Col, Empty, Progress, Row, Statistic, Typography } from 'antd';
 import { ChevronDown, ChevronUp } from 'lucide-react';
-import type { MonitorSnapshot, NetworkTrendSample } from '@/types/monitor';
+import { formatAppError, type TranslationKey, translate } from '@/i18n';
+import { TaskStatus, type MonitorSnapshot, type NetworkTrendSample, type TaskInfo } from '@/types/monitor';
 import type { ProcessSortMode } from '@/stores/process';
 import type { ProcessSnapshot } from '@/types/process';
-import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import ProcessSummaryPanel from './ProcessSummaryPanel';
 
@@ -22,6 +22,9 @@ interface Props {
   onProcessSortModeChange: (mode: ProcessSortMode) => void;
   /** 打开当前会话的全量进程纯视图。 */
   onOpenProcess?: () => void;
+  /** 当前会话的主机监控与进程监控任务投影。 */
+  monitorTask?: TaskInfo | null;
+  processTask?: TaskInfo | null;
   /** 是否折叠为状态点窄条 */
   collapsed: boolean;
   /** 请求切换折叠状态 */
@@ -66,6 +69,22 @@ function progressColor(value: number) {
   return '#ef4444';
 }
 
+/** 渲染一个采样任务的状态与结构化失败详情。 */
+function TaskStatusItem({ task, kind, locale }: { task: TaskInfo; kind: 'monitor' | 'process'; locale: ReturnType<typeof useLocaleStore.getState>['locale'] }) {
+  const nameKey: TranslationKey = kind === 'monitor' ? 'monitor.hostTask' : 'monitor.processTask';
+  const statusKeys: Record<TaskStatus, TranslationKey> = {
+    [TaskStatus.Pending]: 'monitor.pending',
+    [TaskStatus.Running]: 'monitor.running',
+    [TaskStatus.Done]: 'monitor.done',
+    [TaskStatus.Failed]: 'monitor.failed',
+  };
+  return <div className={`monitor-task monitor-task--${task.status.toLowerCase()}`} data-testid={`monitor-task-${kind}`}>
+    <span>{translate(locale, nameKey)}</span>
+    <span>{translate(locale, statusKeys[task.status])}</span>
+    {task.status === TaskStatus.Failed && task.error && <span role="alert">{formatAppError(locale, task.error)}</span>}
+  </div>;
+}
+
 /** 将单个方向的有效样本连接为 SVG 路径，null 样本保留为断点。 */
 function trendPath(samples: NetworkTrendSample[], latestTimestamp: number, maximum: number, key: 'receiveBytesPerSecond' | 'transmitBytesPerSecond') {
   let connected = false;
@@ -99,7 +118,7 @@ function NetworkTrendChart({ samples, locale }: { samples: NetworkTrendSample[];
 }
 
 /** 渲染后端单次推送的服务器监控快照；折叠态只显示状态点窄条。 */
-export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], processSnapshot, processSortMode, onProcessSortModeChange, onOpenProcess, collapsed, onToggle }: Props) {
+export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], processSnapshot, processSortMode, onProcessSortModeChange, onOpenProcess, monitorTask, processTask, collapsed, onToggle }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   if (collapsed) {
     return (
@@ -151,6 +170,10 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
           <Col span={12}><Statistic title={translate(locale, 'monitor.up', { name: selectedInterface.name })} value={formatRate(selectedInterface.transmitBytesPerSecond)} /></Col>
         </>)}
         {!snapshot && <Col span={24}><Empty description={translate(locale, 'monitor.empty')} /></Col>}
+        {(monitorTask || processTask) && <Col span={24}><div className="monitor-tasks" aria-label={translate(locale, 'monitor.tasks')}>
+          {monitorTask && <TaskStatusItem task={monitorTask} kind="monitor" locale={locale} />}
+          {processTask && <TaskStatusItem task={processTask} kind="process" locale={locale} />}
+        </div></Col>}
         <Col span={24}><ProcessSummaryPanel snapshot={processSnapshot} sortMode={processSortMode} onSortModeChange={onProcessSortModeChange} onOpenProcess={onOpenProcess} /></Col>
       </Row>
     </Card>

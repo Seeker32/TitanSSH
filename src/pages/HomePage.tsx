@@ -56,6 +56,8 @@ export default function HomePage() {
   const trendSamples = useMonitorStore((state) => activeSessionId === null ? undefined : state.networkTrends.get(activeSessionId));
   const snapshot = activeSessionId === null ? null : monitorSnapshots.get(activeSessionId) ?? null;
   const processSnapshot = activeSessionId === null ? null : processSnapshots.get(activeSessionId) ?? null;
+  const monitorTask = useMonitorStore((state) => activeSessionId === null ? null : state.getSessionTask(activeSessionId));
+  const processTask = useProcessStore((state) => activeSessionId === null ? null : state.getSessionTask(activeSessionId));
   const sftpState = activeSessionId === null ? null : sftpStates.get(activeSessionId) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
@@ -211,6 +213,7 @@ export default function HomePage() {
           <div className="sidebar-footer-row">
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
               processSnapshot={processSnapshot} processSortMode={processSortMode}
+              monitorTask={monitorTask} processTask={processTask}
               onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
               onOpenProcess={activeSessionId === null ? undefined : () => useSessionStore.getState().openProcessTab(activeSessionId)}
               onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
@@ -222,6 +225,7 @@ export default function HomePage() {
           <>
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
               processSnapshot={processSnapshot} processSortMode={processSortMode}
+              monitorTask={monitorTask} processTask={processTask}
               onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
               onOpenProcess={activeSessionId === null ? undefined : () => useSessionStore.getState().openProcessTab(activeSessionId)}
               onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}

@@ -1,6 +1,8 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import ProcessSummaryPanel from '@/components/status/ProcessSummaryPanel';
+import ServerStatusPanel from '@/components/status/ServerStatusPanel';
+import { TaskStatus } from '@/types/monitor';
 import type { ProcessSnapshot } from '@/types/process';
 
 const processSnapshot: ProcessSnapshot = {
@@ -32,5 +34,19 @@ describe('ProcessSummaryPanel', () => {
     fireEvent.click(screen.getByText('worker'));
     fireEvent.click(screen.getByRole('button', { name: '查看全部进程' }));
     expect(onOpenProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it('显示主机监控与进程监控的失败状态及错误详情', () => {
+    render(<ServerStatusPanel snapshot={null} processSnapshot={null} processSortMode="cpu"
+      onProcessSortModeChange={vi.fn()} monitorTask={{ taskId: 'monitor-task', taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Failed, createdAt: 1, error: { code: 'MonitorError', detail: 'shared connection closed' } }}
+      processTask={{ taskId: 'process-task', taskType: 'process', sessionId: 'session-1', status: TaskStatus.Failed, createdAt: 1, error: { code: 'MonitorError', detail: 'shared connection closed' } }}
+      collapsed={false} onToggle={vi.fn()} />);
+
+    expect(screen.getByTestId('monitor-task-monitor')).toHaveTextContent('主机监控');
+    expect(screen.getByTestId('monitor-task-monitor')).toHaveTextContent('失败');
+    expect(screen.getByTestId('monitor-task-monitor')).toHaveTextContent('shared connection closed');
+    expect(screen.getByTestId('monitor-task-process')).toHaveTextContent('进程监控');
+    expect(screen.getByTestId('monitor-task-process')).toHaveTextContent('失败');
+    expect(screen.getByTestId('monitor-task-process')).toHaveTextContent('shared connection closed');
   });
 });

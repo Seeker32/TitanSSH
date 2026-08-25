@@ -123,6 +123,13 @@ export const zhCN = {
   'monitor.ago': '60 秒前',
   'monitor.now': '现在',
   'monitor.empty': '连接建立后，这里会每 2 秒刷新一次服务器状态',
+  'monitor.tasks': '采样任务',
+  'monitor.hostTask': '主机监控',
+  'monitor.processTask': '进程监控',
+  'monitor.pending': '等待中',
+  'monitor.running': '运行中',
+  'monitor.done': '完成',
+  'monitor.failed': '失败',
 
   // 进程摘要
   'process.title': '进程摘要',
