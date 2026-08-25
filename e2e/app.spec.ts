@@ -510,6 +510,30 @@ test('终端标签独立呈现连接生命周期：阶段、错误与关闭', as
   await expect(page.locator('.empty-state')).toBeVisible();
 });
 
+test('连接失败且后端已回收会话时，关闭标签仍生效（close_session 返回 SessionNotFound）', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();
+  const emit = (name: string, payload: unknown) => page.evaluate(([eventName, eventPayload]) => {
+    (window as unknown as { __TAURI_TEST__: { emit: (event: string, value: unknown) => void } }).__TAURI_TEST__.emit(eventName as string, eventPayload);
+  }, [name, payload] as const);
+
+  // TCP 建连失败（v0.1.5 实测场景）：错误覆盖层展示结构化错误，仅剩关闭标签操作
+  await emit('session:status', {
+    sessionId: 'session-1', status: 'Error',
+    error: { code: 'SshConnectionError', detail: '连接失败: 在 10000ms 预算内已尝试 1 个地址，最后错误: No route to host (os error 65)' },
+  });
+  await expect(page.getByRole('alert')).toContainText('No route to host');
+
+  // 后端事实：终端 worker 退出时 TerminalExitGuard 已回收会话，close_session 返回 SessionNotFound
+  await page.evaluate(() => (window as unknown as { __TAURI_TEST__: { failNext: (command: string, error: { code: string; detail?: string }) => void } }).__TAURI_TEST__.failNext('close_session', { code: 'SessionNotFound', detail: 'Session not found: session-1' }));
+
+  // 关闭是本地视图操作：即使后端会话已消失，标签也必须关闭
+  await page.getByRole('button', { name: '关闭标签' }).click();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.locator('.empty-state')).toBeVisible();
+  await expect(page.locator('.tab')).toHaveCount(0);
+});
+
 test('失败状态可见且传输任务可以重试', async ({ page }) => {
   await page.goto('/');
   await page.locator('.sidebar').getByTestId('host-card-host-1').dblclick();

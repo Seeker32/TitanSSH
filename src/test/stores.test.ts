@@ -457,6 +457,30 @@ describe('Zustand stores', () => {
     expect(useSessionStore.getState().activeTabId).toBeNull();
   });
 
+  it('用户路径回归：连接失败后关闭标签（closeTab）在 close_session 返回 SessionNotFound 时仍移除标签', async () => {
+    // v0.1.5 实测缺陷：TCP 建连失败（如 No route to host）→ 终端 worker 退出触发
+    // TerminalExitGuard 后端 teardown → 错误覆盖层仅剩关闭标签操作；用户点击关闭时
+    // 后端返回 SessionNotFound，关闭是本地视图操作，不得被后端会话状态阻塞。
+    // 入口必须是 closeTab（覆盖层按钮 → HomePage → closeTab），覆盖完整包装链。
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession({ status: SessionStatus.Error })]]),
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
+      connections: new Map([['session-1', {
+        phase: null,
+        error: { code: 'SshConnectionError', detail: '连接失败: 在 10000ms 预算内已尝试 1 个地址，最后错误: No route to host (os error 65)' },
+      }]]),
+    });
+    mockInvoke.mockRejectedValueOnce({ code: 'SessionNotFound', detail: 'Session not found: session-1' });
+
+    await expect(useSessionStore.getState().closeTab(terminalTabId('session-1'))).resolves.toBeUndefined();
+
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().tabs.has(terminalTabId('session-1'))).toBe(false);
+    expect(useSessionStore.getState().activeTabId).toBeNull();
+  });
+
   it('后端撤销事件撤下对应确认卡，且不误删已被新 challenge 取代的投影', async () => {
     const oldChallenge = {
       challengeId: 'challenge-old', sessionId: 'session-1', host: '10.0.0.8', port: 22,
