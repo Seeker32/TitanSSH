@@ -20,6 +20,8 @@ interface Props {
   processSortMode: ProcessSortMode;
   /** 请求切换进程摘要排序档位。 */
   onProcessSortModeChange: (mode: ProcessSortMode) => void;
+  /** 打开当前会话的全量进程纯视图。 */
+  onOpenProcess?: () => void;
   /** 是否折叠为状态点窄条 */
   collapsed: boolean;
   /** 请求切换折叠状态 */
@@ -97,7 +99,7 @@ function NetworkTrendChart({ samples, locale }: { samples: NetworkTrendSample[];
 }
 
 /** 渲染后端单次推送的服务器监控快照；折叠态只显示状态点窄条。 */
-export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], processSnapshot, processSortMode, onProcessSortModeChange, collapsed, onToggle }: Props) {
+export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], processSnapshot, processSortMode, onProcessSortModeChange, onOpenProcess, collapsed, onToggle }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   if (collapsed) {
     return (
@@ -149,7 +151,7 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
           <Col span={12}><Statistic title={translate(locale, 'monitor.up', { name: selectedInterface.name })} value={formatRate(selectedInterface.transmitBytesPerSecond)} /></Col>
         </>)}
         {!snapshot && <Col span={24}><Empty description={translate(locale, 'monitor.empty')} /></Col>}
-        <Col span={24}><ProcessSummaryPanel snapshot={processSnapshot} sortMode={processSortMode} onSortModeChange={onProcessSortModeChange} /></Col>
+        <Col span={24}><ProcessSummaryPanel snapshot={processSnapshot} sortMode={processSortMode} onSortModeChange={onProcessSortModeChange} onOpenProcess={onOpenProcess} /></Col>
       </Row>
     </Card>
   );

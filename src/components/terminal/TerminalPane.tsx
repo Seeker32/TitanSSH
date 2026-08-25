@@ -34,11 +34,13 @@ interface Props {
 /** 在空态页与各终端标签视图之间切换；终端实例常驻，仅切换显隐。
  *  每个标签独立呈现连接生命周期：主机身份确认卡 > 连接/错误覆盖层。 */
 export default function TerminalPane({ tabs, sessions, activeTabId, connections, challenges, saveErrors, onInput, onResize, onCreateHost, onCloseTab, onSaveIdentity, onAcceptIdentity, onRejectIdentity }: Props) {
+  const terminalTabs = tabs.filter((tab) => tab.type === 'terminal');
+  const activeTerminalTabId = terminalTabs.some((tab) => tab.tabId === activeTabId) ? activeTabId : null;
   return (
     <section className="terminal-pane">
       <div className="viewport">
-        {activeTabId === null && <EmptyState onCreateHost={onCreateHost} />}
-        {tabs.map((tab) => {
+        {activeTerminalTabId === null && tabs.length === 0 && <EmptyState onCreateHost={onCreateHost} />}
+        {terminalTabs.map((tab) => {
           const session = sessions.get(tab.sessionId);
           // 标签与其会话投影同生命周期，缺投影时不渲染该视图
           if (!session) return null;
@@ -48,7 +50,7 @@ export default function TerminalPane({ tabs, sessions, activeTabId, connections,
           const phaseLabel = connection?.phase === ConnectionPhase.VerifyingHostKey
             ? progressLabel(connection.phase)
             : null;
-          const active = activeTabId === tab.tabId;
+          const active = activeTerminalTabId === tab.tabId;
           return (
             <div key={tab.tabId} className="terminal-session" hidden={!active}>
               <XtermView sessionId={session.sessionId}

@@ -4,7 +4,7 @@ import { create } from 'zustand';
 import type { HostIdentityChallenge, HostIdentityChallengeDismissed, SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import type { TerminalTab } from '@/types/tab';
-import { terminalTabId } from '@/types/tab';
+import { processTabId, terminalTabId } from '@/types/tab';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, toAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
@@ -33,6 +33,8 @@ interface SessionState {
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
   /** 切换激活标签（视图选择状态，标签语义） */
   setActiveTab: (tabId: string) => void;
+  /** 打开指定会话的进程纯视图；重复打开只激活既有标签。 */
+  openProcessTab: (sessionId: string) => void;
   /** 关闭标签：终端标签是会话锚点，关闭即触发 close_session 完整 teardown；
    *  纯视图标签（未来）仅移除自身，不影响会话生命周期 */
   closeTab: (tabId: string) => Promise<void>;
@@ -210,6 +212,19 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set({ activeTabId: tabId });
     },
 
+    /** 打开指定会话的进程纯视图，不启动或停止任何采样任务。 */
+    openProcessTab(sessionId) {
+      if (!get().sessions.has(sessionId)) return;
+      const tabId = processTabId(sessionId);
+      set((state) => {
+        const tabs = new Map(state.tabs);
+        if (!tabs.has(tabId)) {
+          tabs.set(tabId, { tabId, type: 'process', sessionId, createdAt: Date.now() });
+        }
+        return { tabs, activeTabId: tabId };
+      });
+    },
+
     /** 关闭标签（ADR-0002）：终端标签是会话锚点，关闭即触发 close_session 完整
      *  teardown（终端、SFTP、双采样、共享连接）；未知标签与非终端类型（未实现）均为无操作。 */
     async closeTab(tabId) {
@@ -217,7 +232,17 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (!tab) return;
       if (tab.type === 'terminal') {
         await get().closeSession(tab.sessionId);
+        return;
       }
+      // 进程标签是纯视图，关闭后回到同会话终端，不影响快照与采样任务。
+      set((state) => {
+        const tabs = new Map(state.tabs);
+        tabs.delete(tabId);
+        const activeTabId = state.activeTabId === tabId
+          ? (tabs.has(terminalTabId(tab.sessionId)) ? terminalTabId(tab.sessionId) : null)
+          : state.activeTabId;
+        return { tabs, activeTabId };
+      });
     },
 
     /** 应用后端权威会话状态；投影仅更新所属 session，Connected/Disconnected 后清除。 */

@@ -12,6 +12,7 @@ import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
 import TrustedHostsSection from '@/components/settings/TrustedHostsSection';
 import LogViewer from '@/components/settings/LogViewer';
+import ProcessTabPane from '@/components/process/ProcessTabPane';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
@@ -211,6 +212,7 @@ export default function HomePage() {
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
               processSnapshot={processSnapshot} processSortMode={processSortMode}
               onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
+              onOpenProcess={activeSessionId === null ? undefined : () => useSessionStore.getState().openProcessTab(activeSessionId)}
               onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
@@ -221,6 +223,7 @@ export default function HomePage() {
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
               processSnapshot={processSnapshot} processSortMode={processSortMode}
               onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
+              onOpenProcess={activeSessionId === null ? undefined : () => useSessionStore.getState().openProcessTab(activeSessionId)}
               onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed={false} onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
@@ -234,7 +237,7 @@ export default function HomePage() {
         onActivate={(tabId) => useSessionStore.getState().setActiveTab(tabId)}
         onClose={(tabId) => useSessionStore.getState().closeTab(tabId)} /></div>}
       <div className="content-area">
-        <TerminalPane tabs={tabs} sessions={sessionsMap} activeTabId={activeTabId} connections={connections}
+        {activeTab?.type === 'process' ? <ProcessTabPane snapshot={processSnapshot} /> : <TerminalPane tabs={tabs} sessions={sessionsMap} activeTabId={activeTabId} connections={connections}
           challenges={hostKeyChallenges} saveErrors={hostKeySaveErrors}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
@@ -242,7 +245,7 @@ export default function HomePage() {
           onCloseTab={(tabId) => useSessionStore.getState().closeTab(tabId)}
           onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
           onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
-          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />
+          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />}
         {activeSessionId !== null && <SftpPanel sessionId={activeSessionId} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}

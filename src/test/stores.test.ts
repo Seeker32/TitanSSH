@@ -8,10 +8,10 @@ import { useProcessStore } from '@/stores/process';
 import { connectionLabel, useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
-import { terminalTabId } from '@/types/tab';
+import { processTabId, terminalTabId } from '@/types/tab';
 import { TaskStatus } from '@/types/monitor';
 import { uploadTargetDir, type RemoteEntry, type TransferTask } from '@/types/sftp';
-import { makeHost, makeProcessTaskInfo, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab, makeTransferTask } from './fixtures';
+import { makeHost, makeProcessSnapshot, makeProcessTaskInfo, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -274,6 +274,28 @@ describe('Zustand stores', () => {
     });
     useSessionStore.getState().setActiveTab(terminalTabId('session-2'));
     expect(useSessionStore.getState().activeTabId).toBe(terminalTabId('session-2'));
+  });
+
+  it('进程标签是纯视图：关闭与重开不影响采样或缓存快照', async () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      tabs: new Map([[terminalTabId('session-1'), makeTerminalTab()]]),
+      activeTabId: terminalTabId('session-1'),
+    });
+    const snapshot = makeProcessSnapshot();
+    useProcessStore.getState().applySnapshot(snapshot);
+
+    useSessionStore.getState().openProcessTab('session-1');
+    expect(useSessionStore.getState().activeTabId).toBe(processTabId('session-1'));
+    expect(useSessionStore.getState().tabs.get(processTabId('session-1'))?.type).toBe('process');
+
+    await useSessionStore.getState().closeTab(processTabId('session-1'));
+    expect(mockInvoke).not.toHaveBeenCalledWith('close_session', expect.anything());
+    expect(useSessionStore.getState().activeTabId).toBe(terminalTabId('session-1'));
+    expect(useProcessStore.getState().snapshots.get('session-1')).toBe(snapshot);
+
+    useSessionStore.getState().openProcessTab('session-1');
+    expect(useSessionStore.getState().activeTabId).toBe(processTabId('session-1'));
   });
 
   it('监控启动失败不阻断会话打开', async () => {

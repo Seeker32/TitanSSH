@@ -24,4 +24,13 @@ describe('ProcessSummaryPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: '内存' }));
     expect(onSortModeChange).toHaveBeenCalledWith('memory');
   });
+
+  it('点击 top-5 面板或可访问按钮都能打开全量进程标签', () => {
+    const onOpenProcess = vi.fn();
+    render(<ProcessSummaryPanel snapshot={processSnapshot} sortMode="cpu" onSortModeChange={vi.fn()} onOpenProcess={onOpenProcess} />);
+
+    fireEvent.click(screen.getByText('worker'));
+    fireEvent.click(screen.getByRole('button', { name: '查看全部进程' }));
+    expect(onOpenProcess).toHaveBeenCalledTimes(2);
+  });
 });

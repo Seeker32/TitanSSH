@@ -3,15 +3,17 @@ import { topProcesses } from '@/stores/process';
 import type { ProcessSnapshot } from '@/types/process';
 import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
+import type { MouseEvent, KeyboardEvent } from 'react';
 
 interface Props {
   snapshot: ProcessSnapshot | null;
   sortMode: ProcessSortMode;
   onSortModeChange: (mode: ProcessSortMode) => void;
+  onOpenProcess?: () => void;
 }
 
 /** 将进程内存占用格式化为侧栏可读文本。 */
-function formatMemory(bytes: number | null) {
+export function formatMemory(bytes: number | null) {
   if (bytes === null || bytes <= 0) return '--';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
@@ -24,13 +26,26 @@ function formatMemory(bytes: number | null) {
 }
 
 /** 渲染当前会话同一份进程快照派生的 top-5 摘要。 */
-export default function ProcessSummaryPanel({ snapshot, sortMode, onSortModeChange }: Props) {
+export default function ProcessSummaryPanel({ snapshot, sortMode, onSortModeChange, onOpenProcess }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   const processes = topProcesses(snapshot ?? undefined, sortMode);
+  /** 点击 top-5 列表打开全量进程标签；排序按钮只执行自身操作。 */
+  function openFromPanel(event: MouseEvent<HTMLElement>) {
+    if (onOpenProcess && !(event.target as HTMLElement).closest('button')) onOpenProcess();
+  }
+  /** 为可点击摘要面板提供键盘等价操作。 */
+  function openFromKeyboard(event: KeyboardEvent<HTMLElement>) {
+    if (onOpenProcess && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault();
+      onOpenProcess();
+    }
+  }
   return (
-    <section className="process-summary" data-testid="process-summary" aria-label={translate(locale, 'process.title')}>
+    <section className="process-summary" data-testid="process-summary" aria-label={translate(locale, 'process.title')}
+      onClick={onOpenProcess ? openFromPanel : undefined} onKeyDown={onOpenProcess ? openFromKeyboard : undefined} tabIndex={onOpenProcess ? 0 : undefined}>
       <div className="process-summary-header">
         <strong>{translate(locale, 'process.title')}</strong>
+        {onOpenProcess && <button type="button" className="process-summary-open" onClick={onOpenProcess}>{translate(locale, 'process.open')}</button>}
         <div className="process-summary-sort" role="group" aria-label={translate(locale, 'process.sort')}>
           <button type="button" aria-pressed={sortMode === 'cpu'} onClick={() => onSortModeChange('cpu')}>{translate(locale, 'process.cpu')}</button>
           <button type="button" aria-pressed={sortMode === 'memory'} onClick={() => onSortModeChange('memory')}>{translate(locale, 'process.memory')}</button>

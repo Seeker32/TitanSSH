@@ -106,6 +106,21 @@ describe('HomePage integration', () => {
     expect(screen.getByTestId('process-summary')).toHaveTextContent('worker');
   });
 
+  it('从 top-5 打开进程标签，关闭后仍保留缓存快照', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => emitMockEvent('process:snapshot', makeProcessSnapshot()));
+
+    await user.click(screen.getByRole('button', { name: '查看全部进程' }));
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(screen.getByText('进程 · root@10.0.0.8')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '关闭 进程 · root@10.0.0.8' }));
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(useProcessStore.getState().snapshots.has('session-1')).toBe(true);
+  });
+
   it('切换活动会话后保留各自的网卡选择', async () => {
     const user = userEvent.setup();
     render(<HomePage />);
