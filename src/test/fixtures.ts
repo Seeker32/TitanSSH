@@ -4,6 +4,7 @@ import type { TerminalTab } from '@/types/tab';
 import { terminalTabId } from '@/types/tab';
 import type { MonitorSnapshot, TaskInfo } from '@/types/monitor';
 import { TaskStatus } from '@/types/monitor';
+import type { ProcessSnapshot } from '@/types/process';
 import type { RemoteEntry, TransferTask } from '@/types/sftp';
 
 /** 生成测试用 HostConfig（含 ref 字段，不含明文凭据） */
@@ -88,6 +89,25 @@ export function makeTaskInfo(overrides: Partial<TaskInfo> = {}): TaskInfo {
     sessionId: 'session-1',
     status: TaskStatus.Pending,
     createdAt: 1_710_000_000_000,
+    ...overrides,
+  };
+}
+
+/** 生成测试用进程采样 TaskInfo。 */
+export function makeProcessTaskInfo(overrides: Partial<TaskInfo> = {}): TaskInfo {
+  return makeTaskInfo({ taskId: 'process-task-1', taskType: 'process', ...overrides });
+}
+
+/** 生成测试用进程快照。 */
+export function makeProcessSnapshot(overrides: Partial<ProcessSnapshot> = {}): ProcessSnapshot {
+  return {
+    sessionId: 'session-1',
+    timestamp: 1_710_000_120_000,
+    totalCount: 2,
+    processes: [
+      { pid: 1, ppid: 0, user: 'root', command: 'shell', commandLine: 'shell', cpuPercent: 10, memoryBytes: 1024, state: 'S' },
+      { pid: 2, ppid: 1, user: 'root', command: 'worker', commandLine: 'worker --serve', cpuPercent: 80, memoryBytes: 2048, state: 'R' },
+    ],
     ...overrides,
   };
 }

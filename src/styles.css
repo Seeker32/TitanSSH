@@ -160,6 +160,16 @@ body.sftp-resizing { cursor: row-resize; }
 .status-panel { border: 1px solid var(--color-border) !important; border-radius: 16px !important; background: var(--color-card-bg) !important; }
 .status-panel .ant-card-head-title { display: flex; flex-direction: column; font-size: 12px; }
 .status-panel .capacity, .status-panel .updated { display: block; margin-top: 6px; font-size: 11px; }
+.process-summary { border-top: 1px solid var(--color-border); padding-top: 10px; font-size: 11px; }
+.process-summary-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.process-summary-sort { display: flex; gap: 4px; }
+.process-summary-sort button { padding: 2px 6px; border: 1px solid var(--color-border); border-radius: 4px; background: transparent; color: var(--color-text-secondary); font-size: 10px; cursor: pointer; }
+.process-summary-sort button[aria-pressed="true"] { border-color: var(--color-border-focus); color: var(--color-accent); }
+.process-summary-empty { color: var(--color-text-tertiary); }
+.process-summary-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding-left: 18px; }
+.process-summary-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 6px; align-items: baseline; }
+.process-summary-command { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.process-summary-pid { color: var(--color-text-tertiary); }
 .network-trend svg { display: block; width: 100%; height: 96px; color: var(--color-text-tertiary); }
 .network-trend-legend, .network-trend-boundary { display: flex; justify-content: space-between; font-size: 11px; }
 .network-trend-boundary { color: var(--color-text-tertiary); }

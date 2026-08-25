@@ -1,8 +1,11 @@
 import { Card, Col, Empty, Progress, Row, Statistic, Typography } from 'antd';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import type { MonitorSnapshot, NetworkTrendSample } from '@/types/monitor';
+import type { ProcessSortMode } from '@/stores/process';
+import type { ProcessSnapshot } from '@/types/process';
 import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
+import ProcessSummaryPanel from './ProcessSummaryPanel';
 
 interface Props {
   snapshot: MonitorSnapshot | null;
@@ -12,6 +15,11 @@ interface Props {
   onInterfaceChange?: (interfaceName: string) => void;
   /** 当前 Session 已选网卡的最近一分钟趋势。 */
   trendSamples?: NetworkTrendSample[];
+  /** 当前 Session 最新进程快照与摘要排序档位。 */
+  processSnapshot: ProcessSnapshot | null;
+  processSortMode: ProcessSortMode;
+  /** 请求切换进程摘要排序档位。 */
+  onProcessSortModeChange: (mode: ProcessSortMode) => void;
   /** 是否折叠为状态点窄条 */
   collapsed: boolean;
   /** 请求切换折叠状态 */
@@ -89,7 +97,7 @@ function NetworkTrendChart({ samples, locale }: { samples: NetworkTrendSample[];
 }
 
 /** 渲染后端单次推送的服务器监控快照；折叠态只显示状态点窄条。 */
-export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], collapsed, onToggle }: Props) {
+export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onInterfaceChange, trendSamples = [], processSnapshot, processSortMode, onProcessSortModeChange, collapsed, onToggle }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   if (collapsed) {
     return (
@@ -141,6 +149,7 @@ export default function ServerStatusPanel({ snapshot, selectedInterfaceName, onI
           <Col span={12}><Statistic title={translate(locale, 'monitor.up', { name: selectedInterface.name })} value={formatRate(selectedInterface.transmitBytesPerSecond)} /></Col>
         </>)}
         {!snapshot && <Col span={24}><Empty description={translate(locale, 'monitor.empty')} /></Col>}
+        <Col span={24}><ProcessSummaryPanel snapshot={processSnapshot} sortMode={processSortMode} onSortModeChange={onProcessSortModeChange} /></Col>
       </Row>
     </Card>
   );

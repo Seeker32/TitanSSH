@@ -127,6 +127,13 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'monitor.now': 'Now',
   'monitor.empty': 'Server status refreshes here every 2 seconds after the connection is established',
 
+  // Process summary
+  'process.title': 'Process summary',
+  'process.sort': 'Process sort',
+  'process.cpu': 'CPU',
+  'process.memory': 'Memory',
+  'process.empty': 'Process snapshot is not ready',
+
   // Session and connection phases
   'session.ready': 'Ready',
   'session.connecting': 'Connecting to {name}',

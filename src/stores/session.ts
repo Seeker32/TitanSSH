@@ -9,6 +9,7 @@ import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, toAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { useMonitorStore } from './monitor';
+import { useProcessStore } from './process';
 import { useSftpStore } from './sftp';
 
 interface SessionState {
@@ -132,6 +133,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         };
       });
       useMonitorStore.getState().clearSession(sessionId);
+      useProcessStore.getState().clearSession(sessionId);
       useSftpStore.getState().clearSession(sessionId);
     },
 
@@ -166,6 +168,11 @@ export const useSessionStore = create<SessionState>((set, get) => {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
       } catch {
         // 监控失败不阻断 SSH 主流程。
+      }
+      try {
+        await useProcessStore.getState().startMonitoring(session.sessionId);
+      } catch {
+        // 进程采样失败不阻断 SSH 主流程。
       }
       return session;
     },

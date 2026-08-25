@@ -4,13 +4,14 @@ import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
 import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, readMonitorCollapsed, useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
+import { useProcessStore } from '@/stores/process';
 import { connectionLabel, useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { terminalTabId } from '@/types/tab';
 import { TaskStatus } from '@/types/monitor';
 import { uploadTargetDir, type RemoteEntry, type TransferTask } from '@/types/sftp';
-import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab, makeTransferTask } from './fixtures';
+import { makeHost, makeProcessTaskInfo, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -19,6 +20,7 @@ function resetStores() {
   useHostStore.setState(useHostStore.getInitialState(), true);
   useLayoutStore.setState(useLayoutStore.getInitialState(), true);
   useMonitorStore.setState(useMonitorStore.getInitialState(), true);
+  useProcessStore.setState(useProcessStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
   useSftpStore.getState().ensureState('session-1');
@@ -190,10 +192,11 @@ describe('Zustand stores', () => {
   it('打开会话后设为激活并启动监控', async () => {
     const session = makeSession();
     const task = makeTaskInfo();
-    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? session : task);
+    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? session : command === 'start_process_monitoring' ? makeProcessTaskInfo() : task);
     await useSessionStore.getState().openSession('host-1');
     expect(useSessionStore.getState().activeTabId).toBe(terminalTabId(session.sessionId));
     expect(useMonitorStore.getState().sessionTaskMap.get(session.sessionId)).toBe(task.taskId);
+    expect(useProcessStore.getState().sessionTaskMap.get(session.sessionId)).toBe('process-task-1');
   });
 
   it('标签视图模型：打开会话建立恰好一个终端标签（会话锚点）并按打开顺序排列', async () => {
@@ -421,6 +424,14 @@ describe('Zustand stores', () => {
       snapshots: new Map([['session-1', makeSnapshot()]]),
       selectedInterfaces: new Map([['session-1', 'eth0']]),
     });
+    const processTask = makeProcessTaskInfo();
+    useProcessStore.setState({
+      sessionTaskMap: new Map([['session-1', processTask.taskId]]),
+      tasks: new Map([[processTask.taskId, processTask]]),
+      snapshots: new Map([['session-1', {
+        sessionId: 'session-1', timestamp: 1, processes: [], totalCount: 0,
+      }]]),
+    });
     mockInvoke.mockResolvedValue(undefined);
     await useSessionStore.getState().closeSession('session-1');
 
@@ -433,6 +444,9 @@ describe('Zustand stores', () => {
     expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
+    expect(useProcessStore.getState().sessionTaskMap.has('session-1')).toBe(false);
+    expect(useProcessStore.getState().tasks.has(processTask.taskId)).toBe(false);
+    expect(useProcessStore.getState().snapshots.has('session-1')).toBe(false);
   });
 
   it('连接失败后端已自动 teardown：close_session 返回 SessionNotFound 时仍清理投影，标签始终可关闭', async () => {

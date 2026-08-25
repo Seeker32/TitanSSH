@@ -15,6 +15,7 @@ import LogViewer from '@/components/settings/LogViewer';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
 import { useMonitorStore } from '@/stores/monitor';
+import { useProcessStore } from '@/stores/process';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useThemeStore } from '@/stores/theme';
@@ -38,6 +39,8 @@ export default function HomePage() {
   const hostKeyChallenges = useSessionStore((state) => state.hostKeyChallenges);
   const hostKeySaveErrors = useSessionStore((state) => state.hostKeySaveErrors);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
+  const processSnapshots = useProcessStore((state) => state.snapshots);
+  const processSortMode = useProcessStore((state) => state.sortMode);
   const sftpStates = useSftpStore((state) => state.sessionStates);
   const recentTransfers = useSftpStore((state) => state.recentTransfers);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
@@ -51,6 +54,7 @@ export default function HomePage() {
   const selectedInterfaceName = useMonitorStore((state) => activeSessionId === null ? null : state.selectedInterfaces.get(activeSessionId) ?? null);
   const trendSamples = useMonitorStore((state) => activeSessionId === null ? undefined : state.networkTrends.get(activeSessionId));
   const snapshot = activeSessionId === null ? null : monitorSnapshots.get(activeSessionId) ?? null;
+  const processSnapshot = activeSessionId === null ? null : processSnapshots.get(activeSessionId) ?? null;
   const sftpState = activeSessionId === null ? null : sftpStates.get(activeSessionId) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
@@ -84,6 +88,7 @@ export default function HomePage() {
     resize();
     useSessionStore.getState().initListeners().then(keep);
     useMonitorStore.getState().initListeners().then(keep);
+    useProcessStore.getState().initListeners().then(keep);
     useSftpStore.getState().initListeners().then(keep);
     useHostStore.getState().loadHosts();
     return () => {
@@ -204,6 +209,8 @@ export default function HomePage() {
         {monitorCollapsed ? (
           <div className="sidebar-footer-row">
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
+              processSnapshot={processSnapshot} processSortMode={processSortMode}
+              onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
               onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
@@ -212,6 +219,8 @@ export default function HomePage() {
         ) : (
           <>
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
+              processSnapshot={processSnapshot} processSortMode={processSortMode}
+              onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
               onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed={false} onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />

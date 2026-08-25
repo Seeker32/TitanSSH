@@ -124,6 +124,13 @@ export const zhCN = {
   'monitor.now': '现在',
   'monitor.empty': '连接建立后，这里会每 2 秒刷新一次服务器状态',
 
+  // 进程摘要
+  'process.title': '进程摘要',
+  'process.sort': '进程排序',
+  'process.cpu': 'CPU',
+  'process.memory': '内存',
+  'process.empty': '进程快照尚未就绪',
+
   // 会话与连接阶段
   'session.ready': '就绪',
   'session.connecting': '正在连接 {name}',
