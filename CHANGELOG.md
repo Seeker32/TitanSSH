@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.6] - 2026-08-25
+
+### Features
+
+- Added process monitoring: full process snapshots with delta CPU sampling, delivered by a new process service and shared exec connection registry.
+- Introduced the tab view model (ADR-0002): the tab bar and terminal pane render from a tab list; the terminal tab is the session anchor, and other tabs are pure views that reference sessions without owning connections.
+- Added memory usage metrics to the monitoring snapshot and the ServerStatusPanel.
+- Added a RecentTransfers component listing terminal-state transfers from closed sessions.
+
+### Changed
+
+- Removed the legacy activeView session-view state in favor of tab-based view selection.
+- Added a cargo fmt check gate to the release workflow and tidied code formatting in session and host models.
+- Updated architecture documentation; added process monitoring and tab view model ADRs.
+
+### Fixed
+
+- Closing a tab after a connection failure (e.g. "No route to host") no longer gets stuck: the frontend removes the session projection even when the backend has already reaped the session and close_session returns SessionNotFound, with store and e2e regression tests covering the user-facing entry point.
+
 ## [0.1.5] - 2026-08-18
 
 ### Features
