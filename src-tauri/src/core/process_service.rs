@@ -1,53 +1,45 @@
 use crate::core::host_identity::HostKeyVerifier;
 use crate::core::process_worker;
+use crate::core::sampling_task_runtime::{
+    SamplingTaskRuntime, SamplingTaskSink, SamplingTaskSpec, SamplingWorkerInput,
+};
 use crate::core::shared_exec_registry::SharedExecRegistry;
-use crate::errors::app_error::AppErrorInfo;
-use crate::errors::app_error::{AppError, ErrorDetail};
-use crate::models::host::{AuthType, HostConfig};
-use crate::models::monitor::{TaskInfo, TaskStatus};
+use crate::errors::app_error::AppError;
+use crate::models::host::HostConfig;
+use crate::models::monitor::TaskInfo;
+#[cfg(test)]
+use crate::models::monitor::TaskStatus;
 use crate::models::process::ProcessSnapshot;
-use crate::models::session::TaskStatusEvent;
-use crate::storage::secure_store;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use tauri::{AppHandle, Emitter, Runtime};
-use uuid::Uuid;
+#[cfg(test)]
+use std::sync::Arc;
+use tauri::{AppHandle, Runtime};
 
-/// 进程采样任务句柄，包含任务元数据和关闭信号。
-pub(crate) struct ProcessTaskHandle {
-    /// 任务基本信息。
-    pub(crate) task_info: TaskInfo,
-    /// 置为 true 后通知 worker 停止。
-    pub(crate) shutdown: Arc<AtomicBool>,
-}
+/// 进程采样任务的固定事件与错误描述。
+const SPEC: SamplingTaskSpec = SamplingTaskSpec {
+    task_type: "process",
+    snapshot_event: "process:snapshot",
+    error_code: "ProcessError",
+    worker_panic_detail_key: "进程工作线程异常退出: {0}",
+    snapshot_emit_detail_key: "进程快照推送失败: {0}",
+};
 
-/// 进程采样服务：独立管理任务状态与最新全量快照。
+/// 进程采样 adapter：只连接进程 worker 与共享任务生命周期。
 #[derive(Clone)]
 pub struct ProcessService {
-    /// 活跃进程采样任务。
-    pub(crate) tasks: Arc<Mutex<HashMap<String, ProcessTaskHandle>>>,
-    /// 按 sessionId 缓存最新快照。
-    pub(crate) snapshots: Arc<Mutex<HashMap<String, ProcessSnapshot>>>,
-    /// 已完成 teardown 的会话，阻止迟到的启动请求重新注册任务。
-    closed_sessions: Arc<Mutex<HashSet<String>>>,
-    /// 与主机监控共享的采样连接注册表。
+    runtime: SamplingTaskRuntime<ProcessSnapshot>,
     exec_registry: SharedExecRegistry,
 }
 
 impl ProcessService {
-    /// 创建进程采样服务。
+    /// 创建进程采样 adapter，并绑定共享 exec 注册表。
     pub fn new(exec_registry: SharedExecRegistry) -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(HashMap::new())),
-            snapshots: Arc::new(Mutex::new(HashMap::new())),
-            closed_sessions: Arc::new(Mutex::new(HashSet::new())),
+            runtime: SamplingTaskRuntime::new(SPEC),
             exec_registry,
         }
     }
 
-    /// 为指定会话启动进程采样；凭据读取成功前不注册任务。
+    /// 读取凭据并启动真实进程采样 worker。
     pub fn start_process_monitoring<R: Runtime>(
         &self,
         session_id: String,
@@ -55,287 +47,75 @@ impl ProcessService {
         verifier: HostKeyVerifier,
         app: AppHandle<R>,
     ) -> Result<TaskInfo, AppError> {
-        let (password, passphrase) = load_credentials(&host)?;
-        let task_id = Uuid::new_v4().to_string();
-        let task_info = TaskInfo {
-            task_id: task_id.clone(),
-            task_type: "process".to_string(),
-            session_id: Some(session_id.clone()),
-            status: TaskStatus::Pending,
-            created_at: chrono::Utc::now().timestamp_millis(),
-        };
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut tasks = lock_unpoisoned(&self.tasks);
-        if lock_unpoisoned(&self.closed_sessions).contains(&session_id) {
-            return Err(AppError::SessionNotFound(session_id.into()));
-        }
-        tasks.insert(
-            task_id.clone(),
-            ProcessTaskHandle {
-                task_info: task_info.clone(),
-                shutdown: shutdown.clone(),
-            },
-        );
-        drop(tasks);
-
-        let tasks_ref = self.tasks.clone();
-        let snapshots_ref = self.snapshots.clone();
         let exec_registry = self.exec_registry.clone();
-        emit_task_status(&app, &task_id, TaskStatus::Pending, None);
-
-        thread::spawn(move || {
-            transition_task_status(&tasks_ref, &app, &task_id, TaskStatus::Running, None);
-            let tasks_for_error = tasks_ref.clone();
-            let app_for_error = app.clone();
-            let task_id_for_error = task_id.clone();
-            let tasks_for_snapshot = tasks_ref.clone();
-            let app_for_snapshot = app.clone();
-            let task_id_for_snapshot = task_id.clone();
-            let shutdown_for_snapshot = shutdown.clone();
-
-            run_loop_with_panic_guard(&tasks_ref, &app, &task_id, move || {
+        self.runtime.start(
+            app,
+            session_id,
+            host,
+            move |input: SamplingWorkerInput, sink: SamplingTaskSink<R, ProcessSnapshot>| {
+                let snapshot_sink = sink.clone();
                 process_worker::run_process_loop(
                     exec_registry,
                     verifier,
                     process_worker::ProcessLoopParams {
-                        host,
-                        password,
-                        passphrase,
-                        session_id,
-                        shutdown,
+                        host: input.host,
+                        password: input.password,
+                        passphrase: input.passphrase,
+                        session_id: input.session_id,
+                        shutdown: input.shutdown,
                     },
-                    move |snapshot| {
-                        apply_snapshot_if_task_alive(
-                            &tasks_for_snapshot,
-                            &snapshots_ref,
-                            &app_for_snapshot,
-                            &shutdown_for_snapshot,
-                            &task_id_for_snapshot,
-                            &snapshot,
-                        );
-                    },
-                    move |error| {
-                        transition_task_status(
-                            &tasks_for_error,
-                            &app_for_error,
-                            &task_id_for_error,
-                            TaskStatus::Failed,
-                            process_status_error("进程采集失败: {0}", error.to_string()),
-                        );
-                    },
+                    move |snapshot| snapshot_sink.publish(snapshot),
+                    move |error| sink.fail("进程采集失败: {0}", error.to_string()),
                 );
-            });
-        });
-
-        Ok(task_info)
+            },
+        )
     }
 
-    /// 停止指定进程采样任务并补发 Done 终态事件。
+    /// 停止一个进程采样任务并在需要时补发 Done。
     pub fn stop_process_monitoring<R: Runtime>(&self, app: &AppHandle<R>, task_id: &str) -> bool {
-        let Some(handle) = lock_unpoisoned(&self.tasks).remove(task_id) else {
-            return false;
-        };
-        handle.shutdown.store(true, Ordering::Release);
-        if !matches!(
-            handle.task_info.status,
-            TaskStatus::Done | TaskStatus::Failed
-        ) {
-            emit_task_status(app, task_id, TaskStatus::Done, None);
-        }
-        true
+        self.runtime.stop(app, task_id)
     }
 
-    /// 停止会话所属的全部进程采样任务并清除快照。
+    /// 建立 Session tombstone 并停止该 Session 的全部进程采样任务。
     pub fn stop_session<R: Runtime>(&self, app: &AppHandle<R>, session_id: &str) {
-        let mut terminal_ids = Vec::new();
-        let mut tasks = lock_unpoisoned(&self.tasks);
-        lock_unpoisoned(&self.closed_sessions).insert(session_id.to_string());
-        tasks.retain(|task_id, handle| {
-            if handle.task_info.session_id.as_deref() != Some(session_id) {
-                return true;
-            }
-            handle.shutdown.store(true, Ordering::Release);
-            if !matches!(
-                handle.task_info.status,
-                TaskStatus::Done | TaskStatus::Failed
-            ) {
-                terminal_ids.push(task_id.clone());
-            }
-            false
-        });
-        drop(tasks);
-        lock_unpoisoned(&self.snapshots).remove(session_id);
-        for task_id in terminal_ids {
-            emit_task_status(app, &task_id, TaskStatus::Done, None);
-        }
+        self.runtime.stop_session(app, session_id);
     }
 
-    /// 停止全部任务并清空缓存。
+    /// 停止全部进程采样任务并清空快照。
     pub fn stop_all<R: Runtime>(&self, app: &AppHandle<R>) {
-        let task_ids: Vec<_> = lock_unpoisoned(&self.tasks).keys().cloned().collect();
-        for task_id in task_ids {
-            self.stop_process_monitoring(app, &task_id);
-        }
-        lock_unpoisoned(&self.snapshots).clear();
+        self.runtime.stop_all(app);
     }
 
-    /// 获取会话最新进程快照。
+    /// 返回指定 Session 最近一次成功采集的进程快照。
     pub fn get_process_status(&self, session_id: &str) -> Option<ProcessSnapshot> {
-        lock_unpoisoned(&self.snapshots).get(session_id).cloned()
+        self.runtime.latest_snapshot(session_id)
     }
-}
 
-/// 从安全存储读取运行时凭据，失败时不创建任务。
-fn load_credentials(host: &HostConfig) -> Result<(Option<String>, Option<String>), AppError> {
-    match host.auth_type {
-        AuthType::Password => {
-            let password_ref = host.password_ref.as_deref().ok_or_else(|| {
-                AppError::InvalidHostConfig(ErrorDetail::msg("密码引用为空", Vec::new()))
-            })?;
-            Ok((Some(secure_store::get_credential(password_ref)?), None))
-        }
-        AuthType::PrivateKey => Ok((
-            None,
-            host.passphrase_ref
-                .as_deref()
-                .map(secure_store::get_credential)
-                .transpose()?,
-        )),
+    /// 测试构造：注入缓存快照供命令层有数据路径测试使用。
+    #[cfg(test)]
+    pub(crate) fn insert_snapshot_for_test(&self, snapshot: ProcessSnapshot) {
+        let session_id = snapshot.session_id.clone();
+        self.runtime.insert_snapshot_for_test(&session_id, snapshot);
     }
-}
 
-/// 仅任务仍存活时缓存并推送快照；迟到快照直接丢弃。
-pub(crate) fn apply_snapshot_if_task_alive<R: Runtime>(
-    tasks: &Arc<Mutex<HashMap<String, ProcessTaskHandle>>>,
-    snapshots: &Arc<Mutex<HashMap<String, ProcessSnapshot>>>,
-    app: &AppHandle<R>,
-    shutdown: &AtomicBool,
-    task_id: &str,
-    snapshot: &ProcessSnapshot,
-) -> bool {
-    {
-        let tasks_guard = lock_unpoisoned(tasks);
-        if !tasks_guard.contains_key(task_id) {
-            return false;
-        }
-        // 与 stop_session 持同一把 tasks 锁，防止清理后迟到快照重新写入缓存。
-        lock_unpoisoned(snapshots).insert(snapshot.session_id.clone(), snapshot.clone());
+    /// 测试构造：注入任务供命令与 Session teardown 测试使用。
+    #[cfg(test)]
+    pub(crate) fn insert_task_for_test(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        status: TaskStatus,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.runtime
+            .insert_task_for_test(task_id, session_id, status, shutdown);
     }
-    if let Err(error) = app.emit("process:snapshot", snapshot) {
-        handle_snapshot_emit_failure(shutdown, tasks, app, task_id, error);
+
+    /// 测试观测：确认任务已从 runtime registry 移除。
+    #[cfg(test)]
+    pub(crate) fn task_exists_for_test(&self, task_id: &str) -> bool {
+        self.runtime.task_exists_for_test(task_id)
     }
-    true
-}
-
-/// 事件推送失败时停止采样并把任务迁移为 Failed。
-pub(crate) fn handle_snapshot_emit_failure<R: Runtime>(
-    shutdown: &AtomicBool,
-    tasks: &Arc<Mutex<HashMap<String, ProcessTaskHandle>>>,
-    app: &AppHandle<R>,
-    task_id: &str,
-    error: impl std::fmt::Display,
-) {
-    shutdown.store(true, Ordering::Release);
-    transition_task_status(
-        tasks,
-        app,
-        task_id,
-        TaskStatus::Failed,
-        process_status_error("进程快照推送失败: {0}", error.to_string()),
-    );
-}
-
-/// worker 或回调 panic 时统一迁移 Failed；正常退出迁移 Done。
-pub(crate) fn run_loop_with_panic_guard<R: Runtime>(
-    tasks: &Arc<Mutex<HashMap<String, ProcessTaskHandle>>>,
-    app: &AppHandle<R>,
-    task_id: &str,
-    body: impl FnOnce(),
-) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        Ok(()) => {
-            transition_task_status(tasks, app, task_id, TaskStatus::Done, None);
-        }
-        Err(payload) => {
-            transition_task_status(
-                tasks,
-                app,
-                task_id,
-                TaskStatus::Failed,
-                process_status_error("进程工作线程异常退出: {0}", panic_message(&*payload)),
-            );
-        }
-    }
-}
-
-/// 从 panic payload 提取可诊断文本。
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_string())
-}
-
-/// 执行 Pending → Running → Done/Failed 的合法状态迁移。
-fn transition_task_status<R: Runtime>(
-    tasks: &Arc<Mutex<HashMap<String, ProcessTaskHandle>>>,
-    app: &AppHandle<R>,
-    task_id: &str,
-    status: TaskStatus,
-    error: Option<AppErrorInfo>,
-) -> bool {
-    let mut tasks = lock_unpoisoned(tasks);
-    let Some(handle) = tasks.get_mut(task_id) else {
-        return false;
-    };
-    let legal = matches!(
-        (&handle.task_info.status, &status),
-        (TaskStatus::Pending, TaskStatus::Running)
-            | (TaskStatus::Running, TaskStatus::Done)
-            | (TaskStatus::Running, TaskStatus::Failed)
-    );
-    if !legal {
-        return false;
-    }
-    handle.task_info.status = status.clone();
-    drop(tasks);
-    emit_task_status(app, task_id, status, error);
-    true
-}
-
-/// 发布共享任务状态事件。
-fn emit_task_status<R: Runtime>(
-    app: &AppHandle<R>,
-    task_id: &str,
-    status: TaskStatus,
-    error: Option<AppErrorInfo>,
-) {
-    let _ = app.emit(
-        "task:status",
-        TaskStatusEvent {
-            task_id: task_id.to_string(),
-            status,
-            error,
-        },
-    );
-}
-
-/// 构造进程任务错误事件的结构化 payload。
-fn process_status_error(key: &str, param: String) -> Option<AppErrorInfo> {
-    Some(AppErrorInfo {
-        code: "ProcessError".to_string(),
-        detail: None,
-        detail_key: Some(key.to_string()),
-        detail_params: Some(vec![param]),
-    })
-}
-
-/// 毒化容忍锁，避免单次 worker panic 让服务永久不可用。
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

@@ -2,13 +2,13 @@
 mod tests {
     use crate::commands::monitor::{get_monitor_status, stop_monitoring};
     use crate::core::host_identity::HostIdentityService;
-    use crate::core::monitor_service::{MonitorService, MonitorTaskHandle};
+    use crate::core::monitor_service::MonitorService;
     use crate::core::process_service::ProcessService;
     use crate::core::session_manager::SessionManager;
     use crate::core::sftp_service::SftpService;
     use crate::errors::app_error::AppErrorInfo;
     use crate::models::host::{AuthType, HostConfig};
-    use crate::models::monitor::{MonitorSnapshot, NetworkSnapshot, TaskInfo, TaskStatus};
+    use crate::models::monitor::{MonitorSnapshot, NetworkSnapshot, TaskStatus};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tauri::Manager;
@@ -91,18 +91,11 @@ mod tests {
 
     /// 向注册表插入一个 Running 任务（无工作线程），模拟进行中的监控任务。
     fn insert_running_task(service: &MonitorService, task_id: &str, session_id: &str) {
-        service.tasks.lock().unwrap().insert(
-            task_id.to_string(),
-            MonitorTaskHandle {
-                task_info: TaskInfo {
-                    task_id: task_id.to_string(),
-                    task_type: "monitor".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    status: TaskStatus::Running,
-                    created_at: 0,
-                },
-                shutdown: Arc::new(AtomicBool::new(false)),
-            },
+        service.insert_task_for_test(
+            task_id,
+            session_id,
+            TaskStatus::Running,
+            Arc::new(AtomicBool::new(false)),
         );
     }
 
@@ -145,7 +138,7 @@ mod tests {
 
         let value: serde_json::Value = response.deserialize().unwrap();
         assert_eq!(value, serde_json::Value::Null);
-        assert!(!service.tasks.lock().unwrap().contains_key("task-1"));
+        assert!(!service.task_exists_for_test("task-1"));
     }
 
     /// 回归：会话存活但尚无快照（首轮采集前、或监控已停止）时，get_monitor_status

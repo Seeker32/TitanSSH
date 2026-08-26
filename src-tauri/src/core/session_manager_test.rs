@@ -267,9 +267,7 @@ mod tests {
     /// close_session 必须在后端一次性停止 Terminal、Monitoring 并清理 File Transfer。
     #[test]
     fn close_session_tears_down_all_backend_work() {
-        use crate::core::monitor_service::MonitorTaskHandle;
-        use crate::core::process_service::ProcessTaskHandle;
-        use crate::models::monitor::{TaskInfo, TaskStatus};
+        use crate::models::monitor::TaskStatus;
         use tauri::test::mock_app;
 
         let app = mock_app();
@@ -312,31 +310,17 @@ mod tests {
                 host: make_host("host-1"),
             },
         );
-        monitor_service.tasks.lock().unwrap().insert(
-            "monitor-task".to_string(),
-            MonitorTaskHandle {
-                task_info: TaskInfo {
-                    task_id: "monitor-task".to_string(),
-                    task_type: "monitor".to_string(),
-                    session_id: Some(session_id.clone()),
-                    status: TaskStatus::Running,
-                    created_at: 1_710_000_000_000,
-                },
-                shutdown: monitor_shutdown.clone(),
-            },
+        monitor_service.insert_task_for_test(
+            "monitor-task",
+            &session_id,
+            TaskStatus::Running,
+            monitor_shutdown.clone(),
         );
-        process_service.tasks.lock().unwrap().insert(
-            "process-task".to_string(),
-            ProcessTaskHandle {
-                task_info: TaskInfo {
-                    task_id: "process-task".to_string(),
-                    task_type: "process".to_string(),
-                    session_id: Some(session_id.clone()),
-                    status: TaskStatus::Running,
-                    created_at: 1_710_000_000_000,
-                },
-                shutdown: process_shutdown.clone(),
-            },
+        process_service.insert_task_for_test(
+            "process-task",
+            &session_id,
+            TaskStatus::Running,
+            process_shutdown.clone(),
         );
         sftp_service.register_session(session_id.clone(), make_host("host-1"));
 
@@ -346,9 +330,9 @@ mod tests {
 
         assert!(terminal_shutdown.load(Ordering::Relaxed));
         assert!(monitor_shutdown.load(Ordering::Acquire));
-        assert!(monitor_service.tasks.lock().unwrap().is_empty());
+        assert!(!monitor_service.task_exists_for_test("monitor-task"));
         assert!(process_shutdown.load(Ordering::Acquire));
-        assert!(process_service.tasks.lock().unwrap().is_empty());
+        assert!(!process_service.task_exists_for_test("process-task"));
         assert!(!sftp_service.has_session(&session_id));
     }
 

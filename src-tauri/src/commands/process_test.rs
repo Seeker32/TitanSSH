@@ -140,24 +140,21 @@ mod tests {
         let (app, service) = test_app();
         app.state::<SessionManager>()
             .insert_session_for_test("session-1", host());
-        service.snapshots.lock().unwrap().insert(
-            "session-1".to_string(),
-            ProcessSnapshot {
-                session_id: "session-1".to_string(),
-                timestamp: 1_710_000_000_000,
-                processes: vec![ProcessInfo {
-                    pid: 1,
-                    ppid: 0,
-                    user: "root".to_string(),
-                    command: "init".to_string(),
-                    command_line: "init".to_string(),
-                    cpu_percent: None,
-                    memory_bytes: Some(1),
-                    state: "S".to_string(),
-                }],
-                total_count: 1,
-            },
-        );
+        service.insert_snapshot_for_test(ProcessSnapshot {
+            session_id: "session-1".to_string(),
+            timestamp: 1_710_000_000_000,
+            processes: vec![ProcessInfo {
+                pid: 1,
+                ppid: 0,
+                user: "root".to_string(),
+                command: "init".to_string(),
+                command_line: "init".to_string(),
+                cpu_percent: None,
+                memory_bytes: Some(1),
+                state: "S".to_string(),
+            }],
+            total_count: 1,
+        });
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .unwrap();
