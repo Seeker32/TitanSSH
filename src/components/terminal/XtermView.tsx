@@ -75,6 +75,16 @@ export default function XtermView({ sessionId, active, interactive, onInput, onR
     fitAddonRef.current = addon;
     terminal.loadAddon(addon);
     terminal.open(container);
+    terminal.attachCustomKeyEventHandler((event) => {
+      if (event.key !== 'Tab') return true;
+      event.preventDefault();
+      event.stopPropagation();
+      // WebView 可能不提供 keyCode；仅在 keydown 且已连接时直接转发 Tab，避免重复输入
+      if (event.type === 'keydown' && interactiveRef.current) {
+        inputRef.current({ sessionId, data: event.shiftKey ? '\x1b[Z' : '\t' });
+      }
+      return false;
+    });
     const viewport = container.querySelector<HTMLElement>('.xterm-viewport');
     viewportRef.current = viewport;
     viewport?.style.setProperty('scrollbar-width', 'none');

@@ -352,6 +352,34 @@ test('侧栏主机列表：双击打开会话，单击不连接', async ({ page 
   await expect(page.getByRole('tab', { name: /root@10.0.0.8/ })).toBeVisible();
 });
 
+test('WebView Tab 输入仅在终端连接后转发到 SSH Shell', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.sidebar').getByTestId('host-card-host-1').focus();
+  await page.keyboard.press('Enter');
+  const textarea = page.locator('.xterm-helper-textarea');
+
+  await textarea.evaluate((element) => element.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'Tab', code: 'Tab', bubbles: true, cancelable: true,
+  })));
+  await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { emit: (name: string, payload: unknown) => void };
+  }).__TAURI_TEST__.emit('session:status', { sessionId: 'session-1', status: 'Connected', message: null }));
+  const dispatchResults = await textarea.evaluate((element) => [false, true].map((shiftKey) => (
+    element.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Tab', code: 'Tab', shiftKey, bubbles: true, cancelable: true,
+    }))
+  )));
+
+  expect(dispatchResults).toEqual([false, false]);
+  const writes = await page.evaluate(() => (window as unknown as {
+    __TAURI_TEST__: { calls: Array<{ command: string; args: Record<string, unknown> }> };
+  }).__TAURI_TEST__.calls.filter((call) => call.command === 'write_terminal'));
+  expect(writes).toEqual([
+    { command: 'write_terminal', args: { sessionId: 'session-1', data: '\t' } },
+    { command: 'write_terminal', args: { sessionId: 'session-1', data: '\x1b[Z' } },
+  ]);
+});
+
 test('新建主机携带分组保存', async ({ page }) => {
   await page.goto('/');
   await page.getByLabel('新建主机').click();
