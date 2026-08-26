@@ -35,9 +35,9 @@ for proc in /proc/[0-9]*; do
   [ "$#" -ge 22 ] || continue
   state=$1
   ppid=$2
-  utime=$12
-  stime=$13
-  rss_pages=$22
+  utime=${12}
+  stime=${13}
+  rss_pages=${22}
   case "$pid:$ppid:$utime:$stime:$rss_pages" in
     *[!0-9:]*|*:) continue ;;
   esac

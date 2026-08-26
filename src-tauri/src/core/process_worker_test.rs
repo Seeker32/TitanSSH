@@ -168,6 +168,9 @@ mod tests {
         assert!(script.contains("$proc/stat"));
         assert!(script.contains("PAGE_SIZE=$(getconf PAGESIZE"));
         assert!(script.contains("rss_bytes=$((rss_pages * PAGE_SIZE))"));
+        assert!(script.contains("utime=${12}"));
+        assert!(script.contains("stime=${13}"));
+        assert!(script.contains("rss_pages=${22}"));
 
         let mut shell = Command::new("sh")
             .arg("-n")

@@ -737,6 +737,7 @@ fn map_sftp_path_error(path: &str, error: ssh2::Error) -> AppError {
 }
 
 /// 解析目标主机的所有可连接地址，使用默认 SSH 建连预算。
+#[cfg(test)]
 fn resolve_socket_addrs(host: &HostConfig) -> Result<Vec<SocketAddr>, AppError> {
     resolve_socket_addrs_until(host, Instant::now() + SSH_CONNECT_TIMEOUT)
 }
@@ -835,6 +836,7 @@ fn dns_timeout_error(address: &str) -> AppError {
 }
 
 /// 使用固定总预算逐个尝试 TCP 建连。
+#[cfg(test)]
 fn connect_tcp_stream(
     socket_addrs: &[SocketAddr],
     timeout: Duration,
