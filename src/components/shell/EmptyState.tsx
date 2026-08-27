@@ -1,3 +1,4 @@
+import { Button, Empty } from 'antd';
 import { Terminal } from 'lucide-react';
 import { translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
@@ -10,11 +11,12 @@ interface Props {
 export default function EmptyState({ onCreateHost }: Props) {
   const locale = useLocaleStore((state) => state.locale);
   return (
-    <div className="empty-state">
-      <Terminal size={40} className="empty-state-icon" />
-      <p className="empty-state-title">{translate(locale, 'empty.title')}</p>
-      <p className="empty-state-hint">{translate(locale, 'empty.hint')}</p>
-      <button type="button" className="sidebar-create-btn" onClick={onCreateHost}>{translate(locale, 'host.create')}</button>
-    </div>
+    <Empty className="empty-state" image={<Terminal size={40} className="empty-state-icon" />}
+      description={<>
+        <p className="empty-state-title">{translate(locale, 'empty.title')}</p>
+        <p className="empty-state-hint">{translate(locale, 'empty.hint')}</p>
+      </>}>
+      <Button type="primary" className="sidebar-create-btn" onClick={onCreateHost}>{translate(locale, 'host.create')}</Button>
+    </Empty>
   );
 }

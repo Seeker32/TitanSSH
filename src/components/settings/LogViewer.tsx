@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { Alert, Button, Empty } from 'antd';
 import { formatAppError, translate, type TranslationKey } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { useLogsStore } from '@/stores/logs';
@@ -40,25 +41,29 @@ export default function LogViewer() {
   return (
     <div className="log-viewer" data-testid="log-viewer">
       <div className="log-viewer__toolbar">
-        <button type="button" data-testid="log-refresh-btn" onClick={() => void useLogsStore.getState().load()}>
+        <Button size="small" data-testid="log-refresh-btn" onClick={() => void useLogsStore.getState().load()}>
           {t('settings.logRefresh')}
-        </button>
-        <button type="button" data-testid="log-export-btn" onClick={() => void handleExport()}>
+        </Button>
+        <Button size="small" data-testid="log-export-btn" onClick={() => void handleExport()}>
           {t('settings.logExport')}
-        </button>
+        </Button>
       </div>
       {loadError && (
-        <p className="log-viewer__error" data-testid="log-viewer-load-error" role="alert">
-          {t('settings.logLoadFailed')}: {formatAppError(locale, loadError)}
-        </p>
+        <div data-testid="log-viewer-load-error">
+          <Alert className="log-viewer__error" type="error" showIcon
+            title={`${t('settings.logLoadFailed')}: ${formatAppError(locale, loadError)}`} />
+        </div>
       )}
       {exportError && (
-        <p className="log-viewer__error" data-testid="log-viewer-export-error" role="alert">
-          {t('settings.logExportFailed')}: {formatAppError(locale, exportError)}
-        </p>
+        <div data-testid="log-viewer-export-error">
+          <Alert className="log-viewer__error" type="error" showIcon
+            title={`${t('settings.logExportFailed')}: ${formatAppError(locale, exportError)}`} />
+        </div>
       )}
       {lines.length === 0 && !loadError ? (
-        <p className="log-viewer__empty" data-testid="log-viewer-empty">{t('settings.logEmpty')}</p>
+        <div className="log-viewer__empty" data-testid="log-viewer-empty">
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('settings.logEmpty')} />
+        </div>
       ) : (
         <pre className="log-viewer__lines" data-testid="log-viewer-lines">{lines.join('\n')}</pre>
       )}
