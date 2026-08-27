@@ -1,11 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::commands::monitor::{get_monitor_status, stop_monitoring};
-    use crate::core::host_identity::HostIdentityService;
     use crate::core::monitor_service::MonitorService;
-    use crate::core::process_service::ProcessService;
     use crate::core::session_manager::SessionManager;
-    use crate::core::sftp_service::SftpService;
     use crate::errors::app_error::AppErrorInfo;
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::monitor::{MonitorSnapshot, NetworkSnapshot, TaskStatus};
@@ -31,18 +28,10 @@ mod tests {
 
     /// 构造已注册监控命令的 mock 应用；MonitorService 与 SessionManager
     /// 共享同一监控服务实例，返回句柄用于构建 webview。
-    fn test_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<MonitorService>) {
-        let exec_registry = crate::core::shared_exec_registry::SharedExecRegistry::new();
-        let service = MonitorService::new(exec_registry.clone());
-        let session_manager = SessionManager::new(
-            service.clone(),
-            ProcessService::new(exec_registry.clone()),
-            SftpService::new(),
-            HostIdentityService::new(),
-            exec_registry,
-        );
+    fn test_app() -> (tauri::App<tauri::test::MockRuntime>, MonitorService) {
+        let session_manager = SessionManager::new();
+        let service = session_manager.monitoring();
         let app = mock_builder()
-            .manage(service.clone())
             .manage(session_manager)
             .invoke_handler(tauri::generate_handler![
                 stop_monitoring,
@@ -50,7 +39,7 @@ mod tests {
             ])
             .build(mock_context(noop_assets()))
             .unwrap();
-        (app, Arc::new(service))
+        (app, service)
     }
 
     /// 构造不含明文凭据的测试主机。

@@ -1,8 +1,8 @@
 use crate::commands::run_blocking_op;
-use crate::core::sftp_service::SftpService;
+use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::AppErrorInfo;
 use crate::models::sftp::{ConflictStrategy, RemoteEntry, TransferTask};
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Runtime, State};
 
 /// 列举远程目录内容，按目录优先、名称排序
 ///
@@ -13,12 +13,12 @@ use tauri::{AppHandle, Manager, Runtime, State};
 /// - `session_id`: 关联的 SSH 会话 ID
 /// - `path`: 远程目录绝对路径
 #[tauri::command]
-pub async fn sftp_list_dir<R: Runtime>(
+pub async fn sftp_list_dir(
     session_id: String,
     path: String,
-    app: AppHandle<R>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<Vec<RemoteEntry>, AppErrorInfo> {
-    let service = app.state::<SftpService>().inner().clone();
+    let service = session_manager.file_transfer();
     run_blocking_op(move || service.list_dir(&session_id, &path)).await
 }
 
@@ -38,8 +38,9 @@ pub async fn sftp_download<R: Runtime>(
     remote_path: String,
     local_path: String,
     conflict_strategy: Option<ConflictStrategy>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<TransferTask, AppErrorInfo> {
-    let service = app.state::<SftpService>().inner().clone();
+    let service = session_manager.file_transfer();
     run_blocking_op(move || {
         service.enqueue_download(
             session_id,
@@ -69,8 +70,9 @@ pub async fn sftp_upload<R: Runtime>(
     local_path: String,
     remote_path: String,
     conflict_strategy: Option<ConflictStrategy>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<TransferTask, AppErrorInfo> {
-    let service = app.state::<SftpService>().inner().clone();
+    let service = session_manager.file_transfer();
     run_blocking_op(move || {
         service.enqueue_upload(
             session_id,
@@ -90,9 +92,10 @@ pub async fn sftp_upload<R: Runtime>(
 #[tauri::command]
 pub fn sftp_cancel_task(
     task_id: String,
-    sftp_service: State<'_, SftpService>,
+    session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
-    sftp_service
+    session_manager
+        .file_transfer()
         .cancel_task(&task_id)
         .map_err(AppErrorInfo::from)
 }
@@ -104,9 +107,9 @@ pub fn sftp_cancel_task(
 #[tauri::command]
 pub fn sftp_task_snapshot(
     session_id: String,
-    sftp_service: State<'_, SftpService>,
+    session_manager: State<'_, SessionManager>,
 ) -> Vec<TransferTask> {
-    sftp_service.task_snapshot(&session_id)
+    session_manager.file_transfer().task_snapshot(&session_id)
 }
 
 /// 清除指定 Session 的全部终态任务记录；Pending/Running 活动任务不受影响
@@ -116,8 +119,10 @@ pub fn sftp_task_snapshot(
 /// # 参数
 /// - `session_id`: 关联的 SSH 会话 ID
 #[tauri::command]
-pub fn sftp_clear_terminal_tasks(session_id: String, sftp_service: State<'_, SftpService>) {
-    sftp_service.clear_terminal_tasks(&session_id);
+pub fn sftp_clear_terminal_tasks(session_id: String, session_manager: State<'_, SessionManager>) {
+    session_manager
+        .file_transfer()
+        .clear_terminal_tasks(&session_id);
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
 use crate::commands::run_blocking_op;
-use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use crate::models::monitor::{MonitorSnapshot, TaskInfo};
@@ -20,7 +19,6 @@ pub async fn start_monitoring<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
     session_manager: State<'_, SessionManager>,
-    monitor_service: State<'_, MonitorService>,
 ) -> Result<TaskInfo, AppErrorInfo> {
     let host = session_manager
         .host_config(&session_id)
@@ -28,7 +26,7 @@ pub async fn start_monitoring<R: Runtime>(
     let verifier = session_manager
         .host_key_verifier(&app, &session_id)
         .map_err(AppErrorInfo::from)?;
-    let service = monitor_service.inner().clone();
+    let service = session_manager.monitoring();
     run_blocking_op(move || service.start_monitoring(session_id, host, verifier, app)).await
 }
 
@@ -47,7 +45,7 @@ pub async fn stop_monitoring<R: Runtime>(
     app: AppHandle<R>,
     task_id: String,
 ) -> Result<(), AppErrorInfo> {
-    let service = app.state::<MonitorService>().inner().clone();
+    let service = app.state::<SessionManager>().monitoring();
     run_blocking_op(move || {
         if service.stop_monitoring(&app, &task_id) {
             Ok(())
@@ -72,12 +70,10 @@ pub async fn get_monitor_status<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
 ) -> Result<MonitorSnapshot, AppErrorInfo> {
-    let monitor_service = app.state::<MonitorService>().inner().clone();
-    let app_for_status = app.clone();
+    let session_manager = app.state::<SessionManager>().inner().clone();
+    let monitor_service = session_manager.monitoring();
     run_blocking_op(move || {
-        app_for_status
-            .state::<SessionManager>()
-            .host_config(&session_id)?;
+        session_manager.host_config(&session_id)?;
         monitor_service
             .get_monitor_status(&session_id)
             .ok_or_else(|| AppError::MonitorSnapshotUnavailable(session_id.into()))

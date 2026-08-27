@@ -32,14 +32,16 @@ pub struct SessionHandle {
     pub host: HostConfig,
 }
 
-/// 会话管理器（纯协调层）
-///
-/// 只负责真实会话的注册、索引与生命周期协调，
-/// 不直接承担终端 IO 或监控采集逻辑。
-/// 监控能力统一由 monitor_service 提供，不存在双轨实现。
+/// Runtime Session 的唯一所有权根，固定装配并持有全部 capability adapter。
+#[derive(Clone)]
 pub struct SessionManager {
+    inner: Arc<RuntimeSessionState>,
+}
+
+/// Runtime Session 运行时状态；由 SessionManager 以 Arc 共享给各个廉价 clone。
+struct RuntimeSessionState {
     /// 存储所有活跃会话的 HashMap，键为 session_id
-    sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
+    sessions: Mutex<HashMap<String, SessionHandle>>,
     /// 独立监控服务，负责管理所有监控任务的生命周期（单一实现）
     monitor_service: MonitorService,
     /// 独立进程采样服务，负责管理进程任务与快照。
@@ -53,25 +55,32 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    /// 使用共享 Monitoring、File Transfer、共享采样连接与主机身份确认状态创建会话管理器实例
-    ///
-    /// # 参数
-    /// - `monitor_service` / `process_service`: 必须与本实例的 `exec_registry`
-    ///   共享同一注册表，否则采样任务解析的连接无法被 teardown 回收
-    pub fn new(
-        monitor_service: MonitorService,
-        process_service: ProcessService,
+    /// 创建完整且 alias 正确的 Runtime Session ownership module。
+    pub fn new() -> Self {
+        Self::assemble(SftpService::new(), HostIdentityService::new())
+    }
+
+    /// 测试构造：只替换 File Transfer 与主机身份 adapter，采样 adapter 和 registry 仍由本模块装配。
+    #[cfg(test)]
+    pub(crate) fn with_adapters(
         sftp_service: SftpService,
         identity_service: HostIdentityService,
-        exec_registry: SharedExecRegistry,
     ) -> Self {
+        Self::assemble(sftp_service, identity_service)
+    }
+
+    /// 私有唯一装配点：Monitoring、process sampling 与 teardown 共享同一 registry。
+    fn assemble(sftp_service: SftpService, identity_service: HostIdentityService) -> Self {
+        let exec_registry = SharedExecRegistry::new();
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            monitor_service,
-            process_service,
-            sftp_service,
-            exec_registry,
-            identity_service,
+            inner: Arc::new(RuntimeSessionState {
+                sessions: Mutex::new(HashMap::new()),
+                monitor_service: MonitorService::new(exec_registry.clone()),
+                process_service: ProcessService::new(exec_registry.clone()),
+                sftp_service,
+                exec_registry,
+                identity_service,
+            }),
         }
     }
 
@@ -117,7 +126,8 @@ impl SessionManager {
         let host_for_handle = host.clone();
 
         // 注册会话句柄到 HashMap
-        self.sessions
+        self.inner
+            .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
@@ -133,23 +143,19 @@ impl SessionManager {
 
         // 为该 Runtime Session 构建统一主机身份校验器：Terminal、SFTP、Monitoring 共用
         let verifier = self
+            .inner
             .identity_service
             .verifier(app.clone(), session_id.clone());
 
         // 与 Terminal 并行启动独立 SFTP 连接；registry 在返回前已可等待连接结果。
-        self.sftp_service.register_session_with_verifier(
+        self.inner.sftp_service.register_session_with_verifier(
             session_id.clone(),
             host.clone(),
             verifier.clone(),
         );
 
         // 启动 terminal_service 工作线程（独立 SSH 连接、PTY、终端 IO）
-        let sessions_for_cleanup = Arc::clone(&self.sessions);
-        let monitor_service_for_cleanup = self.monitor_service.clone();
-        let process_service_for_cleanup = self.process_service.clone();
-        let sftp_service_for_cleanup = self.sftp_service.clone();
-        let exec_registry_for_cleanup = self.exec_registry.clone();
-        let identity_service_for_cleanup = self.identity_service.clone();
+        let owner = self.clone();
         let app_for_cleanup = app.clone();
         let session_id_for_cleanup = session_id.clone();
         terminal_service::start_terminal_session(
@@ -161,16 +167,7 @@ impl SessionManager {
             runtime_status,
             verifier,
             Box::new(move || {
-                cleanup_registered_session(
-                    &sessions_for_cleanup,
-                    &monitor_service_for_cleanup,
-                    &process_service_for_cleanup,
-                    &sftp_service_for_cleanup,
-                    &exec_registry_for_cleanup,
-                    &identity_service_for_cleanup,
-                    &session_id_for_cleanup,
-                    &app_for_cleanup,
-                );
+                owner.cleanup_registered_session(&session_id_for_cleanup, &app_for_cleanup);
             }),
         );
 
@@ -182,6 +179,7 @@ impl SessionManager {
     /// 将写入命令路由到对应会话的 terminal_service 工作线程。
     pub fn write_terminal(&self, session_id: &str, data: String) -> Result<(), AppError> {
         let command_tx = self
+            .inner
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -199,6 +197,7 @@ impl SessionManager {
     /// 将 Resize 命令路由到对应会话的 terminal_service 工作线程。
     pub fn resize_terminal(&self, session_id: &str, cols: u32, rows: u32) -> Result<(), AppError> {
         let command_tx = self
+            .inner
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -224,16 +223,7 @@ impl SessionManager {
         session_id: &str,
         app: &AppHandle<R>,
     ) -> Result<(), AppError> {
-        if cleanup_registered_session(
-            &self.sessions,
-            &self.monitor_service,
-            &self.process_service,
-            &self.sftp_service,
-            &self.exec_registry,
-            &self.identity_service,
-            session_id,
-            app,
-        ) {
+        if self.cleanup_registered_session(session_id, app) {
             Ok(())
         } else {
             Err(AppError::SessionNotFound(session_id.to_string().into()))
@@ -245,6 +235,7 @@ impl SessionManager {
     /// ExitRequested 与 Exit 可重复调用；各 service teardown 均按 registry miss 幂等处理。
     pub fn shutdown_all<R: Runtime>(&self, app: &AppHandle<R>) {
         let session_ids: Vec<String> = self
+            .inner
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -252,30 +243,22 @@ impl SessionManager {
             .cloned()
             .collect();
         for session_id in session_ids {
-            cleanup_registered_session(
-                &self.sessions,
-                &self.monitor_service,
-                &self.process_service,
-                &self.sftp_service,
-                &self.exec_registry,
-                &self.identity_service,
-                &session_id,
-                app,
-            );
+            self.cleanup_registered_session(&session_id, app);
         }
-        self.monitor_service.stop_all(app);
-        self.process_service.stop_all(app);
-        self.sftp_service.cleanup_all(app);
-        self.identity_service.cancel_all(app);
+        self.inner.monitor_service.stop_all(app);
+        self.inner.process_service.stop_all(app);
+        self.inner.sftp_service.cleanup_all(app);
+        self.inner.identity_service.cancel_all(app);
         // 兜底清空共享采样连接注册表：逐会话回收后才插入的迟来条目也不得泄漏
-        self.exec_registry.clear();
+        self.inner.exec_registry.clear();
     }
 
     /// 获取所有活跃会话的列表
     ///
     /// 返回内部 HashMap 中所有会话的 SessionInfo 副本，状态直接读取后端运行时事实。
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
-        self.sessions
+        self.inner
+            .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
@@ -300,18 +283,35 @@ impl SessionManager {
         // 校验会话存在，避免为已关闭会话发放校验器
         self.host_config(session_id)?;
         Ok(self
+            .inner
             .identity_service
             .verifier(app.clone(), session_id.to_string()))
     }
 
-    /// 主机身份确认服务句柄，供命令层接受/拒绝决定使用。
-    pub fn identity_service(&self) -> &HostIdentityService {
-        &self.identity_service
+    /// 返回主机身份确认 adapter 的廉价 clone handle。
+    pub(crate) fn host_identity(&self) -> HostIdentityService {
+        self.inner.identity_service.clone()
+    }
+
+    /// 返回 Monitoring adapter 的廉价 clone handle。
+    pub(crate) fn monitoring(&self) -> MonitorService {
+        self.inner.monitor_service.clone()
+    }
+
+    /// 返回 process sampling adapter 的廉价 clone handle。
+    pub(crate) fn processes(&self) -> ProcessService {
+        self.inner.process_service.clone()
+    }
+
+    /// 返回 File Transfer adapter 的廉价 clone handle。
+    pub(crate) fn file_transfer(&self) -> SftpService {
+        self.inner.sftp_service.clone()
     }
 
     /// 返回指定 Session 的主机配置副本，供所属 module 在锁外启动工作。
     pub fn host_config(&self, session_id: &str) -> Result<HostConfig, AppError> {
-        self.sessions
+        self.inner
+            .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
@@ -324,7 +324,7 @@ impl SessionManager {
     #[cfg(test)]
     pub(crate) fn insert_session_for_test(&self, session_id: &str, host: HostConfig) {
         let (command_tx, _command_rx) = mpsc::channel();
-        self.sessions.lock().unwrap().insert(
+        self.inner.sessions.lock().unwrap().insert(
             session_id.to_string(),
             SessionHandle {
                 meta: SessionInfo {
@@ -345,49 +345,40 @@ impl SessionManager {
     }
 }
 
-/// 回收已注册会话及其所属的所有后台资源。
-///
-/// 显式关闭和终端工作线程退出共享这一路径；若另一方已先完成回收，返回 false，
-/// 以保证并发 teardown 幂等且不会重复推送取消事件。
-#[allow(clippy::too_many_arguments)]
-fn cleanup_registered_session<R: Runtime>(
-    sessions: &Arc<Mutex<HashMap<String, SessionHandle>>>,
-    monitor_service: &MonitorService,
-    process_service: &ProcessService,
-    sftp_service: &SftpService,
-    exec_registry: &SharedExecRegistry,
-    identity_service: &HostIdentityService,
-    session_id: &str,
-    app: &AppHandle<R>,
-) -> bool {
-    let Some(handle) = sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(session_id)
-    else {
-        return false;
-    };
+impl SessionManager {
+    /// 回收已注册会话及其所属的所有后台资源；移除索引是唯一 teardown 线性化点。
+    fn cleanup_registered_session<R: Runtime>(&self, session_id: &str, app: &AppHandle<R>) -> bool {
+        let Some(handle) = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id)
+        else {
+            return false;
+        };
 
-    // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
-    identity_service.cancel_session(app, session_id);
-    // 通知所有工作线程退出
-    handle.shutdown.store(true, Ordering::Relaxed);
-    // 发送关闭命令到终端工作线程；接收端已退出时仍继续其余回收，但记录可观测诊断。
-    if let Err(error) = handle.command_tx.send(TerminalCommand::Close) {
-        warn!(
-            "[session:{}][diagnostic] Failed to deliver terminal close command: {}",
-            session_id, error
-        );
+        // 取消该 Session 的主机身份等待者并清除临时信任，等待中的连接不得进入认证
+        self.inner.identity_service.cancel_session(app, session_id);
+        // 通知所有工作线程退出
+        handle.shutdown.store(true, Ordering::Relaxed);
+        // 发送关闭命令到终端工作线程；接收端已退出时仍继续其余回收，但记录可观测诊断。
+        if let Err(error) = handle.command_tx.send(TerminalCommand::Close) {
+            warn!(
+                "[session:{}][diagnostic] Failed to deliver terminal close command: {}",
+                session_id, error
+            );
+        }
+        // 停止该会话的全部监控任务（每个任务补发 Done 终态事件）
+        self.inner.monitor_service.stop_session(app, session_id);
+        // 停止该会话的全部进程采样任务并清除缓存。
+        self.inner.process_service.stop_session(app, session_id);
+        // 回收该会话的共享采样连接；在途 capability 释放时底层连接才真正关闭
+        self.inner.exec_registry.remove(session_id);
+        // 关闭 SFTP capability 并请求取消；worker 随后发布唯一的真实终态
+        self.inner.sftp_service.cleanup_session(session_id, app);
+        true
     }
-    // 停止该会话的全部监控任务（每个任务补发 Done 终态事件）
-    monitor_service.stop_session(app, session_id);
-    // 停止该会话的全部进程采样任务并清除缓存。
-    process_service.stop_session(app, session_id);
-    // 回收该会话的共享采样连接；在途 capability 释放时底层连接才真正关闭
-    exec_registry.remove(session_id);
-    // 关闭 SFTP capability 并请求取消；worker 随后发布唯一的真实终态
-    sftp_service.cleanup_session(session_id, app);
-    true
 }
 
 #[cfg(test)]

@@ -3,12 +3,8 @@ mod tests {
     use crate::commands::process::{
         get_process_status, start_process_monitoring, stop_process_monitoring,
     };
-    use crate::core::host_identity::HostIdentityService;
-    use crate::core::monitor_service::MonitorService;
     use crate::core::process_service::ProcessService;
     use crate::core::session_manager::SessionManager;
-    use crate::core::sftp_service::SftpService;
-    use crate::core::shared_exec_registry::SharedExecRegistry;
     use crate::errors::app_error::AppErrorInfo;
     use crate::models::host::{AuthType, HostConfig};
     use crate::models::process::{ProcessInfo, ProcessSnapshot};
@@ -46,17 +42,9 @@ mod tests {
     }
 
     fn test_app() -> (tauri::App<tauri::test::MockRuntime>, ProcessService) {
-        let registry = SharedExecRegistry::new();
-        let process_service = ProcessService::new(registry.clone());
-        let manager = SessionManager::new(
-            MonitorService::new(registry.clone()),
-            process_service.clone(),
-            SftpService::new(),
-            HostIdentityService::new(),
-            registry,
-        );
+        let manager = SessionManager::new();
+        let process_service = manager.processes();
         let app = mock_builder()
-            .manage(process_service.clone())
             .manage(manager)
             .invoke_handler(tauri::generate_handler![
                 start_process_monitoring,

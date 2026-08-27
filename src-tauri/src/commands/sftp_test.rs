@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::commands::sftp::{sftp_download, sftp_list_dir, sftp_upload};
+    use crate::core::host_identity::HostIdentityService;
+    use crate::core::session_manager::SessionManager;
     use crate::core::sftp_service::SftpService;
     use crate::core::ssh_transport::test_support::memory_sftp;
     use crate::models::host::{AuthType, HostConfig};
@@ -84,7 +86,10 @@ mod tests {
         service.register_session("session-1".to_string(), make_host());
 
         let app = mock_builder()
-            .manage(managed)
+            .manage(SessionManager::with_adapters(
+                managed,
+                HostIdentityService::new(),
+            ))
             .invoke_handler(tauri::generate_handler![sftp_list_dir])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -128,7 +133,10 @@ mod tests {
         service.register_session("session-1".to_string(), make_host());
 
         let app = mock_builder()
-            .manage(managed)
+            .manage(SessionManager::with_adapters(
+                managed,
+                HostIdentityService::new(),
+            ))
             .invoke_handler(tauri::generate_handler![sftp_download])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -178,7 +186,10 @@ mod tests {
         service.register_session("session-1".to_string(), make_host());
 
         let app = mock_builder()
-            .manage(managed)
+            .manage(SessionManager::with_adapters(
+                managed,
+                HostIdentityService::new(),
+            ))
             .invoke_handler(tauri::generate_handler![sftp_download])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -231,7 +242,10 @@ mod tests {
         service.register_session("session-1".to_string(), make_host());
 
         let app = mock_builder()
-            .manage(managed)
+            .manage(SessionManager::with_adapters(
+                managed,
+                HostIdentityService::new(),
+            ))
             .invoke_handler(tauri::generate_handler![sftp_upload])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -290,7 +304,10 @@ mod tests {
         service.register_session("session-1".to_string(), make_host());
 
         let app = mock_builder()
-            .manage(managed)
+            .manage(SessionManager::with_adapters(
+                managed,
+                HostIdentityService::new(),
+            ))
             .invoke_handler(tauri::generate_handler![sftp_upload])
             .build(mock_context(noop_assets()))
             .unwrap();

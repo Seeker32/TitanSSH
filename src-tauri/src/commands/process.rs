@@ -1,5 +1,4 @@
 use crate::commands::run_blocking_op;
-use crate::core::process_service::ProcessService;
 use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, AppErrorInfo};
 use crate::models::monitor::TaskInfo;
@@ -12,7 +11,6 @@ pub async fn start_process_monitoring<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
     session_manager: State<'_, SessionManager>,
-    process_service: State<'_, ProcessService>,
 ) -> Result<TaskInfo, AppErrorInfo> {
     let host = session_manager
         .host_config(&session_id)
@@ -20,7 +18,7 @@ pub async fn start_process_monitoring<R: Runtime>(
     let verifier = session_manager
         .host_key_verifier(&app, &session_id)
         .map_err(AppErrorInfo::from)?;
-    let service = process_service.inner().clone();
+    let service = session_manager.processes();
     run_blocking_op(move || service.start_process_monitoring(session_id, host, verifier, app)).await
 }
 
@@ -29,9 +27,8 @@ pub async fn start_process_monitoring<R: Runtime>(
 pub async fn stop_process_monitoring<R: Runtime>(
     app: AppHandle<R>,
     task_id: String,
-    process_service: State<'_, ProcessService>,
 ) -> Result<(), AppErrorInfo> {
-    let service = process_service.inner().clone();
+    let service = app.state::<SessionManager>().processes();
     run_blocking_op(move || {
         if service.stop_process_monitoring(&app, &task_id) {
             Ok(())
@@ -47,11 +44,11 @@ pub async fn stop_process_monitoring<R: Runtime>(
 pub async fn get_process_status<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
-    process_service: State<'_, ProcessService>,
 ) -> Result<ProcessSnapshot, AppErrorInfo> {
-    let service = process_service.inner().clone();
+    let session_manager = app.state::<SessionManager>().inner().clone();
+    let service = session_manager.processes();
     run_blocking_op(move || {
-        app.state::<SessionManager>().host_config(&session_id)?;
+        session_manager.host_config(&session_id)?;
         service
             .get_process_status(&session_id)
             .ok_or_else(|| AppError::ProcessSnapshotUnavailable(session_id.into()))
