@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Alert, Button, Card, Spin } from 'antd';
 import type { HostIdentityChallenge } from '@/types/session';
 import { formatAppError, translate, type AppErrorInfo, type TranslationKey } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
@@ -44,8 +45,8 @@ export default function HostIdentityCard({ challenge, phaseLabel, saveError, onA
   return (
     <div className="terminal-overlay terminal-overlay--identity" data-testid="host-identity-card"
       role="alertdialog" aria-label={t(changed ? 'hostIdentity.changedTitle' : 'hostIdentity.title')}>
-      <div className={`host-identity-card${changed ? ' host-identity-card--changed' : ''}`}>
-        {phaseLabel && <p className="host-identity-card__phase">{phaseLabel}</p>}
+        <Card className={`host-identity-card${changed ? ' host-identity-card--changed' : ''}`} variant="borderless">
+        {phaseLabel && <div className="host-identity-card__phase"><Spin size="small" />{phaseLabel}</div>}
         <p className="host-identity-card__title">{t(changed ? 'hostIdentity.changedTitle' : 'hostIdentity.title')}</p>
         <p className="host-identity-card__hint">{t(changed ? 'hostIdentity.changedHint' : 'hostIdentity.hint')}</p>
         <dl className="host-identity-card__meta">
@@ -90,9 +91,10 @@ export default function HostIdentityCard({ challenge, phaseLabel, saveError, onA
           )}
         </dl>
         {saveError && (
-          <div className="host-identity-card__save-error" data-testid="host-identity-save-error" role="alert">
-            <p>{t(changed ? 'hostIdentity.replaceFailed' : 'hostIdentity.saveFailed')}</p>
-            <p className="host-identity-card__mono">{formatAppError(locale, saveError)}</p>
+          <div data-testid="host-identity-save-error">
+            <Alert className="host-identity-card__save-error" type="error" showIcon
+              title={t(changed ? 'hostIdentity.replaceFailed' : 'hostIdentity.saveFailed')}
+              description={<span className="host-identity-card__mono">{formatAppError(locale, saveError)}</span>} />
           </div>
         )}
         <div className="host-identity-card__actions">
@@ -102,32 +104,32 @@ export default function HostIdentityCard({ challenge, phaseLabel, saveError, onA
                 <p className="host-identity-card__confirm-title">{t('hostIdentity.replaceConfirmTitle')}</p>
                 <p className="host-identity-card__confirm-hint">{t('hostIdentity.replaceConfirmHint')}</p>
               </div>
-              <button type="button" className="host-identity-card__replace-confirm" data-testid="host-identity-replace-confirm-btn"
-                onClick={onAcceptAndSave}>{t('hostIdentity.confirmReplace')}</button>
-              <button type="button" className="host-identity-card__cancel" data-testid="host-identity-replace-cancel"
-                onClick={() => setConfirmState((state) => ({ ...state, confirming: false }))}>{t('hostIdentity.cancel')}</button>
+              <Button type="primary" danger className="host-identity-card__replace-confirm" data-testid="host-identity-replace-confirm-btn"
+                aria-label={t('hostIdentity.confirmReplace')} onClick={onAcceptAndSave}>{t('hostIdentity.confirmReplace')}</Button>
+              <Button className="host-identity-card__cancel" data-testid="host-identity-replace-cancel" aria-label={t('hostIdentity.cancel')}
+                onClick={() => setConfirmState((state) => ({ ...state, confirming: false }))}>{t('hostIdentity.cancel')}</Button>
             </>
           ) : changed ? (
             <>
-              <button type="button" className="host-identity-card__accept" data-testid="host-identity-accept"
-                onClick={onAccept}>{t('hostIdentity.accept')}</button>
-              <button type="button" className="host-identity-card__save" data-testid="host-identity-replace"
-                onClick={() => setConfirmState((state) => ({ ...state, confirming: true }))}>{t('hostIdentity.replaceRecord')}</button>
-              <button type="button" className="host-identity-card__reject" data-testid="host-identity-reject"
-                onClick={onReject}>{t('hostIdentity.reject')}</button>
+              <Button type="primary" className="host-identity-card__accept" data-testid="host-identity-accept"
+                aria-label={t('hostIdentity.accept')} onClick={onAccept}>{t('hostIdentity.accept')}</Button>
+              <Button className="host-identity-card__save" data-testid="host-identity-replace"
+                aria-label={t('hostIdentity.replaceRecord')} onClick={() => setConfirmState((state) => ({ ...state, confirming: true }))}>{t('hostIdentity.replaceRecord')}</Button>
+              <Button className="host-identity-card__reject" data-testid="host-identity-reject" aria-label={t('hostIdentity.reject')}
+                onClick={onReject}>{t('hostIdentity.reject')}</Button>
             </>
           ) : (
             <>
-              <button type="button" className="host-identity-card__save" data-testid="host-identity-save"
-                onClick={onAcceptAndSave}>{t('hostIdentity.acceptAndSave')}</button>
-              <button type="button" className="host-identity-card__accept" data-testid="host-identity-accept"
-                onClick={onAccept}>{t('hostIdentity.accept')}</button>
-              <button type="button" className="host-identity-card__reject" data-testid="host-identity-reject"
-                onClick={onReject}>{t('hostIdentity.reject')}</button>
+              <Button type="primary" className="host-identity-card__save" data-testid="host-identity-save"
+                aria-label={t('hostIdentity.acceptAndSave')} onClick={onAcceptAndSave}>{t('hostIdentity.acceptAndSave')}</Button>
+              <Button className="host-identity-card__accept" data-testid="host-identity-accept"
+                aria-label={t('hostIdentity.accept')} onClick={onAccept}>{t('hostIdentity.accept')}</Button>
+              <Button className="host-identity-card__reject" data-testid="host-identity-reject" aria-label={t('hostIdentity.reject')}
+                onClick={onReject}>{t('hostIdentity.reject')}</Button>
             </>
           )}
         </div>
-      </div>
+        </Card>
     </div>
   );
 }

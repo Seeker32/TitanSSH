@@ -1,3 +1,4 @@
+import { Button, Card, Empty } from 'antd';
 import type { ProcessSortMode } from '@/stores/process';
 import { topProcesses } from '@/stores/process';
 import type { ProcessSnapshot } from '@/types/process';
@@ -43,26 +44,28 @@ export default function ProcessSummaryPanel({ snapshot, sortMode, onSortModeChan
   return (
     <section className="process-summary" data-testid="process-summary" aria-label={translate(locale, 'process.title')}
       onClick={onOpenProcess ? openFromPanel : undefined} onKeyDown={onOpenProcess ? openFromKeyboard : undefined} tabIndex={onOpenProcess ? 0 : undefined}>
-      <div className="process-summary-header">
-        <strong>{translate(locale, 'process.title')}</strong>
-        {onOpenProcess && <button type="button" className="process-summary-open" onClick={onOpenProcess}>{translate(locale, 'process.open')}</button>}
-        <div className="process-summary-sort" role="group" aria-label={translate(locale, 'process.sort')}>
-          <button type="button" aria-pressed={sortMode === 'cpu'} onClick={() => onSortModeChange('cpu')}>{translate(locale, 'process.cpu')}</button>
-          <button type="button" aria-pressed={sortMode === 'memory'} onClick={() => onSortModeChange('memory')}>{translate(locale, 'process.memory')}</button>
+      <Card size="small" variant="borderless">
+        <div className="process-summary-header">
+          <strong>{translate(locale, 'process.title')}</strong>
+          {onOpenProcess && <Button type="link" size="small" className="process-summary-open" onClick={onOpenProcess}>{translate(locale, 'process.open')}</Button>}
+          <div className="process-summary-sort" role="group" aria-label={translate(locale, 'process.sort')}>
+            <Button size="small" type={sortMode === 'cpu' ? 'primary' : 'default'} aria-label={translate(locale, 'process.cpu')} aria-pressed={sortMode === 'cpu'} onClick={() => onSortModeChange('cpu')}>{translate(locale, 'process.cpu')}</Button>
+            <Button size="small" type={sortMode === 'memory' ? 'primary' : 'default'} aria-label={translate(locale, 'process.memory')} aria-pressed={sortMode === 'memory'} onClick={() => onSortModeChange('memory')}>{translate(locale, 'process.memory')}</Button>
+          </div>
         </div>
-      </div>
-      {processes.length === 0 ? <span className="process-summary-empty">{translate(locale, 'process.empty')}</span> : (
-        <ol className="process-summary-list">
-          {processes.map((process) => (
-            <li key={process.pid}>
-              <span className="process-summary-command" title={process.commandLine}>{process.command}</span>
-              <span className="process-summary-pid">PID {process.pid}</span>
-              <span>{process.cpuPercent === null ? '--' : `${process.cpuPercent.toFixed(1)}%`}</span>
-              <span>{formatMemory(process.memoryBytes)}</span>
-            </li>
-          ))}
-        </ol>
-      )}
+        {processes.length === 0 ? <div className="process-summary-empty"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={translate(locale, 'process.empty')} /></div> : (
+          <ol className="process-summary-list">
+            {processes.map((process) => (
+              <li key={process.pid}>
+                <span className="process-summary-command" title={process.commandLine}>{process.command}</span>
+                <span className="process-summary-pid">PID {process.pid}</span>
+                <span>{process.cpuPercent === null ? '--' : `${process.cpuPercent.toFixed(1)}%`}</span>
+                <span>{formatMemory(process.memoryBytes)}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+      </Card>
     </section>
   );
 }
