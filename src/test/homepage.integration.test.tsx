@@ -6,6 +6,7 @@ import { emitMockEvent, listen, resetMockEvents } from '@tauri-apps/api/event';
 import HomePage from '@/pages/HomePage';
 import { useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
+import { longTaskProjection } from '@/stores/long-task';
 import { useLocaleStore } from '@/stores/locale';
 import { useMonitorStore } from '@/stores/monitor';
 import { useProcessStore } from '@/stores/process';
@@ -131,6 +132,8 @@ describe('HomePage integration', () => {
       [terminalTabId('session-1'), makeTerminalTab()],
       [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
     ]), activeTabId: terminalTabId('session-1') }));
+    longTaskProjection.activateSession('session-1');
+    longTaskProjection.activateSession('session-2');
     await act(async () => {
       emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
         available: true,
@@ -428,6 +431,7 @@ describe('HomePage integration', () => {
     const eventNames = mockListen.mock.calls.map(([eventName]) => eventName);
 
     expect(eventNames.filter((name) => name === 'session:status')).toHaveLength(1);
+    expect(eventNames.filter((name) => name === 'task:status')).toHaveLength(1);
     expect(eventNames.filter((name) => name === 'monitor:snapshot')).toHaveLength(1);
     expect(eventNames.filter((name) => name === 'terminal:data')).toHaveLength(0);
   });

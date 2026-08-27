@@ -78,7 +78,7 @@ where
             return;
         };
 
-        state.snapshots.insert(session_id, snapshot.clone());
+        state.snapshots.insert(session_id.clone(), snapshot.clone());
         if let Err(error) = self.app.emit(self.spec.snapshot_event, &snapshot) {
             let detail = error.to_string();
             if let Some(handle) = state.tasks.get_mut(&self.task_id) {
@@ -88,6 +88,8 @@ where
                     emit_task_status(
                         &self.app,
                         &self.task_id,
+                        self.spec.task_type,
+                        Some(&session_id),
                         TaskStatus::Failed,
                         status_error(
                             self.spec.error_code,
@@ -113,6 +115,8 @@ where
         emit_task_status(
             &self.app,
             &self.task_id,
+            self.spec.task_type,
+            handle.task_info.session_id.as_deref(),
             TaskStatus::Failed,
             status_error(self.spec.error_code, detail_key, detail_param),
         );
@@ -175,7 +179,14 @@ where
                 shutdown: shutdown.clone(),
             },
         );
-        emit_task_status(&app, &task_id, TaskStatus::Pending, None);
+        emit_task_status(
+            &app,
+            &task_id,
+            self.spec.task_type,
+            Some(&session_id),
+            TaskStatus::Pending,
+            None,
+        );
         drop(state);
 
         let runtime = self.clone();
@@ -241,25 +252,39 @@ where
             return false;
         }
         handle.task_info.status = status.clone();
-        emit_task_status(app, task_id, status, error);
+        emit_task_status(
+            app,
+            task_id,
+            self.spec.task_type,
+            handle.task_info.session_id.as_deref(),
+            status,
+            error,
+        );
         true
     }
 
     /// 原子移除任务并通知其 worker 停止；不存在时返回 false。
     pub(crate) fn stop<R: Runtime>(&self, app: &AppHandle<R>, task_id: &str) -> bool {
-        let should_emit = {
+        let handle = {
             let mut state = lock_unpoisoned(&self.state);
             let Some(handle) = state.tasks.remove(task_id) else {
                 return false;
             };
             handle.shutdown.store(true, Ordering::Release);
-            !matches!(
-                handle.task_info.status,
-                TaskStatus::Done | TaskStatus::Failed
-            )
+            handle
         };
-        if should_emit {
-            emit_task_status(app, task_id, TaskStatus::Done, None);
+        if !matches!(
+            handle.task_info.status,
+            TaskStatus::Done | TaskStatus::Failed
+        ) {
+            emit_task_status(
+                app,
+                task_id,
+                self.spec.task_type,
+                handle.task_info.session_id.as_deref(),
+                TaskStatus::Done,
+                None,
+            );
         }
         true
     }
@@ -279,15 +304,22 @@ where
                     handle.task_info.status,
                     TaskStatus::Done | TaskStatus::Failed
                 ) {
-                    terminal_ids.push(task_id.clone());
+                    terminal_ids.push((task_id.clone(), handle.task_info.session_id.clone()));
                 }
                 false
             });
             state.snapshots.remove(session_id);
             terminal_ids
         };
-        for task_id in terminal_ids {
-            emit_task_status(app, &task_id, TaskStatus::Done, None);
+        for (task_id, session_id) in terminal_ids {
+            emit_task_status(
+                app,
+                &task_id,
+                self.spec.task_type,
+                session_id.as_deref(),
+                TaskStatus::Done,
+                None,
+            );
         }
     }
 
@@ -302,14 +334,21 @@ where
                     handle.task_info.status,
                     TaskStatus::Done | TaskStatus::Failed
                 ) {
-                    terminal_ids.push(task_id);
+                    terminal_ids.push((task_id, handle.task_info.session_id.clone()));
                 }
             }
             state.snapshots.clear();
             terminal_ids
         };
-        for task_id in terminal_ids {
-            emit_task_status(app, &task_id, TaskStatus::Done, None);
+        for (task_id, session_id) in terminal_ids {
+            emit_task_status(
+                app,
+                &task_id,
+                self.spec.task_type,
+                session_id.as_deref(),
+                TaskStatus::Done,
+                None,
+            );
         }
     }
 
@@ -393,13 +432,20 @@ fn status_error(code: &str, key: &str, param: String) -> Option<AppErrorInfo> {
 fn emit_task_status<R: Runtime>(
     app: &AppHandle<R>,
     task_id: &str,
+    task_type: &str,
+    session_id: Option<&str>,
     status: TaskStatus,
     error: Option<AppErrorInfo>,
 ) {
+    let Some(session_id) = session_id else {
+        return;
+    };
     let _ = app.emit(
         "task:status",
         TaskStatusEvent {
             task_id: task_id.to_string(),
+            task_type: task_type.to_string(),
+            session_id: session_id.to_string(),
             status,
             error,
         },

@@ -4,7 +4,7 @@ mod tests {
     use crate::models::monitor::{
         MonitorSnapshot, NetworkInterface, NetworkSnapshot, TaskInfo, TaskStatus,
     };
-    use crate::models::session::{SessionInfo, SessionStatus, TerminalDataEvent};
+    use crate::models::session::{SessionInfo, SessionStatus, TaskStatusEvent, TerminalDataEvent};
     use crate::models::sftp::{SftpProgressEvent, SftpTaskStatus, TransferTask, TransferType};
     use serde_json::json;
 
@@ -111,6 +111,25 @@ mod tests {
         let interface = &monitor["network"]["interfaces"][0];
         assert_eq!(interface["receiveBytesPerSecond"], 4);
         assert!(interface.get("receive_bytes_per_second").is_none());
+    }
+
+    /// 任务状态事件必须携带采样类型与 Runtime Session 归属。
+    #[test]
+    fn task_status_event_includes_sampling_scope() {
+        let value = serde_json::to_value(TaskStatusEvent {
+            task_id: "task-1".into(),
+            task_type: "monitor".into(),
+            session_id: "session-1".into(),
+            status: TaskStatus::Running,
+            error: None,
+        })
+        .unwrap();
+
+        assert_eq!(value["taskId"], "task-1");
+        assert_eq!(value["taskType"], "monitor");
+        assert_eq!(value["sessionId"], "session-1");
+        assert_eq!(value["status"], "Running");
+        assert!(value.get("task_type").is_none());
     }
 
     /// 验证升级后仍可读取旧版本写入的 snake_case 主机配置。

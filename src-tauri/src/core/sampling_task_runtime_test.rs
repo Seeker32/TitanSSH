@@ -46,6 +46,12 @@ fn statuses(app: &tauri::AppHandle<tauri::test::MockRuntime>) -> Arc<Mutex<Vec<T
     let captured = statuses.clone();
     app.listen("task:status", move |event| {
         let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+        assert_eq!(payload["taskType"], "test");
+        assert!(
+            payload["sessionId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
         captured
             .lock()
             .unwrap()

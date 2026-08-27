@@ -53,10 +53,13 @@ export enum TaskStatus {
   Failed = 'Failed',
 }
 
+/** 前端共享投影支持的采样任务类型。 */
+export type SamplingTaskType = 'monitor' | 'process';
+
 /** 长任务信息，所有持续任务必须具备 taskId 与状态 */
 export interface TaskInfo {
   taskId: string;
-  taskType: string;
+  taskType: SamplingTaskType;
   sessionId?: string;
   status: TaskStatus;
   /** Unix 毫秒时间戳 */
@@ -68,6 +71,8 @@ export interface TaskInfo {
 /** 长任务状态变更事件 payload */
 export interface TaskStatusEvent {
   taskId: string;
+  taskType: SamplingTaskType;
+  sessionId: string;
   status: TaskStatus;
   error?: AppErrorInfo | null;
 }

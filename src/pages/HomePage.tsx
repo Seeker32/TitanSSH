@@ -15,6 +15,7 @@ import LogViewer from '@/components/settings/LogViewer';
 import ProcessTabPane from '@/components/process/ProcessTabPane';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
+import { longTaskProjection, useLongTask } from '@/stores/long-task';
 import { useMonitorStore } from '@/stores/monitor';
 import { useProcessStore } from '@/stores/process';
 import { useSessionStore } from '@/stores/session';
@@ -56,8 +57,8 @@ export default function HomePage() {
   const trendSamples = useMonitorStore((state) => activeSessionId === null ? undefined : state.networkTrends.get(activeSessionId));
   const snapshot = activeSessionId === null ? null : monitorSnapshots.get(activeSessionId) ?? null;
   const processSnapshot = activeSessionId === null ? null : processSnapshots.get(activeSessionId) ?? null;
-  const monitorTask = useMonitorStore((state) => activeSessionId === null ? null : state.getSessionTask(activeSessionId));
-  const processTask = useProcessStore((state) => activeSessionId === null ? null : state.getSessionTask(activeSessionId));
+  const monitorTask = useLongTask('monitor', activeSessionId);
+  const processTask = useLongTask('process', activeSessionId);
   const sftpState = activeSessionId === null ? null : sftpStates.get(activeSessionId) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
@@ -90,6 +91,7 @@ export default function HomePage() {
     window.addEventListener('resize', resize);
     resize();
     useSessionStore.getState().initListeners().then(keep);
+    longTaskProjection.initListener().then(keep);
     useMonitorStore.getState().initListeners().then(keep);
     useProcessStore.getState().initListeners().then(keep);
     useSftpStore.getState().initListeners().then(keep);

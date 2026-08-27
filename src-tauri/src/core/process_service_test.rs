@@ -89,6 +89,8 @@ mod tests {
         app.listen("task:status", move |event| {
             let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
             if payload["status"] == "Failed" {
+                assert_eq!(payload["taskType"], "process");
+                assert_eq!(payload["sessionId"], "session-1");
                 assert_eq!(payload["error"]["code"], "ProcessError");
                 failed_ref.fetch_add(1, Ordering::Release);
             }

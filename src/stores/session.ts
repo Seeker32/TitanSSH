@@ -8,6 +8,7 @@ import { processTabId, terminalTabId } from '@/types/tab';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, toAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
+import { longTaskProjection } from './long-task';
 import { useMonitorStore } from './monitor';
 import { useProcessStore } from './process';
 import { useSftpStore } from './sftp';
@@ -114,6 +115,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
     /** 从前端投影移除会话及其关联状态（含引用该会话的全部标签）；后端 teardown 由调用方保证。 */
     removeSessionProjection(sessionId: string) {
+      longTaskProjection.invalidateSession(sessionId);
       set((state) => {
         const sessions = new Map(state.sessions);
         sessions.delete(sessionId);
@@ -166,11 +168,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
       useSftpStore.getState().ensureState(session.sessionId);
       void useSftpStore.getState().listDir(session.sessionId, '/');
       void useSftpStore.getState().loadTaskSnapshot(session.sessionId);
+      longTaskProjection.activateSession(session.sessionId);
       try {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
       } catch {
         // 监控失败不阻断 SSH 主流程。
       }
+      if (!longTaskProjection.isSessionActive(session.sessionId)) return session;
       try {
         await useProcessStore.getState().startMonitoring(session.sessionId);
       } catch {

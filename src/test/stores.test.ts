@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
 import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, readMonitorCollapsed, useLayoutStore } from '@/stores/layout';
+import { longTaskProjection } from '@/stores/long-task';
 import { useMonitorStore } from '@/stores/monitor';
 import { useProcessStore } from '@/stores/process';
 import { connectionLabel, useSessionStore } from '@/stores/session';
@@ -23,6 +24,10 @@ function resetStores() {
   useProcessStore.setState(useProcessStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
+  longTaskProjection.invalidateSession('session-1');
+  longTaskProjection.invalidateSession('session-2');
+  longTaskProjection.activateSession('session-1');
+  longTaskProjection.activateSession('session-2');
   useSftpStore.getState().ensureState('session-1');
 }
 
@@ -195,8 +200,8 @@ describe('Zustand stores', () => {
     mockInvoke.mockImplementation(async (command) => command === 'open_session' ? session : command === 'start_process_monitoring' ? makeProcessTaskInfo() : task);
     await useSessionStore.getState().openSession('host-1');
     expect(useSessionStore.getState().activeTabId).toBe(terminalTabId(session.sessionId));
-    expect(useMonitorStore.getState().sessionTaskMap.get(session.sessionId)).toBe(task.taskId);
-    expect(useProcessStore.getState().sessionTaskMap.get(session.sessionId)).toBe('process-task-1');
+    expect(longTaskProjection.getTask('monitor', session.sessionId)?.taskId).toBe(task.taskId);
+    expect(longTaskProjection.getTask('process', session.sessionId)?.taskId).toBe('process-task-1');
   });
 
   it('标签视图模型：打开会话建立恰好一个终端标签（会话锚点）并按打开顺序排列', async () => {
@@ -304,6 +309,23 @@ describe('Zustand stores', () => {
       throw new Error('monitor failed');
     });
     await expect(useSessionStore.getState().openSession('host-1')).resolves.toMatchObject({ sessionId: 'session-1' });
+  });
+
+  it('等待监控启动时会话关闭，不再启动进程采样', async () => {
+    let resolveMonitor!: (task: TaskInfo) => void;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') return makeSession();
+      if (command === 'start_monitoring') return new Promise<TaskInfo>((resolve) => { resolveMonitor = resolve; });
+      if (command === 'start_process_monitoring') throw new Error('must not start process sampling');
+      return undefined;
+    });
+    const opening = useSessionStore.getState().openSession('host-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await useSessionStore.getState().closeSession('session-1');
+    resolveMonitor(makeTaskInfo());
+    await opening;
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('start_process_monitoring', expect.anything());
   });
 
   it('连接阶段与失败错误按 sessionId 更新且互不覆盖', async () => {
@@ -441,15 +463,10 @@ describe('Zustand stores', () => {
       connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
     });
     useMonitorStore.setState({
-      sessionTaskMap: new Map([['session-1', task.taskId]]),
-      tasks: new Map([[task.taskId, task]]),
       snapshots: new Map([['session-1', makeSnapshot()]]),
       selectedInterfaces: new Map([['session-1', 'eth0']]),
     });
-    const processTask = makeProcessTaskInfo();
     useProcessStore.setState({
-      sessionTaskMap: new Map([['session-1', processTask.taskId]]),
-      tasks: new Map([[processTask.taskId, processTask]]),
       snapshots: new Map([['session-1', {
         sessionId: 'session-1', timestamp: 1, processes: [], totalCount: 0,
       }]]),
@@ -462,12 +479,10 @@ describe('Zustand stores', () => {
     expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
     expect(useSessionStore.getState().tabs.has(terminalTabId('session-1'))).toBe(false);
     expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
-    expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
-    expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
+    expect(longTaskProjection.getTask('monitor', 'session-1')).toBeNull();
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
-    expect(useProcessStore.getState().sessionTaskMap.has('session-1')).toBe(false);
-    expect(useProcessStore.getState().tasks.has(processTask.taskId)).toBe(false);
+    expect(longTaskProjection.getTask('process', 'session-1')).toBeNull();
     expect(useProcessStore.getState().snapshots.has('session-1')).toBe(false);
   });
 
@@ -788,12 +803,14 @@ describe('Zustand stores', () => {
 
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {
     const task = makeTaskInfo();
-    useMonitorStore.setState({ tasks: new Map([[task.taskId, task]]) });
+    const taskCleanup = await longTaskProjection.initListener();
     const cleanup = await useMonitorStore.getState().initListeners();
     emitMockEvent('monitor:snapshot', makeSnapshot());
-    emitMockEvent('task:status', { taskId: task.taskId, status: TaskStatus.Done });
+    await longTaskProjection.start('monitor', 'session-1', async () => task);
+    emitMockEvent('task:status', { taskId: task.taskId, taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Done, error: null });
     expect(useMonitorStore.getState().snapshots.get('session-1')?.cpuUsage).toBe(21.5);
-    expect(useMonitorStore.getState().tasks.get(task.taskId)?.status).toBe(TaskStatus.Done);
+    expect(longTaskProjection.getTask('monitor', 'session-1')?.status).toBe(TaskStatus.Done);
+    taskCleanup();
     cleanup();
   });
 
@@ -1258,18 +1275,20 @@ describe('Zustand stores', () => {
   });
 
   it('监控任务事件先于 invoke 返回时补投最新状态，终态不丢失', async () => {
+    const cleanup = await longTaskProjection.initListener();
     let resolveInvoke!: (task: TaskInfo) => void;
     mockInvoke.mockImplementationOnce(() => new Promise<TaskInfo>((resolve) => { resolveInvoke = resolve; }));
     const startPromise = useMonitorStore.getState().startMonitoring('session-1');
 
     // invoke 返回前到达的事件：Running 先到，Failed 后到，latest-wins
-    useMonitorStore.getState().applyTaskStatus({ taskId: 'task-1', status: TaskStatus.Running });
-    useMonitorStore.getState().applyTaskStatus({ taskId: 'task-1', status: TaskStatus.Failed, error: { code: 'MonitorError', detail: 'collect failed' } });
+    await Promise.resolve();
+    emitMockEvent('task:status', { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Running, error: null });
+    emitMockEvent('task:status', { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Failed, error: { code: 'MonitorError', detail: 'collect failed' } });
     resolveInvoke(makeTaskInfo());
     await startPromise;
 
-    expect(useMonitorStore.getState().tasks.get('task-1')?.status).toBe(TaskStatus.Failed);
-    expect(useMonitorStore.getState().pendingTaskEvents.has('task-1')).toBe(false);
+    expect(longTaskProjection.getTask('monitor', 'session-1')?.status).toBe(TaskStatus.Failed);
+    cleanup();
   });
 
   it('SFTP 终态事件先于 invoke 返回时补投，进度强制为总大小', async () => {
