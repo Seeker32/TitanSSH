@@ -1,13 +1,11 @@
 #[cfg(test)]
 mod tests {
     use crate::commands::monitor::{get_monitor_status, stop_monitoring};
-    use crate::core::host_identity::HostIdentityService;
-    use crate::core::monitor_service::{MonitorService, MonitorTaskHandle};
+    use crate::core::monitor_service::MonitorService;
     use crate::core::session_manager::SessionManager;
-    use crate::core::sftp_service::SftpService;
     use crate::errors::app_error::AppErrorInfo;
     use crate::models::host::{AuthType, HostConfig};
-    use crate::models::monitor::{MonitorSnapshot, NetworkSnapshot, TaskInfo, TaskStatus};
+    use crate::models::monitor::{MonitorSnapshot, NetworkSnapshot, TaskStatus};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tauri::Manager;
@@ -30,15 +28,10 @@ mod tests {
 
     /// 构造已注册监控命令的 mock 应用；MonitorService 与 SessionManager
     /// 共享同一监控服务实例，返回句柄用于构建 webview。
-    fn test_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<MonitorService>) {
-        let service = MonitorService::new();
-        let session_manager = SessionManager::new(
-            service.clone(),
-            SftpService::new(),
-            HostIdentityService::new(),
-        );
+    fn test_app() -> (tauri::App<tauri::test::MockRuntime>, MonitorService) {
+        let session_manager = SessionManager::new();
+        let service = session_manager.monitoring();
         let app = mock_builder()
-            .manage(service.clone())
             .manage(session_manager)
             .invoke_handler(tauri::generate_handler![
                 stop_monitoring,
@@ -46,7 +39,7 @@ mod tests {
             ])
             .build(mock_context(noop_assets()))
             .unwrap();
-        (app, Arc::new(service))
+        (app, service)
     }
 
     /// 构造不含明文凭据的测试主机。
@@ -73,6 +66,8 @@ mod tests {
             timestamp: 1_710_000_000_000,
             cpu_usage: Some(1.0),
             memory_usage: Some(2.0),
+            memory_total_bytes: Some(6),
+            memory_used_bytes: Some(7),
             disk_usage: Some(3.0),
             disk_available_bytes: Some(4),
             disk_total_bytes: Some(5),
@@ -85,18 +80,11 @@ mod tests {
 
     /// 向注册表插入一个 Running 任务（无工作线程），模拟进行中的监控任务。
     fn insert_running_task(service: &MonitorService, task_id: &str, session_id: &str) {
-        service.tasks.lock().unwrap().insert(
-            task_id.to_string(),
-            MonitorTaskHandle {
-                task_info: TaskInfo {
-                    task_id: task_id.to_string(),
-                    task_type: "monitor".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    status: TaskStatus::Running,
-                    created_at: 0,
-                },
-                shutdown: Arc::new(AtomicBool::new(false)),
-            },
+        service.insert_task_for_test(
+            task_id,
+            session_id,
+            TaskStatus::Running,
+            Arc::new(AtomicBool::new(false)),
         );
     }
 
@@ -139,7 +127,7 @@ mod tests {
 
         let value: serde_json::Value = response.deserialize().unwrap();
         assert_eq!(value, serde_json::Value::Null);
-        assert!(!service.tasks.lock().unwrap().contains_key("task-1"));
+        assert!(!service.task_exists_for_test("task-1"));
     }
 
     /// 回归：会话存活但尚无快照（首轮采集前、或监控已停止）时，get_monitor_status

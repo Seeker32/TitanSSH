@@ -10,8 +10,18 @@ permissions:
   contents: write
 
 jobs:
+  lint:
+    name: Lint (cargo fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Rust 代码三平台同源，格式检查在单一 Linux runner 跑一次即可；
+      - run: cargo fmt --all --check --manifest-path src-tauri/Cargo.toml
+
   build:
     name: Build ${{ matrix.name }}
+    needs: lint
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

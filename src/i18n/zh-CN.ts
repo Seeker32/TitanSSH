@@ -98,6 +98,9 @@ export const zhCN = {
   'sftp.failed': '失败',
   'sftp.cancelled': '已取消',
   'sftp.clearTerminal': '清除已结束',
+  'sftp.recentTransfers': '近期传输',
+  'sftp.noRecentTransfers': '暂无关闭会话的传输结果',
+  'sftp.clearRecentTransfers': '清空近期记录',
   'sftp.defaultDownload': '下载',
 
   // 服务器监控
@@ -107,6 +110,7 @@ export const zhCN = {
   'monitor.name': '监控',
   'monitor.collapse': '折叠监视条',
   'monitor.capacity': '剩余 {available} / 总量 {total}',
+  'monitor.memoryCapacity': '已用 {used} / 总量 {total}',
   'monitor.unavailable': '网络数据不可用',
   'monitor.noInterface': '无可用网卡',
   'monitor.interface': '网卡接口',
@@ -119,6 +123,33 @@ export const zhCN = {
   'monitor.ago': '60 秒前',
   'monitor.now': '现在',
   'monitor.empty': '连接建立后，这里会每 2 秒刷新一次服务器状态',
+  'monitor.tasks': '采样任务',
+  'monitor.hostTask': '主机监控',
+  'monitor.processTask': '进程监控',
+  'monitor.pending': '等待中',
+  'monitor.running': '运行中',
+  'monitor.done': '完成',
+  'monitor.failed': '失败',
+
+  // 进程摘要
+  'process.title': '进程摘要',
+  'process.tab': '进程',
+  'process.open': '查看全部进程',
+  'process.filter': '过滤进程',
+  'process.count': '共 {count} 个进程',
+  'process.emptyTable': '暂无匹配的进程',
+  'process.pid': 'PID',
+  'process.ppid': 'PPID',
+  'process.user': '用户',
+  'process.cpuPercent': 'CPU%',
+  'process.memoryBytes': '内存',
+  'process.state': '状态',
+  'process.command': '命令名',
+  'process.commandLine': '完整命令行',
+  'process.sort': '进程排序',
+  'process.cpu': 'CPU',
+  'process.memory': '内存',
+  'process.empty': '进程快照尚未就绪',
 
   // 会话与连接阶段
   'session.ready': '就绪',
@@ -196,4 +227,3 @@ export const zhCN = {
   'error.Unknown': '未知错误',
   'error.Timeout': '连接超时',
 } as const;
-

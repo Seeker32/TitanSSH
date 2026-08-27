@@ -101,6 +101,9 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'sftp.failed': 'Failed',
   'sftp.cancelled': 'Cancelled',
   'sftp.clearTerminal': 'Clear finished',
+  'sftp.recentTransfers': 'Recent transfers',
+  'sftp.noRecentTransfers': 'No closed-session transfer results',
+  'sftp.clearRecentTransfers': 'Clear recent transfers',
   'sftp.defaultDownload': 'download',
 
   // Server monitoring
@@ -110,6 +113,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'monitor.name': 'Monitor',
   'monitor.collapse': 'Collapse monitor',
   'monitor.capacity': 'Available {available} / Total {total}',
+  'monitor.memoryCapacity': 'Used {used} / Total {total}',
   'monitor.unavailable': 'Network data unavailable',
   'monitor.noInterface': 'No network interface available',
   'monitor.interface': 'Network interface',
@@ -122,6 +126,33 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'monitor.ago': '60 seconds ago',
   'monitor.now': 'Now',
   'monitor.empty': 'Server status refreshes here every 2 seconds after the connection is established',
+  'monitor.tasks': 'Sampling tasks',
+  'monitor.hostTask': 'Host monitoring',
+  'monitor.processTask': 'Process monitoring',
+  'monitor.pending': 'Pending',
+  'monitor.running': 'Running',
+  'monitor.done': 'Done',
+  'monitor.failed': 'Failed',
+
+  // Process summary
+  'process.title': 'Process summary',
+  'process.tab': 'Processes',
+  'process.open': 'View all processes',
+  'process.filter': 'Filter processes',
+  'process.count': '{count} processes',
+  'process.emptyTable': 'No matching processes',
+  'process.pid': 'PID',
+  'process.ppid': 'PPID',
+  'process.user': 'User',
+  'process.cpuPercent': 'CPU%',
+  'process.memoryBytes': 'Memory',
+  'process.state': 'State',
+  'process.command': 'Command',
+  'process.commandLine': 'Full command line',
+  'process.sort': 'Process sort',
+  'process.cpu': 'CPU',
+  'process.memory': 'Memory',
+  'process.empty': 'Process snapshot is not ready',
 
   // Session and connection phases
   'session.ready': 'Ready',
@@ -199,4 +230,3 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'error.Unknown': 'Unknown error',
   'error.Timeout': 'Connection timed out',
 };
-

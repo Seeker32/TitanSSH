@@ -17,7 +17,7 @@ use tauri::{AppHandle, State};
 pub async fn list_trusted_hosts(
     session_manager: State<'_, SessionManager>,
 ) -> Result<Vec<TrustedHostInfo>, AppErrorInfo> {
-    let identity_service = session_manager.identity_service().clone();
+    let identity_service = session_manager.host_identity();
     run_blocking_op(move || identity_service.list_trusted_hosts()).await
 }
 
@@ -32,7 +32,7 @@ pub fn accept_host_identity(
     session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
     session_manager
-        .identity_service()
+        .host_identity()
         .accept(&challenge_id)
         .map_err(AppErrorInfo::from)
 }
@@ -52,7 +52,7 @@ pub async fn accept_and_save_host_identity(
     challenge_id: String,
     session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
-    let identity_service = session_manager.identity_service().clone();
+    let identity_service = session_manager.host_identity();
     run_blocking_op(move || identity_service.accept_and_save(&app, &challenge_id)).await
 }
 
@@ -68,7 +68,7 @@ pub fn reject_host_identity(
     session_manager: State<'_, SessionManager>,
 ) -> Result<(), AppErrorInfo> {
     let challenge = session_manager
-        .identity_service()
+        .host_identity()
         .reject(&challenge_id)
         .map_err(AppErrorInfo::from)?;
     if let Err(error) = session_manager.close_session(&challenge.session_id, &app) {

@@ -1,4 +1,5 @@
 import { Download, RotateCcw, Trash2, Upload, X } from 'lucide-react';
+import { Alert, Button, Progress, Tag } from 'antd';
 import type { AppErrorInfo } from '@/i18n';
 import { isTerminalStatus, type SftpTaskStatus, type TransferTask } from '@/types/sftp';
 import { formatAppError, translate } from '@/i18n';
@@ -39,12 +40,13 @@ export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry, 
   if (tasks.size === 0) return <div className="empty-msg">{translate(locale, 'sftp.noTasks')}</div>;
   const sorted = [...tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
   const hasTerminal = sorted.some((task) => isTerminalStatus(task.status));
+  const statusColors = { Pending: 'gold', Running: 'blue', Done: 'green', Failed: 'red', Cancelled: 'default' } as const;
   return <div className="transfer-queue">
     {hasTerminal && <div className="transfer-queue-actions">
-      <button type="button" data-testid="clear-terminal-btn" className="task-btn"
-        title={translate(locale, 'sftp.clearTerminal')} onClick={onClearTerminal}>
-        <Trash2 size={12} />{translate(locale, 'sftp.clearTerminal')}
-      </button>
+      <Button type="text" size="small" data-testid="clear-terminal-btn" className="task-btn"
+        title={translate(locale, 'sftp.clearTerminal')} icon={<Trash2 size={12} />} onClick={onClearTerminal}>
+        {translate(locale, 'sftp.clearTerminal')}
+      </Button>
     </div>}
     {sorted.map((task) => {
       const active = task.status === 'Pending' || task.status === 'Running';
@@ -54,22 +56,19 @@ export default function TransferQueue({ tasks, actionErrors, onCancel, onRetry, 
         <div className="task-top">
           <span className="task-direction">{task.transferType === 'Download' ? <Download size={13} /> : <Upload size={13} />}</span>
           <span className="task-name" title={task.fileName}>{task.fileName}</span>
-          <span className={`task-status task-status--${task.status.toLowerCase()}`}>{taskStatusLabel(task.status, locale)}</span>
-          {active && <button data-testid="cancel-btn" className="task-btn" title={translate(locale, 'sftp.cancel')} onClick={() => onCancel(task.taskId)}><X size={12} /></button>}
+          <Tag variant="filled" color={statusColors[task.status]} className={`task-status task-status--${task.status.toLowerCase()}`}>{taskStatusLabel(task.status, locale)}</Tag>
+          {active && <Button type="text" size="small" data-testid="cancel-btn" className="task-btn" title={translate(locale, 'sftp.cancel')} icon={<X size={12} />} onClick={() => onCancel(task.taskId)} />}
           {(task.status === 'Failed' || task.status === 'Cancelled')
-            && <button data-testid="retry-btn" className="task-btn" title={translate(locale, 'sftp.retry')} onClick={() => onRetry(task)}><RotateCcw size={12} /></button>}
+            && <Button type="text" size="small" data-testid="retry-btn" className="task-btn" title={translate(locale, 'sftp.retry')} icon={<RotateCcw size={12} />} onClick={() => onRetry(task)} />}
           {task.status === 'Failed' && task.error?.code === 'SftpTargetExists'
-            && <button data-testid="overwrite-btn" className="task-btn"
+            && <Button size="small" data-testid="overwrite-btn" className="task-btn"
               title={translate(locale, task.transferType === 'Download' ? 'sftp.overwriteDownload' : 'sftp.overwriteUpload')}
-              onClick={() => onOverwrite(task)}>{translate(locale, task.transferType === 'Download' ? 'sftp.overwriteDownload' : 'sftp.overwriteUpload')}</button>}
+              onClick={() => onOverwrite(task)}>{translate(locale, task.transferType === 'Download' ? 'sftp.overwriteDownload' : 'sftp.overwriteUpload')}</Button>}
         </div>
-        <div className="progress-bar" data-testid="progress-bar">
-          <div className={`progress-fill ${task.status === 'Done' ? 'progress-fill--done' : ''}`}
-            data-testid="progress-fill" style={{ width: `${percent}%` }} />
-        </div>
+        <Progress className="task-progress" percent={percent} status={task.status === 'Done' ? 'success' : task.status === 'Failed' ? 'exception' : 'active'} showInfo={false} size="small" />
         <div className="task-meta"><span>{formatSpeed(task.speedBps)}</span><span>{percent}%</span></div>
-        {task.error && <div className="task-error">{formatAppError(locale, task.error)}</div>}
-        {actionError && <div data-testid="task-action-error" className="task-error">{formatAppError(locale, actionError)}</div>}
+        {task.error && <Alert className="task-error" type="error" showIcon title={formatAppError(locale, task.error)} />}
+        {actionError && <div data-testid="task-action-error"><Alert className="task-error" type="error" showIcon title={formatAppError(locale, actionError)} /></div>}
       </div>;
     })}</div>;
 }

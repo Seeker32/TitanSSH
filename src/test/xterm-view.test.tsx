@@ -11,16 +11,15 @@ const terminal = {
   options: { theme: {} },
   loadAddon: vi.fn(),
   open: vi.fn(),
+  attachCustomKeyEventHandler: vi.fn(),
   onData: vi.fn(),
-  onBinary: vi.fn(),
   write: vi.fn(),
   dispose: vi.fn(),
 };
 const inputDisposable = { dispose: vi.fn() };
-const binaryInputDisposable = { dispose: vi.fn() };
 const fit = vi.fn();
 let inputHandler: (data: string) => void;
-let binaryInputHandler: (data: string) => void;
+let keyHandler: ((event: KeyboardEvent) => boolean) | undefined;
 
 vi.mock('@xterm/xterm', () => ({ Terminal: vi.fn(() => terminal) }));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: vi.fn(() => ({ fit })) }));
@@ -32,8 +31,8 @@ describe('XtermView', () => {
     fit.mockClear();
     inputDisposable.dispose.mockClear();
     terminal.onData.mockImplementation((handler) => { inputHandler = handler; return inputDisposable; });
-    terminal.onBinary.mockImplementation((handler) => { binaryInputHandler = handler; return binaryInputDisposable; });
-    binaryInputDisposable.dispose.mockClear();
+    terminal.attachCustomKeyEventHandler.mockImplementation((handler) => { keyHandler = handler; });
+    keyHandler = undefined;
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(0); return 1; });
     useTerminalThemeStore.setState(useTerminalThemeStore.getInitialState(), true);
   });
@@ -59,9 +58,35 @@ describe('XtermView', () => {
     const onInput = vi.fn();
     render(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
     inputHandler('ls\r');
-    expect(onInput).toHaveBeenCalledTimes(1);
-    expect(onInput.mock.calls[0][0].sessionId).toBe('session-1');
-    expect(Array.from(onInput.mock.calls[0][0].data)).toEqual([0x6c, 0x73, 0x0d]);
+    expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: 'ls\r' });
+  });
+
+  it('WebView keyCode 为 0 时 Tab 仍会阻止焦点跳转并上送补全输入', () => {
+    const onInput = vi.fn();
+    render(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
+    const event = {
+      type: 'keydown', key: 'Tab', keyCode: 0, shiftKey: false,
+      preventDefault: vi.fn(), stopPropagation: vi.fn(),
+    } as unknown as KeyboardEvent;
+
+    expect(keyHandler).toBeTypeOf('function');
+    expect(keyHandler?.(event)).toBe(false);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(event.stopPropagation).toHaveBeenCalledOnce();
+    expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: '\t' });
+  });
+
+  it('Shift+Tab 仅上送一次反向补全序列', () => {
+    const onInput = vi.fn();
+    render(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
+    const event = {
+      type: 'keydown', key: 'Tab', keyCode: 0, shiftKey: true,
+      preventDefault: vi.fn(), stopPropagation: vi.fn(),
+    } as unknown as KeyboardEvent;
+
+    keyHandler?.(event);
+    expect(onInput).toHaveBeenCalledOnce();
+    expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: '\x1b[Z' });
   });
 
   it('Connected 前不接收用户输入，转为可交互后恢复上送', () => {
@@ -71,18 +96,7 @@ describe('XtermView', () => {
     expect(onInput).not.toHaveBeenCalled();
     view.rerender(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
     inputHandler('pwd\r');
-    expect(onInput).toHaveBeenCalledTimes(1);
-    expect(onInput.mock.calls[0][0].sessionId).toBe('session-1');
-    expect(Array.from(onInput.mock.calls[0][0].data)).toEqual([0x70, 0x77, 0x64, 0x0d]);
-  });
-
-  it('二进制终端输入按字节上送且不经过 UTF-8 解码', () => {
-    const onInput = vi.fn();
-    render(<XtermView sessionId="session-1" active interactive onInput={onInput} onResize={vi.fn()} />);
-    binaryInputHandler(String.fromCharCode(0x00, 0xff, 0x1b, 0x5b, 0x41));
-    expect(onInput).toHaveBeenCalledTimes(1);
-    expect(onInput.mock.calls[0][0].sessionId).toBe('session-1');
-    expect(Array.from(onInput.mock.calls[0][0].data)).toEqual([0x00, 0xff, 0x1b, 0x5b, 0x41]);
+    expect(onInput).toHaveBeenCalledWith({ sessionId: 'session-1', data: 'pwd\r' });
   });
 
   it('终端色板与 slate 视觉体系一致', () => {

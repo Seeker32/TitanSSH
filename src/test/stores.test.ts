@@ -3,13 +3,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { emitMockEvent, resetMockEvents } from '@tauri-apps/api/event';
 import { filterHosts, groupHosts, useHostStore } from '@/stores/host';
 import { DEFAULT_SIDEBAR_WIDTH, MIN_MAIN_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, readCollapsedGroups, readMonitorCollapsed, useLayoutStore } from '@/stores/layout';
+import { longTaskProjection } from '@/stores/long-task';
 import { useMonitorStore } from '@/stores/monitor';
+import { useProcessStore } from '@/stores/process';
 import { connectionLabel, useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
 import { TaskStatus } from '@/types/monitor';
 import { uploadTargetDir, type RemoteEntry, type TransferTask } from '@/types/sftp';
-import { makeHost, makeRemoteEntry, makeSession, makeSnapshot, makeTaskInfo, makeTransferTask } from './fixtures';
+import { makeHost, makeProcessSnapshot, makeProcessTaskInfo, makeRemoteEntry, makeSession, makeSnapshot, makeTabViewState, makeTaskInfo, makeTransferTask } from './fixtures';
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -18,8 +20,14 @@ function resetStores() {
   useHostStore.setState(useHostStore.getInitialState(), true);
   useLayoutStore.setState(useLayoutStore.getInitialState(), true);
   useMonitorStore.setState(useMonitorStore.getInitialState(), true);
+  useProcessStore.setState(useProcessStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
+  longTaskProjection.invalidateSession('session-1');
+  longTaskProjection.invalidateSession('session-2');
+  longTaskProjection.activateSession('session-1');
+  longTaskProjection.activateSession('session-2');
+  useSftpStore.getState().ensureState('session-1');
 }
 
 beforeEach(() => {
@@ -199,10 +207,121 @@ describe('Zustand stores', () => {
   it('打开会话后设为激活并启动监控', async () => {
     const session = makeSession();
     const task = makeTaskInfo();
-    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? session : task);
+    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? session : command === 'start_process_monitoring' ? makeProcessTaskInfo() : task);
     await useSessionStore.getState().openSession('host-1');
-    expect(useSessionStore.getState().activeView).toBe(session.sessionId);
-    expect(useMonitorStore.getState().sessionTaskMap.get(session.sessionId)).toBe(task.taskId);
+    expect(useSessionStore.getState().tabViews.activeId).toBe('terminal:session-1');
+    expect(longTaskProjection.getTask('monitor', session.sessionId)?.taskId).toBe(task.taskId);
+    expect(longTaskProjection.getTask('process', session.sessionId)?.taskId).toBe('process-task-1');
+  });
+
+  it('标签视图模型：打开会话建立恰好一个终端标签（会话锚点）并按打开顺序排列', async () => {
+    let openCount = 0;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') {
+        openCount += 1;
+        return makeSession({ sessionId: `session-${openCount}` });
+      }
+      return makeTaskInfo();
+    });
+    await useSessionStore.getState().openSession('host-1');
+    await useSessionStore.getState().openSession('host-1');
+
+    const state = useSessionStore.getState();
+    // 一个会话恰有一个终端标签：两会话 → 两标签，顺序与打开顺序一致（标签栏渲染源）
+    expect([...state.tabViews.byId.values()].map((tab) => tab.sessionId)).toEqual(['session-1', 'session-2']);
+    expect([...state.tabViews.byId.values()].every((tab) => tab.kind === 'terminal')).toBe(true);
+    expect(state.tabViews.activeId).toBe('terminal:session-2');
+  });
+
+  it('锚点语义：关闭终端标签触发 close_session 完整 teardown 并清理会话与标签投影', async () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      tabViews: makeTabViewState([makeSession()], 'session-1'),
+    });
+    mockInvoke.mockResolvedValue(undefined);
+
+    await useSessionStore.getState().closeTab('terminal:session-1');
+
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    const state = useSessionStore.getState();
+    expect(state.sessions.has('session-1')).toBe(false);
+    expect(state.tabViews.byId.has('terminal:session-1')).toBe(false);
+    expect(state.tabViews.activeId).toBeNull();
+  });
+
+  it('锚点语义：关闭后台会话的终端标签不影响当前激活标签', async () => {
+    useSessionStore.setState({
+      sessions: new Map([
+        ['session-1', makeSession()],
+        ['session-2', makeSession({ sessionId: 'session-2' })],
+      ]),
+      tabViews: makeTabViewState([makeSession(), makeSession({ sessionId: 'session-2' })], 'session-2'),
+    });
+    mockInvoke.mockResolvedValue(undefined);
+
+    await useSessionStore.getState().closeTab('terminal:session-1');
+
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().tabViews.byId.has('terminal:session-1')).toBe(false);
+    expect(useSessionStore.getState().tabViews.activeId).toBe('terminal:session-2');
+  });
+
+  it('重复关闭同一终端标签只产生一次 close_session effect', async () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      tabViews: makeTabViewState([makeSession()], 'session-1'),
+    });
+    let resolveClose!: () => void;
+    mockInvoke.mockImplementation(async (command) => command === 'close_session'
+      ? new Promise<void>((resolve) => { resolveClose = resolve; })
+      : undefined);
+
+    const first = useSessionStore.getState().closeTab('terminal:session-1');
+    await Promise.resolve();
+    const second = useSessionStore.getState().closeTab('terminal:session-1');
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    resolveClose();
+    await Promise.all([first, second]);
+  });
+
+  it('关闭未知标签为无操作：不发起后端调用也不改动状态', async () => {
+    mockInvoke.mockResolvedValue(undefined);
+    await useSessionStore.getState().closeTab('terminal:ghost');
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().tabViews.byId.size).toBe(0);
+    expect(useSessionStore.getState().tabViews.activeId).toBeNull();
+  });
+
+  it('切换激活标签：setActiveTab 迁移视图选择状态到标签语义', () => {
+    const first = makeSession();
+    const second = makeSession({ sessionId: 'session-2' });
+    useSessionStore.setState({
+      sessions: new Map([[first.sessionId, first], [second.sessionId, second]]),
+      tabViews: makeTabViewState([first, second], 'session-1'),
+    });
+    useSessionStore.getState().setActiveTab('terminal:session-2');
+    expect(useSessionStore.getState().tabViews.activeId).toBe('terminal:session-2');
+  });
+
+  it('进程标签是纯视图：关闭与重开不影响采样或缓存快照', async () => {
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession()]]),
+      tabViews: makeTabViewState([makeSession()], 'session-1'),
+    });
+    const snapshot = makeProcessSnapshot();
+    useProcessStore.getState().applySnapshot(snapshot);
+
+    useSessionStore.getState().openProcessTab('session-1');
+    expect(useSessionStore.getState().tabViews.activeId).toBe('process:session-1');
+    expect(useSessionStore.getState().tabViews.byId.get('process:session-1')?.kind).toBe('process');
+
+    await useSessionStore.getState().closeTab('process:session-1');
+    expect(mockInvoke).not.toHaveBeenCalledWith('close_session', expect.anything());
+    expect(useSessionStore.getState().tabViews.activeId).toBe('terminal:session-1');
+    expect(useProcessStore.getState().snapshots.get('session-1')).toBe(snapshot);
+
+    useSessionStore.getState().openProcessTab('session-1');
+    expect(useSessionStore.getState().tabViews.activeId).toBe('process:session-1');
   });
 
   it('监控启动失败不阻断会话打开', async () => {
@@ -211,6 +330,23 @@ describe('Zustand stores', () => {
       throw new Error('monitor failed');
     });
     await expect(useSessionStore.getState().openSession('host-1')).resolves.toMatchObject({ sessionId: 'session-1' });
+  });
+
+  it('等待监控启动时会话关闭，不再启动进程采样', async () => {
+    let resolveMonitor!: (task: TaskInfo) => void;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === 'open_session') return makeSession();
+      if (command === 'start_monitoring') return new Promise<TaskInfo>((resolve) => { resolveMonitor = resolve; });
+      if (command === 'start_process_monitoring') throw new Error('must not start process sampling');
+      return undefined;
+    });
+    const opening = useSessionStore.getState().openSession('host-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await useSessionStore.getState().closeSession('session-1');
+    resolveMonitor(makeTaskInfo());
+    await opening;
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('start_process_monitoring', expect.anything());
   });
 
   it('连接阶段与失败错误按 sessionId 更新且互不覆盖', async () => {
@@ -325,30 +461,93 @@ describe('Zustand stores', () => {
     vi.useRealTimers();
   });
 
+  it('首个进度事件先于 open_session 返回到达时不丢弃，投影建立后回放阶段', async () => {
+    // 复现 IPC 竞态：worker 在 open_session 返回前就发出 LoadingCredentials 进度，
+    // 事件先到、投影后建。丢弃会让标签永远显示通用“正在连接”而非卡点提示。
+    const cleanup = await useSessionStore.getState().initListeners();
+    emitMockEvent('session:progress', { sessionId: 'session-1', phase: ConnectionPhase.LoadingCredentials, timestamp: 1 });
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+
+    mockInvoke.mockImplementation(async (command) => command === 'open_session' ? makeSession() : makeTaskInfo());
+    await useSessionStore.getState().openSession('host-1');
+
+    expect(useSessionStore.getState().connections.get('session-1')?.phase).toBe(ConnectionPhase.LoadingCredentials);
+    cleanup();
+  });
+
   it('关闭活动会话只调用后端 teardown 并清理前端 projection', async () => {
     const task = makeTaskInfo();
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession()]]),
-      activeView: 'session-1',
+      tabViews: makeTabViewState([makeSession()], 'session-1'),
       connections: new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]]),
     });
     useMonitorStore.setState({
-      sessionTaskMap: new Map([['session-1', task.taskId]]),
-      tasks: new Map([[task.taskId, task]]),
       snapshots: new Map([['session-1', makeSnapshot()]]),
       selectedInterfaces: new Map([['session-1', 'eth0']]),
+    });
+    useProcessStore.setState({
+      snapshots: new Map([['session-1', {
+        sessionId: 'session-1', timestamp: 1, processes: [], totalCount: 0,
+      }]]),
     });
     mockInvoke.mockResolvedValue(undefined);
     await useSessionStore.getState().closeSession('session-1');
 
-    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSessionStore.getState().tabViews.activeId).toBeNull();
     expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().tabViews.byId.has('terminal:session-1')).toBe(false);
     expect(mockInvoke).not.toHaveBeenCalledWith('stop_monitoring', expect.anything());
-    expect(useMonitorStore.getState().sessionTaskMap.has('session-1')).toBe(false);
-    expect(useMonitorStore.getState().tasks.has(task.taskId)).toBe(false);
+    expect(longTaskProjection.getTask('monitor', 'session-1')).toBeNull();
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
     expect(useMonitorStore.getState().selectedInterfaces.has('session-1')).toBe(false);
+    expect(longTaskProjection.getTask('process', 'session-1')).toBeNull();
+    expect(useProcessStore.getState().snapshots.has('session-1')).toBe(false);
+  });
+
+  it('连接失败后端已自动 teardown：close_session 返回 SessionNotFound 时仍清理投影，标签始终可关闭', async () => {
+    // 复现凭据不存在场景：worker 退出触发 TerminalExitGuard 清理会话，
+    // 前端投影保留 Error 状态与覆盖层，用户点击关闭时后端返回 SessionNotFound
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession({ status: SessionStatus.Error })]]),
+      tabViews: makeTabViewState([makeSession({ status: SessionStatus.Error })], 'session-1'),
+      connections: new Map([['session-1', {
+        phase: null,
+        error: { code: 'CredentialNotFound', detail: '凭据不存在: titanssh-xxx-password' },
+      }]]),
+    });
+    mockInvoke.mockRejectedValueOnce({ code: 'SessionNotFound', detail: 'Session not found: session-1' });
+
+    // 关闭视图是本地操作：不得因后端会话已消失而抛出或残留投影
+    await expect(useSessionStore.getState().closeSession('session-1')).resolves.toBeUndefined();
+
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().connections.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().tabViews.activeId).toBeNull();
+  });
+
+  it('用户路径回归：连接失败后关闭标签（closeTab）在 close_session 返回 SessionNotFound 时仍移除标签', async () => {
+    // v0.1.5 实测缺陷：TCP 建连失败（如 No route to host）→ 终端 worker 退出触发
+    // TerminalExitGuard 后端 teardown → 错误覆盖层仅剩关闭标签操作；用户点击关闭时
+    // 后端返回 SessionNotFound，关闭是本地视图操作，不得被后端会话状态阻塞。
+    // 入口必须是 closeTab（覆盖层按钮 → HomePage → closeTab），覆盖完整包装链。
+    useSessionStore.setState({
+      sessions: new Map([['session-1', makeSession({ status: SessionStatus.Error })]]),
+      tabViews: makeTabViewState([makeSession({ status: SessionStatus.Error })], 'session-1'),
+      connections: new Map([['session-1', {
+        phase: null,
+        error: { code: 'SshConnectionError', detail: '连接失败: 在 10000ms 预算内已尝试 1 个地址，最后错误: No route to host (os error 65)' },
+      }]]),
+    });
+    mockInvoke.mockRejectedValueOnce({ code: 'SessionNotFound', detail: 'Session not found: session-1' });
+
+    await expect(useSessionStore.getState().closeTab('terminal:session-1')).resolves.toBeUndefined();
+
+    expect(mockInvoke).toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
+    expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
+    expect(useSessionStore.getState().tabViews.byId.has('terminal:session-1')).toBe(false);
+    expect(useSessionStore.getState().tabViews.activeId).toBeNull();
   });
 
   it('后端撤销事件撤下对应确认卡，且不误删已被新 challenge 取代的投影', async () => {
@@ -395,7 +594,7 @@ describe('Zustand stores', () => {
     };
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession()]]),
-      activeView: 'session-1',
+      tabViews: makeTabViewState([makeSession()], 'session-1'),
       hostKeyChallenges: new Map([['session-1', challenge]]),
     });
     mockInvoke.mockResolvedValue(undefined);
@@ -407,7 +606,7 @@ describe('Zustand stores', () => {
     expect(mockInvoke).not.toHaveBeenCalledWith('close_session', { sessionId: 'session-1' });
     expect(useSessionStore.getState().sessions.has('session-1')).toBe(false);
     expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
-    expect(useSessionStore.getState().activeView).toBeNull();
+    expect(useSessionStore.getState().tabViews.activeId).toBeNull();
     expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
     expect(useMonitorStore.getState().snapshots.has('session-1')).toBe(false);
   });
@@ -449,7 +648,7 @@ describe('Zustand stores', () => {
     };
     useSessionStore.setState({
       sessions: new Map([['session-1', makeSession()]]),
-      activeView: 'session-1',
+      tabViews: makeTabViewState([makeSession()], 'session-1'),
       hostKeyChallenges: new Map([['session-1', challenge]]),
     });
     mockInvoke.mockRejectedValue({ code: 'HostKeyChallengeNotFound', detail: 'challenge-gone' });
@@ -458,7 +657,7 @@ describe('Zustand stores', () => {
 
     expect(useSessionStore.getState().hostKeyChallenges.has('session-1')).toBe(false);
     expect(useSessionStore.getState().sessions.has('session-1')).toBe(true);
-    expect(useSessionStore.getState().activeView).toBe('session-1');
+    expect(useSessionStore.getState().tabViews.activeId).toBe('terminal:session-1');
   });
 
   it('接受并保存成功：调用后端命令并清除确认卡', async () => {
@@ -620,12 +819,14 @@ describe('Zustand stores', () => {
 
   it('监控事件按 sessionId 更新快照并流转任务状态', async () => {
     const task = makeTaskInfo();
-    useMonitorStore.setState({ tasks: new Map([[task.taskId, task]]) });
+    const taskCleanup = await longTaskProjection.initListener();
     const cleanup = await useMonitorStore.getState().initListeners();
     emitMockEvent('monitor:snapshot', makeSnapshot());
-    emitMockEvent('task:status', { taskId: task.taskId, status: TaskStatus.Done });
+    await longTaskProjection.start('monitor', 'session-1', async () => task);
+    emitMockEvent('task:status', { taskId: task.taskId, taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Done, error: null });
     expect(useMonitorStore.getState().snapshots.get('session-1')?.cpuUsage).toBe(21.5);
-    expect(useMonitorStore.getState().tasks.get(task.taskId)?.status).toBe(TaskStatus.Done);
+    expect(longTaskProjection.getTask('monitor', 'session-1')?.status).toBe(TaskStatus.Done);
+    taskCleanup();
     cleanup();
   });
 
@@ -736,6 +937,8 @@ describe('Zustand stores', () => {
 
   it('SFTP 多会话状态互不影响', async () => {
     mockInvoke.mockResolvedValueOnce([makeRemoteEntry()]).mockResolvedValueOnce([]);
+    useSftpStore.getState().ensureState('a');
+    useSftpStore.getState().ensureState('b');
     await useSftpStore.getState().listDir('a', '/a');
     await useSftpStore.getState().listDir('b', '/b');
     expect(useSftpStore.getState().getState('a')?.entries).toHaveLength(1);
@@ -847,6 +1050,9 @@ describe('Zustand stores', () => {
       .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveAOld = resolve; }))
       .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveB = resolve; }))
       .mockImplementationOnce(() => new Promise<RemoteEntry[]>((resolve) => { resolveANew = resolve; }));
+
+    useSftpStore.getState().ensureState('a');
+    useSftpStore.getState().ensureState('b');
 
     const aOld = useSftpStore.getState().listDir('a', '/a-old');
     const b = useSftpStore.getState().listDir('b', '/b');
@@ -1085,18 +1291,20 @@ describe('Zustand stores', () => {
   });
 
   it('监控任务事件先于 invoke 返回时补投最新状态，终态不丢失', async () => {
+    const cleanup = await longTaskProjection.initListener();
     let resolveInvoke!: (task: TaskInfo) => void;
     mockInvoke.mockImplementationOnce(() => new Promise<TaskInfo>((resolve) => { resolveInvoke = resolve; }));
     const startPromise = useMonitorStore.getState().startMonitoring('session-1');
 
     // invoke 返回前到达的事件：Running 先到，Failed 后到，latest-wins
-    useMonitorStore.getState().applyTaskStatus({ taskId: 'task-1', status: TaskStatus.Running });
-    useMonitorStore.getState().applyTaskStatus({ taskId: 'task-1', status: TaskStatus.Failed, error: { code: 'MonitorError', detail: 'collect failed' } });
+    await Promise.resolve();
+    emitMockEvent('task:status', { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Running, error: null });
+    emitMockEvent('task:status', { taskId: 'task-1', taskType: 'monitor', sessionId: 'session-1', status: TaskStatus.Failed, error: { code: 'MonitorError', detail: 'collect failed' } });
     resolveInvoke(makeTaskInfo());
     await startPromise;
 
-    expect(useMonitorStore.getState().tasks.get('task-1')?.status).toBe(TaskStatus.Failed);
-    expect(useMonitorStore.getState().pendingTaskEvents.has('task-1')).toBe(false);
+    expect(longTaskProjection.getTask('monitor', 'session-1')?.status).toBe(TaskStatus.Failed);
+    cleanup();
   });
 
   it('SFTP 终态事件先于 invoke 返回时补投，进度强制为总大小', async () => {
@@ -1125,6 +1333,28 @@ describe('Zustand stores', () => {
     // 关闭后到达的迟到状态事件（后端 cleanup 的 Cancelled）直接丢弃，不再落回缓存
     useSftpStore.getState().applyTaskStatus({ taskId: 'task-x', sessionId: 'session-1', status: 'Cancelled', error: null });
     expect(useSftpStore.getState().pendingTaskEvents.has('task-x')).toBe(false);
+  });
+
+  it('关闭后迟到的目录失败不得重新创建 SFTP projection', async () => {
+    let rejectRequest!: (error: unknown) => void;
+    mockInvoke.mockImplementationOnce(() => new Promise<RemoteEntry[]>((_, reject) => { rejectRequest = reject; }));
+    useSftpStore.getState().ensureState('session-1');
+
+    const request = useSftpStore.getState().listDir('session-1', '/');
+    useSftpStore.getState().clearSession('session-1');
+    rejectRequest({ code: 'SessionNotFound', detail: 'session-1' });
+    await request;
+
+    expect(useSftpStore.getState().getState('session-1')).toBeUndefined();
+  });
+
+  it('关闭中的会话终态进入有界近期传输记录', () => {
+    useSftpStore.getState().ensureState('session-1');
+    useSftpStore.getState().markSessionClosing('session-1');
+    useSftpStore.getState().applyFinishedTask(makeTransferTask({ status: 'Done' }));
+
+    expect(useSftpStore.getState().recentTransfers).toHaveLength(1);
+    expect(useSftpStore.getState().recentTransfers[0]?.status).toBe('Done');
   });
 
   it('打开会话时从后端权威快照恢复任务投影', async () => {

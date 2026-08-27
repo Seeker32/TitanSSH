@@ -1,6 +1,7 @@
 pub mod host;
 pub mod host_identity;
 pub mod monitor;
+pub mod process;
 pub mod session;
 pub mod sftp;
 

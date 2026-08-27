@@ -6,14 +6,21 @@ import { ConnectionPhase, SessionStatus } from '@/types/session';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, toAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
+import { longTaskProjection } from './long-task';
 import { useMonitorStore } from './monitor';
+import { useProcessStore } from './process';
 import { useSftpStore } from './sftp';
+import { emptyTabViewState, transitionTabViews, type TabId, type TabViewState } from './tab-view';
 
 interface SessionState {
   sessions: Map<string, SessionInfo>;
-  activeView: string | null;
+  /** 标签视图状态（ADR-0002）；标签引用会话但不拥有连接。 */
+  tabViews: TabViewState;
   /** 按 sessionId 存储的连接生命周期投影（阶段 + 结构化错误）；Connected/Disconnected 后清除。 */
   connections: Map<string, SessionConnection>;
+  /** 投影建立前到达的进度事件缓存（open_session 返回与首个 progress 事件的 IPC 竞态）；
+   *  openSession 建立投影时回放并清除，removeSessionProjection 一并丢弃。 */
+  pendingProgress: Map<string, SessionProgressEvent>;
   /** 按 sessionId 存储的主机身份确认投影；接受/拒绝后清除。 */
   hostKeyChallenges: Map<string, HostIdentityChallenge>;
   /** 按 sessionId 存储的"接受并保存"结构化失败；challenge 保持未决，改选或新 challenge 后清除。 */
@@ -22,7 +29,13 @@ interface SessionState {
   closeSession: (sessionId: string) => Promise<void>;
   writeTerminal: (sessionId: string, data: Uint8Array) => Promise<void>;
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
-  setActiveView: (viewId: string | null) => void;
+  /** 切换激活标签（视图选择状态，标签语义） */
+  setActiveTab: (tabId: TabId) => void;
+  /** 打开指定会话的进程纯视图；重复打开只激活既有标签。 */
+  openProcessTab: (sessionId: string) => void;
+  /** 关闭标签：终端标签是会话锚点，关闭即触发 close_session 完整 teardown；
+   *  纯视图标签（未来）仅移除自身，不影响会话生命周期 */
+  closeTab: (tabId: TabId) => Promise<void>;
   applySessionStatus: (payload: SessionStatusEvent) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
   applyHostIdentityChallenge: (payload: HostIdentityChallenge) => void;
@@ -90,47 +103,87 @@ function withoutHostKeyProjection(
 export const useSessionStore = create<SessionState>((set, get) => {
   return {
     sessions: new Map(),
-    activeView: null,
+    tabViews: emptyTabViewState,
     connections: new Map(),
+    pendingProgress: new Map(),
     hostKeyChallenges: new Map(),
     hostKeySaveErrors: new Map(),
 
-    /** 从前端投影移除会话及其关联状态；后端 teardown 由调用方保证。 */
+    /** 从前端投影移除会话及其关联状态（含引用该会话的全部标签）；后端 teardown 由调用方保证。 */
     removeSessionProjection(sessionId: string) {
+      longTaskProjection.invalidateSession(sessionId);
       set((state) => {
         const sessions = new Map(state.sessions);
         sessions.delete(sessionId);
         const connections = new Map(state.connections);
         connections.delete(sessionId);
+        const pendingProgress = new Map(state.pendingProgress);
+        pendingProgress.delete(sessionId);
         const projection = withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId);
-        return { sessions, connections, ...projection, activeView: state.activeView === sessionId ? null : state.activeView };
+        const tabViews = transitionTabViews(state.tabViews, sessions, { type: 'session-removed', sessionId }).state;
+        return {
+          sessions, connections, pendingProgress, tabViews, ...projection,
+        };
       });
       useMonitorStore.getState().clearSession(sessionId);
+      useProcessStore.getState().clearSession(sessionId);
       useSftpStore.getState().clearSession(sessionId);
     },
 
     /** 打开 SSH 会话，初始化文件传输并启动关联监控任务。 */
     async openSession(hostId) {
       const session = await invoke<SessionInfo>('open_session', { hostId });
-      set((state) => ({
-        sessions: new Map(state.sessions).set(session.sessionId, session),
-        activeView: session.sessionId,
-        connections: new Map(state.connections).set(session.sessionId, { phase: null, error: null }),
-      }));
+      set((state) => {
+        // 回放竞态期间缓存的进度事件：后端 worker 在 open_session 返回前
+        // 就可能已发出首个阶段事件，此时阶段不得丢回 null
+        const pendingPhase = state.pendingProgress.get(session.sessionId)?.phase ?? null;
+        const pendingProgress = new Map(state.pendingProgress);
+        pendingProgress.delete(session.sessionId);
+        const sessions = new Map(state.sessions).set(session.sessionId, session);
+        const tabViews = transitionTabViews(state.tabViews, sessions, {
+          type: 'session-opened', sessionId: session.sessionId, createdAt: Date.now(),
+        }).state;
+        return {
+          sessions,
+          tabViews,
+          connections: new Map(state.connections).set(session.sessionId, { phase: pendingPhase, error: null }),
+          pendingProgress,
+        };
+      });
+      useSftpStore.getState().ensureState(session.sessionId);
       void useSftpStore.getState().listDir(session.sessionId, '/');
       void useSftpStore.getState().loadTaskSnapshot(session.sessionId);
+      longTaskProjection.activateSession(session.sessionId);
       try {
         await useMonitorStore.getState().startMonitoring(session.sessionId);
       } catch {
         // 监控失败不阻断 SSH 主流程。
       }
+      if (!longTaskProjection.isSessionActive(session.sessionId)) return session;
+      try {
+        await useProcessStore.getState().startMonitoring(session.sessionId);
+      } catch {
+        // 进程采样失败不阻断 SSH 主流程。
+      }
       return session;
     },
 
-    /** 关闭 SSH 会话；后端统一 teardown，前端只清理 projection。 */
+    /** 关闭 SSH 会话：请求后端统一 teardown，无论后端结果如何都移除前端 projection。
+     *
+     * 连接失败（如凭据不存在）或断连后，终端工作线程退出时 TerminalExitGuard 已完成后端
+     * teardown，close_session 会返回 SessionNotFound —— 标签是纯视图，关闭视图是本地操作，
+     * 不得被后端会话状态阻塞；其他后端错误同样只记录诊断，不阻塞投影清理。
+     */
     async closeSession(sessionId) {
-      await invoke('close_session', { sessionId });
-      get().removeSessionProjection(sessionId);
+      useSftpStore.getState().markSessionClosing(sessionId);
+      try {
+        await invoke('close_session', { sessionId });
+      } catch (error) {
+        console.warn('[session] close_session rejected, removing projection anyway:', sessionId, error);
+      } finally {
+        get().removeSessionProjection(sessionId);
+        useSftpStore.getState().finishSessionClosing(sessionId);
+      }
     },
 
     /** 将原始终端输入作为 Tauri raw IPC payload 发送，避免 JSON 字符串编码。 */
@@ -145,9 +198,30 @@ export const useSessionStore = create<SessionState>((set, get) => {
       await invoke('resize_terminal', { sessionId, cols, rows });
     },
 
-    /** 切换当前会话视图；null 表示无会话（空态）。 */
-    setActiveView(activeView) {
-      set({ activeView });
+    /** 切换激活标签（标签语义的视图选择）；标签栏点击、视图切换共用。 */
+    setActiveTab(tabId) {
+      set((state) => {
+        const tabViews = transitionTabViews(state.tabViews, state.sessions, { type: 'activated', tabId }).state;
+        return tabViews === state.tabViews ? state : { tabViews };
+      });
+    },
+
+    /** 打开指定会话的进程纯视图，不启动或停止任何采样任务。 */
+    openProcessTab(sessionId) {
+      set((state) => {
+        const tabViews = transitionTabViews(state.tabViews, state.sessions, {
+          type: 'process-opened', sessionId, createdAt: Date.now(),
+        }).state;
+        return tabViews === state.tabViews ? state : { tabViews };
+      });
+    },
+
+    /** 关闭标签（ADR-0002）：终端标签是会话锚点，关闭即触发 close_session 完整
+     *  teardown（终端、SFTP、双采样、共享连接）；未知标签与非终端类型（未实现）均为无操作。 */
+    async closeTab(tabId) {
+      const transition = transitionTabViews(get().tabViews, get().sessions, { type: 'close-requested', tabId });
+      if (transition.state !== get().tabViews) set({ tabViews: transition.state });
+      if (transition.effect) await get().closeSession(transition.effect.sessionId);
     },
 
     /** 应用后端权威会话状态；投影仅更新所属 session，Connected/Disconnected 后清除。 */
@@ -175,10 +249,18 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }));
     },
 
-    /** 仅在连接中应用阶段诊断信息，且只写入所属 session。 */
+    /** 仅在连接中应用阶段诊断信息；投影未建立时缓存待回放，而不是丢弃。 */
     applySessionProgress(payload) {
       const current = get().sessions.get(payload.sessionId);
-      if (current?.status !== SessionStatus.Connecting) return;
+      if (!current) {
+        // open_session 返回前 worker 已发出首个进度事件（IPC 竞态）：
+        // 缓存最新一条，投影建立时回放，避免标签永远显示通用“正在连接”
+        set((state) => ({
+          pendingProgress: new Map(state.pendingProgress).set(payload.sessionId, payload),
+        }));
+        return;
+      }
+      if (current.status !== SessionStatus.Connecting) return;
       set((state) => ({
         connections: new Map(state.connections).set(payload.sessionId, { phase: payload.phase, error: null }),
       }));

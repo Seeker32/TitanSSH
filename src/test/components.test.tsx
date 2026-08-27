@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import FileExplorer from '@/components/sftp/FileExplorer';
+import RecentTransfers from '@/components/sftp/RecentTransfers';
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
 import { groupHosts } from '@/stores/host';
@@ -13,9 +14,10 @@ import TerminalTabs from '@/components/terminal/TerminalTabs';
 import HostIdentityCard from '@/components/terminal/HostIdentityCard';
 import TransferQueue from '@/components/sftp/TransferQueue';
 import { AuthType } from '@/types/host';
-import { ConnectionPhase, SessionStatus, type HostIdentityChallenge } from '@/types/session';
+import { ConnectionPhase, SessionStatus, type HostIdentityChallenge, type SessionInfo } from '@/types/session';
 import { useLocaleStore } from '@/stores/locale';
-import { makeHost, makeRemoteDir, makeRemoteEntry, makeSession, makeSnapshot, makeTransferTask } from './fixtures';
+import { makeHost, makeRemoteDir, makeRemoteEntry, makeSession, makeSnapshot, makeTabViewState, makeTransferTask } from './fixtures';
+import { projectTabViews } from '@/stores/tab-view';
 
 vi.mock('@/components/terminal/XtermView', () => ({
   default: ({ sessionId, active, interactive }: { sessionId: string; active: boolean; interactive?: boolean }) => (
@@ -23,7 +25,27 @@ vi.mock('@/components/terminal/XtermView', () => ({
   ),
 }));
 
+/** 由会话列表推导 TerminalPane 的标签视图 props：每会话恰好一个终端标签，激活标签指定显隐 */
+function paneView(sessions: SessionInfo[], activeSessionId: string | null) {
+  const sessionMap = new Map(sessions.map((session) => [session.sessionId, session]));
+  const state = makeTabViewState(sessions, activeSessionId ?? undefined);
+  return { terminals: projectTabViews(state, sessionMap, 'zh-CN').terminals };
+}
+
 describe('React components', () => {
+  it('近期传输默认折叠，展开显示终态并可清空', async () => {
+    const user = userEvent.setup();
+    const onClear = vi.fn();
+    render(<RecentTransfers tasks={[makeTransferTask({ status: 'Failed', error: { code: 'SftpTransferError', detail: 'closed' } })]} onClear={onClear} />);
+
+    expect(screen.queryByText('syslog')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /近期传输/ }));
+    expect(screen.getByText('syslog')).toBeInTheDocument();
+    expect(screen.getByText('失败')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /清空近期记录/ }));
+    expect(onClear).toHaveBeenCalledOnce();
+  });
+
   it('侧栏主机卡片渲染服务器图标，单击选中、双击连接', async () => {
     const user = userEvent.setup();
     const handlers = { onSearchChange: vi.fn(), onSelect: vi.fn(), onOpen: vi.fn(), onCreate: vi.fn() };
@@ -132,22 +154,24 @@ describe('React components', () => {
     expect(groupHosts([makeHost({ group: '' })])).toEqual([{ name: '', hosts: [makeHost({ group: '' })] }]);
   });
 
-  it('终端标签仅渲染会话，激活切换并关闭', async () => {
+  it('终端标签从标签列表渲染：标签引用会话、按 tabId 激活与关闭', async () => {
     const user = userEvent.setup();
     const activate = vi.fn();
     const close = vi.fn();
-    render(<TerminalTabs sessions={[makeSession({ status: SessionStatus.Connected })]} activeView="session-1" onActivate={activate} onClose={close} />);
+    const session = makeSession({ status: SessionStatus.Connected });
+    render(<TerminalTabs items={projectTabViews(makeTabViewState([session]), new Map([['session-1', session]]), 'zh-CN').strip}
+      onActivate={activate} onClose={close} />);
     expect(screen.getAllByRole('tab')).toHaveLength(1);
     expect(screen.queryByText('首页')).not.toBeInTheDocument();
     expect(document.querySelector('.dot-connected')).toBeInTheDocument();
     await user.click(screen.getByText('root@10.0.0.8'));
     await user.click(screen.getByLabelText('关闭 root@10.0.0.8'));
-    expect(activate).toHaveBeenCalledWith('session-1');
-    expect(close).toHaveBeenCalledWith('session-1');
+    expect(activate).toHaveBeenCalledWith('terminal:session-1');
+    expect(close).toHaveBeenCalledWith('terminal:session-1');
   });
 
-  it('终端面板保留每个会话实例，仅展示当前视图', () => {
-    render(<TerminalPane sessions={[makeSession(), makeSession({ sessionId: 'session-2' })]} activeView="session-2"
+  it('终端面板按终端标签保留每个会话实例，仅展示激活标签的会话', () => {
+    render(<TerminalPane {...paneView([makeSession(), makeSession({ sessionId: 'session-2' })], 'session-2')}
       connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     const terminals = screen.getAllByTestId('xterm');
     expect(terminals).toHaveLength(2);
@@ -157,14 +181,14 @@ describe('React components', () => {
 
   it('无会话时终端面板显示空态页并可新建主机', () => {
     const onCreateHost = vi.fn();
-    render(<TerminalPane sessions={[]} activeView={null} connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
+    render(<TerminalPane {...paneView([], null)} connections={new Map()} challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={onCreateHost} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByText(/选择左侧主机/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '新建主机' }));
     expect(onCreateHost).toHaveBeenCalledOnce();
   });
 
   it('连接中的会话在终端区域显示加载动画与当前阶段', () => {
-    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    render(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
       challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     const overlay = screen.getByRole('status');
@@ -179,23 +203,21 @@ describe('React components', () => {
   it('连接失败的会话显示结构化错误且仅提供关闭标签操作', async () => {
     const user = userEvent.setup();
     const onCloseTab = vi.fn();
-    render(<TerminalPane sessions={[makeSession({ status: SessionStatus.Error })]} activeView="session-1"
+    render(<TerminalPane {...paneView([makeSession({ status: SessionStatus.Error })], 'session-1')}
       connections={new Map([['session-1', { phase: null, error: { code: 'SshConnectionError', detail: 'connection refused' } }]])}
       challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={onCloseTab}
       onSaveIdentity={vi.fn()} saveErrors={new Map()} />);
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('SSH 连接失败: connection refused');
     await user.click(screen.getByRole('button', { name: '关闭标签' }));
-    expect(onCloseTab).toHaveBeenCalledWith('session-1');
+    expect(onCloseTab).toHaveBeenCalledWith('terminal:session-1');
   });
 
   it('两个会话各自呈现连接阶段且互不覆盖，非当前标签不抢占焦点', () => {
-    render(<TerminalPane
-      sessions={[
-        makeSession({ sessionId: 'session-1' }),
-        makeSession({ sessionId: 'session-2', status: SessionStatus.AuthFailed }),
-      ]}
-      activeView="session-1"
+    render(<TerminalPane {...paneView([
+      makeSession({ sessionId: 'session-1' }),
+      makeSession({ sessionId: 'session-2', status: SessionStatus.AuthFailed }),
+    ], 'session-1')}
       connections={new Map([
         ['session-1', { phase: ConnectionPhase.ConnectingTcp, error: null }],
         ['session-2', { phase: null, error: null }],
@@ -209,12 +231,12 @@ describe('React components', () => {
   });
 
   it('连接中切换语言后覆盖层文案即时更新', () => {
-    const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    const { rerender } = render(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
       challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('status')).toHaveTextContent('正在进行 SSH 握手...');
     act(() => useLocaleStore.setState({ locale: 'en-US' }));
-    rerender(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    rerender(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
       challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
@@ -230,7 +252,7 @@ describe('React components', () => {
       challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 2222,
       keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD', timestamp: 1_710_000_000_000,
     };
-    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    render(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
       challenges={new Map([['session-1', challenge]])}
       onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
@@ -259,7 +281,7 @@ describe('React components', () => {
       challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
       keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
     };
-    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    render(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.VerifyingHostKey, error: null }]])}
       challenges={new Map([['session-1', challenge]])}
       saveErrors={new Map([['session-1', { code: 'HostKeySaveFailed', detail: 'write denied' }]])}
@@ -283,7 +305,7 @@ describe('React components', () => {
       challengeId: 'challenge-1', sessionId: 'session-1', host: '10.0.0.8', port: 22,
       keyAlgorithm: 'ssh-ed25519', fingerprint: 'SHA256:abc', timestamp: 1_710_000_000_000,
     };
-    render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    render(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.Authenticating, error: null }]])}
       challenges={new Map([['session-1', challenge]])}
       onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()}
@@ -406,11 +428,11 @@ describe('React components', () => {
   it('英文环境下连接阶段与失败操作使用英文文案', async () => {
     const user = userEvent.setup();
     act(() => useLocaleStore.setState({ locale: 'en-US' }));
-    const { rerender } = render(<TerminalPane sessions={[makeSession()]} activeView="session-1"
+    const { rerender } = render(<TerminalPane {...paneView([makeSession()], 'session-1')}
       connections={new Map([['session-1', { phase: ConnectionPhase.SshHandshake, error: null }]])}
       challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('status')).toHaveTextContent('Performing SSH handshake...');
-    rerender(<TerminalPane sessions={[makeSession({ status: SessionStatus.Timeout })]} activeView="session-1"
+    rerender(<TerminalPane {...paneView([makeSession({ status: SessionStatus.Timeout })], 'session-1')}
       connections={new Map([['session-1', { phase: null, error: null }]])}
       challenges={new Map()} onInput={vi.fn()} onResize={vi.fn()} onCreateHost={vi.fn()} onCloseTab={vi.fn()} onSaveIdentity={vi.fn()} saveErrors={new Map()} onAcceptIdentity={vi.fn()} onRejectIdentity={vi.fn()} />);
     expect(screen.getByRole('alert')).toHaveTextContent('Connection timed out');
@@ -447,6 +469,21 @@ describe('React components', () => {
     expect(screen.queryByText(/^Updated:/)).not.toBeInTheDocument();
   });
 
+  it('内存指标同时显示已用与总量的字节数，缺失时降级为未知', () => {
+    const { rerender } = render(<ServerStatusPanel snapshot={makeSnapshot({
+      memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+      memoryTotalBytes: 8 * 1024 * 1024 * 1024,
+    })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText(/已用 2.0 GB \/ 总量 8.0 GB/)).toBeInTheDocument();
+
+    // 后端未上报（旧后端）或采集缺失时不得伪造 0 B，显示未知
+    rerender(<ServerStatusPanel snapshot={makeSnapshot({
+      memoryUsedBytes: null,
+      memoryTotalBytes: null,
+    })} collapsed={false} onToggle={vi.fn()} />);
+    expect(screen.getByText(/已用 -- \/ 总量 --/)).toBeInTheDocument();
+  });
+
   it('指标缺失时显示未知（--）而非伪造 0%', () => {
     render(<ServerStatusPanel snapshot={makeSnapshot({
       cpuUsage: null,
@@ -454,6 +491,8 @@ describe('React components', () => {
       diskUsage: null,
       diskAvailableBytes: null,
       diskTotalBytes: null,
+      memoryUsedBytes: null,
+      memoryTotalBytes: null,
     })} collapsed={false} onToggle={vi.fn()} />);
     expect(screen.getAllByText('--')).toHaveLength(3);
     expect(screen.queryByText('0.0%')).not.toBeInTheDocument();

@@ -54,6 +54,10 @@ pub struct TerminalDataEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatusEvent {
     pub task_id: String,
+    /// 采样任务类型，用于前端按结构化归属路由事件。
+    pub task_type: String,
+    /// 采样任务所属 Runtime Session。
+    pub session_id: String,
     pub status: crate::models::monitor::TaskStatus,
     /// 可选的语言无关错误。
     pub error: Option<AppErrorInfo>,

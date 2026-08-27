@@ -1,4 +1,5 @@
 use crate::core::host_identity::HostKeyVerifier;
+use crate::core::shared_exec_registry::SharedExecRegistry;
 use crate::core::ssh_transport;
 use crate::core::ssh_transport::ExecTransport;
 use crate::errors::app_error::AppError;
@@ -85,24 +86,25 @@ pub struct MonitorLoopParams {
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// 监控采集主循环（可注入 connect_fn，便于单元测试）
+/// 监控采集主循环（可注入连接解析函数，便于单元测试）
 ///
-/// 在调用方线程内运行，持有独立 SSH 长连接，每 2 秒采集一次快照。
-/// 连接失败或采集出错时调用 on_error 后退出，不自动重连。
+/// 在调用方线程内运行，每 2 秒采集一次快照。
+/// 连接解析失败或采集出错时调用 on_error 后退出，不自动重连。
 /// params.shutdown 为 true 时正常退出，不调用 on_error。
 ///
 /// # 参数
-/// - `connect_fn`: SSH 连接函数，可注入 mock 供测试使用
+/// - `resolve_fn`: 共享连接解析函数；生产实现从共享 exec 注册表按 sessionId
+///   解析（缺失时建立），测试注入内存实现（不感知注册表存在）
 /// - `params`: 循环输入参数（主机配置、运行时凭据、会话 ID、关闭标志）
 /// - `on_snapshot`: 采集成功回调
 /// - `on_error`: 采集失败回调，调用后循环退出
-pub fn run_monitor_loop_with<ConnFn>(
-    connect_fn: ConnFn,
+pub fn run_monitor_loop_with<ResolveFn>(
+    resolve_fn: ResolveFn,
     params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) where
-    ConnFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<ExecTransport, AppError>,
+    ResolveFn: FnOnce(&HostConfig, Option<&str>, Option<&str>) -> Result<ExecTransport, AppError>,
 {
     let MonitorLoopParams {
         host,
@@ -117,13 +119,13 @@ pub fn run_monitor_loop_with<ConnFn>(
     // 保存上一轮网卡累计计数，用于根据真实采样间隔计算速率。
     let mut previous_network_sample = None;
 
-    // shutdown 预先为 true 时直接退出，不建立连接
+    // shutdown 预先为 true 时直接退出，不解析连接
     if shutdown.load(Ordering::Relaxed) {
         return;
     }
 
-    // 建立独立 SSH 连接
-    let mut transport = match connect_fn(&host, password.as_deref(), passphrase.as_deref()) {
+    // 从注入的解析函数取得共享 SSH 连接
+    let mut transport = match resolve_fn(&host, password.as_deref(), passphrase.as_deref()) {
         Ok(transport) => transport,
         Err(err) => {
             on_error(err);
@@ -131,7 +133,7 @@ pub fn run_monitor_loop_with<ConnFn>(
         }
     };
 
-    // 采集循环：每 2 秒开新 channel 执行脚本
+    // 采集循环：每 2 秒在共享连接上开新 channel 执行脚本
     while !shutdown.load(Ordering::Relaxed) {
         match collect_once(
             &mut transport,
@@ -160,19 +162,26 @@ pub fn run_monitor_loop_with<ConnFn>(
     }
 }
 
-/// 监控采集主循环（使用真实 ssh transport）
+/// 监控采集主循环（使用共享 exec 注册表解析连接）
 ///
 /// 是 run_monitor_loop_with 的薄包装，生产代码使用此函数。
-/// 监控连接与其他 capability 一样经过主机身份统一校验：握手后、认证前生效。
+/// 连接来源是共享 exec 连接注册表（按 sessionId 键，缺失时建立并插入）：
+/// 同一会话的监控与其他采样服务共用一条传输连接，session teardown 时回收。
+/// 共享连接与其他 capability 一样经统一主机身份校验：握手后、认证前生效；
+/// 连接断开时 execute 失败并经 on_error 上抛（任务侧转 Failed，共享命运）。
 pub fn run_monitor_loop(
+    exec_registry: SharedExecRegistry,
     verifier: HostKeyVerifier,
     params: MonitorLoopParams,
     on_snapshot: impl Fn(MonitorSnapshot) + Send + 'static,
     on_error: impl Fn(AppError) + Send + 'static,
 ) {
+    let session_key = params.session_id.clone();
     run_monitor_loop_with(
         move |host, password, passphrase| {
-            ssh_transport::connect_exec(host, password, passphrase, &verifier)
+            exec_registry.resolve(&session_key, || {
+                ssh_transport::connect_shared_exec(host, password, passphrase, &verifier)
+            })
         },
         params,
         on_snapshot,
@@ -293,6 +302,8 @@ fn parse_snapshot_at(
     let current_cpu_sample = cpu_total.zip(cpu_idle);
     let cpu_usage = compute_cpu_usage(previous_cpu_sample, current_cpu_sample);
     let memory_usage = resolve_memory_usage(memory_total_kb, memory_available_kb);
+    let (memory_total_bytes, memory_used_bytes) =
+        resolve_memory_sizes(memory_total_kb, memory_available_kb);
     let current_network_sample = network_available.then_some(NetworkSample {
         timestamp,
         interfaces: network_interfaces,
@@ -316,6 +327,8 @@ fn parse_snapshot_at(
             timestamp,
             cpu_usage,
             memory_usage,
+            memory_total_bytes,
+            memory_used_bytes,
             disk_usage,
             disk_available_bytes,
             disk_total_bytes,
@@ -445,13 +458,31 @@ fn resolve_memory_usage(total_kb: Option<f64>, available_kb: Option<f64>) -> Opt
     Some((used_ratio * 10.0).round() / 10.0)
 }
 
+/// 根据 /proc/meminfo 的原始字段，计算内存总量与已用量的字节表示。
+///
+/// 未知语义与 `resolve_memory_usage` 完全一致：MemTotal 或 MemAvailable
+/// 任一缺失/非法、总量非正时两者均返回 None；MemAvailable 超出总量时
+/// 已用钉在 0 字节，不产生负数或 u64 回绕。KB 按四舍五入换算为字节。
+fn resolve_memory_sizes(
+    total_kb: Option<f64>,
+    available_kb: Option<f64>,
+) -> (Option<u64>, Option<u64>) {
+    match (total_kb, available_kb) {
+        (Some(total), Some(available)) if total > 0.0 => {
+            let total_bytes = (total * 1024.0).round() as u64;
+            let used_bytes = ((total - available).max(0.0) * 1024.0).round() as u64;
+            (Some(total_bytes), Some(used_bytes))
+        }
+        _ => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         NetworkSample, STATUS_SCRIPT, build_collect_command, compute_cpu_usage,
         compute_network_rates, parse_snapshot_at,
     };
-    use crate::errors::app_error::AppError;
 
     /// 验证 parse_snapshot 能正确解析原始脚本输出，并由 Rust 计算内存与磁盘指标
     #[test]
@@ -462,6 +493,16 @@ mod tests {
         assert_eq!(snap.session_id, "session-1");
         assert_eq!(snap.cpu_usage, None);
         assert!((snap.memory_usage.unwrap() - 42.3).abs() < 0.01);
+        assert_eq!(
+            snap.memory_total_bytes,
+            Some(1000 * 1024),
+            "内存总量应由 MemTotal KB 换算为字节"
+        );
+        assert_eq!(
+            snap.memory_used_bytes,
+            Some((1000 - 577) * 1024),
+            "内存已用应为 MemTotal-MemAvailable 差值的字节表示"
+        );
         assert!((snap.disk_usage.unwrap() - 65.0).abs() < f64::EPSILON);
         assert_eq!(snap.disk_available_bytes, Some(137_438_953_472));
         assert_eq!(snap.disk_total_bytes, Some(549_755_813_888));
@@ -500,6 +541,11 @@ mod tests {
             snap.memory_usage, None,
             "MemAvailable 缺失时应为未知，不得误报为 100% 已用"
         );
+        assert_eq!(
+            snap.memory_total_bytes, None,
+            "MemAvailable 缺失时内存总量同样未知，不得只报百分比未知"
+        );
+        assert_eq!(snap.memory_used_bytes, None);
     }
 
     /// 验证 MemTotal 缺失时内存使用率同样为未知，失败模式与 available 缺失一致。
@@ -509,6 +555,8 @@ mod tests {
         let (snap, _, _) =
             parse_snapshot_at("session-3", raw, None, None, 2_000).expect("应能解析快照");
         assert_eq!(snap.memory_usage, None);
+        assert_eq!(snap.memory_total_bytes, None);
+        assert_eq!(snap.memory_used_bytes, None);
     }
 
     /// 验证 parse_snapshot 在仅收到内存总量/可用量时，仍能推导出内存使用率
@@ -518,6 +566,20 @@ mod tests {
         let (snap, _, _) = parse_snapshot_at("session-3", raw, None, None, 2_000)
             .expect("应能从 meminfo 字段推导内存占用");
         assert!((snap.memory_usage.unwrap() - 75.0).abs() < 0.01);
+        assert_eq!(snap.memory_total_bytes, Some(1000 * 1024));
+        assert_eq!(snap.memory_used_bytes, Some(750 * 1024));
+    }
+
+    /// 验证 MemAvailable 超出 MemTotal 时已用字节按 0 钉住，
+    /// 与使用率的 clamp 语义一致，不产生负数或回绕值。
+    #[test]
+    fn parse_snapshot_clamps_used_bytes_to_zero_when_available_exceeds_total() {
+        let raw = "MEM_TOTAL_KB=1000\nMEM_AVAILABLE_KB=1500\nDISK=65";
+        let (snap, _, _) =
+            parse_snapshot_at("session-3", raw, None, None, 2_000).expect("应能解析快照");
+        assert_eq!(snap.memory_usage, Some(0.0));
+        assert_eq!(snap.memory_total_bytes, Some(1000 * 1024));
+        assert_eq!(snap.memory_used_bytes, Some(0));
     }
 
     /// 验证 parse_snapshot 在有上一轮 CPU 原始计数时能计算本轮 CPU 使用率

@@ -1,6 +1,9 @@
+import { Alert, Button, Empty, Spin, Table } from 'antd';
+import type { TableProps } from 'antd';
 import { formatAppError, translate, type TranslationKey } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
 import { useTrustedHostsStore } from '@/stores/trusted-hosts';
+import type { TrustedHostInfo } from '@/types/host-identity';
 
 interface Props {
   /** 重试读取信任记录（由页面在进入该区域时触发加载，本节只负责渲染状态）。 */
@@ -29,7 +32,7 @@ export default function TrustedHostsSection({ onRetry }: Props) {
   if (status === 'idle' || status === 'loading') {
     return (
       <div className="trusted-hosts-state" data-testid="trusted-hosts-loading">
-        <span className="spinner" />
+        <Spin size="small" />
         {t('settings.trustedHosts.loading')}
       </div>
     );
@@ -37,42 +40,34 @@ export default function TrustedHostsSection({ onRetry }: Props) {
   if (status === 'error') {
     return (
       <div className="trusted-hosts-state trusted-hosts-state--error" data-testid="trusted-hosts-error" role="alert">
-        <p>{t('settings.trustedHosts.loadFailed')}</p>
-        <p className="trusted-hosts-state__detail">{formatAppError(locale, error)}</p>
-        <button type="button" data-testid="trusted-hosts-retry" onClick={onRetry}>
-          {t('settings.trustedHosts.retry')}
-        </button>
+        <Alert type="error" showIcon title={t('settings.trustedHosts.loadFailed')}
+          description={<>
+            <p className="trusted-hosts-state__detail">{formatAppError(locale, error)}</p>
+            <Button size="small" data-testid="trusted-hosts-retry" onClick={onRetry}>
+              {t('settings.trustedHosts.retry')}
+            </Button>
+          </>} />
       </div>
     );
   }
   if (hosts.length === 0) {
     return (
       <div className="trusted-hosts-state" data-testid="trusted-hosts-empty">
-        {t('settings.trustedHosts.empty')}
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('settings.trustedHosts.empty')} />
       </div>
     );
   }
+  const columns: TableProps<TrustedHostInfo>['columns'] = [
+    { title: t('hostIdentity.endpoint'), key: 'endpoint', render: (_, host) => <span className="trusted-hosts__mono">{endpointLabel(host.host, host.port)}</span> },
+    { title: t('hostIdentity.algorithm'), dataIndex: 'algorithm', key: 'algorithm', className: 'trusted-hosts__mono' },
+    { title: t('hostIdentity.fingerprint'), dataIndex: 'fingerprint', key: 'fingerprint', className: 'trusted-hosts__mono' },
+  ];
   return (
     <div className="trusted-hosts" data-testid="trusted-hosts-list">
       <p className="trusted-hosts__hint">{t('settings.trustedHosts.readOnlyHint')}</p>
-      <table className="trusted-hosts__table">
-        <thead>
-          <tr>
-            <th scope="col">{t('hostIdentity.endpoint')}</th>
-            <th scope="col">{t('hostIdentity.algorithm')}</th>
-            <th scope="col">{t('hostIdentity.fingerprint')}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {hosts.map((host) => (
-            <tr key={`${host.host}:${host.port}`} data-testid={`trusted-host-row-${host.host}-${host.port}`}>
-              <td className="trusted-hosts__mono">{endpointLabel(host.host, host.port)}</td>
-              <td className="trusted-hosts__mono">{host.algorithm}</td>
-              <td className="trusted-hosts__mono">{host.fingerprint}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <Table<TrustedHostInfo> className="trusted-hosts__table" rowKey={(host) => `${host.host}:${host.port}`}
+        dataSource={hosts} columns={columns} pagination={false} size="small"
+        onRow={(host) => ({ 'data-testid': `trusted-host-row-${host.host}-${host.port}` } as ReturnType<NonNullable<TableProps<TrustedHostInfo>['onRow']>>)} />
     </div>
   );
 }

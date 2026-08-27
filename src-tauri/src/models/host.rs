@@ -123,9 +123,13 @@ mod tests {
             port: 22,
             username: "ops".to_string(),
             auth_type: AuthType::PrivateKey,
-            password: Some(CredentialInput::Set("password-should-not-appear".to_string())),
+            password: Some(CredentialInput::Set(
+                "password-should-not-appear".to_string(),
+            )),
             private_key_path: Some("/keys/production".to_string()),
-            passphrase: Some(CredentialInput::Set("passphrase-should-not-appear".to_string())),
+            passphrase: Some(CredentialInput::Set(
+                "passphrase-should-not-appear".to_string(),
+            )),
             remark: None,
             group: "production".to_string(),
         };

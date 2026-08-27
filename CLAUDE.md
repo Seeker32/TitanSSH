@@ -4,7 +4,7 @@ Tauri + React 19 + TS(strict) + event-driven desktop DevOps client: SSH, File Tr
 
 ## Architecture (non-negotiable)
 
-- **Session ≠ UI**: session = runtime entity; tab = view only. Tab never owns the connection
+- **Session ≠ UI**: session = runtime entity; tab = view only. Tab never owns the connection; the terminal tab is the session anchor (closing it triggers full session teardown), other tabs are pure views. See docs/adr/0002-tab-view-model.md
 - **View-only frontend**: never parse shell output in React; Rust returns structured JSON only
 - **Communication**: invoke = request/response, event = streaming; typed, structured, version-safe
 - **Services**: terminal_service / sftp_service / monitor_service / process_service. No god service

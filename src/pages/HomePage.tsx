@@ -6,14 +6,18 @@ import { LOG_LEVELS, useLogLevelStore, type LogLevel } from '@/stores/log-level'
 import HostEditorDialog from '@/components/host/HostEditorDialog';
 import HostListSidebar from '@/components/host/HostListSidebar';
 import SftpPanel from '@/components/sftp/SftpPanel';
+import RecentTransfers from '@/components/sftp/RecentTransfers';
 import ServerStatusPanel from '@/components/status/ServerStatusPanel';
 import TerminalPane from '@/components/terminal/TerminalPane';
 import TerminalTabs from '@/components/terminal/TerminalTabs';
 import TrustedHostsSection from '@/components/settings/TrustedHostsSection';
 import LogViewer from '@/components/settings/LogViewer';
+import ProcessTabPane from '@/components/process/ProcessTabPane';
 import { filterHosts, useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
+import { longTaskProjection, useLongTask } from '@/stores/long-task';
 import { useMonitorStore } from '@/stores/monitor';
+import { useProcessStore } from '@/stores/process';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useThemeStore } from '@/stores/theme';
@@ -21,6 +25,7 @@ import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { useTrustedHostsStore } from '@/stores/trusted-hosts';
 import { translate, toAppError, type AppErrorInfo } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
+import { projectTabViews } from '@/stores/tab-view';
 import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
 import { uploadTargetDir, type TransferTask } from '@/types/sftp';
@@ -31,21 +36,29 @@ export default function HomePage() {
   const searchQuery = useHostStore((state) => state.searchQuery);
   const selectedHostId = useHostStore((state) => state.selectedHostId);
   const sessionsMap = useSessionStore((state) => state.sessions);
-  const activeView = useSessionStore((state) => state.activeView);
+  const tabViews = useSessionStore((state) => state.tabViews);
   const connections = useSessionStore((state) => state.connections);
   const hostKeyChallenges = useSessionStore((state) => state.hostKeyChallenges);
   const hostKeySaveErrors = useSessionStore((state) => state.hostKeySaveErrors);
   const monitorSnapshots = useMonitorStore((state) => state.snapshots);
-  const selectedInterfaceName = useMonitorStore((state) => activeView === null ? null : state.selectedInterfaces.get(activeView) ?? null);
-  const trendSamples = useMonitorStore((state) => activeView === null ? undefined : state.networkTrends.get(activeView));
+  const processSnapshots = useProcessStore((state) => state.snapshots);
+  const processSortMode = useProcessStore((state) => state.sortMode);
   const sftpStates = useSftpStore((state) => state.sessionStates);
+  const recentTransfers = useSftpStore((state) => state.recentTransfers);
   const sidebarWidth = useLayoutStore((state) => state.sidebarWidth);
   const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
   const monitorCollapsed = useLayoutStore((state) => state.monitorCollapsed);
   const theme = useThemeStore((state) => state.theme);
-  const sessions = useMemo(() => [...sessionsMap.values()], [sessionsMap]);
-  const snapshot = activeView === null ? null : monitorSnapshots.get(activeView) ?? null;
-  const sftpState = activeView === null ? null : sftpStates.get(activeView) ?? null;
+  const locale = useLocaleStore((state) => state.locale);
+  const tabProjection = useMemo(() => projectTabViews(tabViews, sessionsMap, locale), [tabViews, sessionsMap, locale]);
+  const activeSessionId = tabProjection.activeSessionId;
+  const selectedInterfaceName = useMonitorStore((state) => activeSessionId === null ? null : state.selectedInterfaces.get(activeSessionId) ?? null);
+  const trendSamples = useMonitorStore((state) => activeSessionId === null ? undefined : state.networkTrends.get(activeSessionId));
+  const snapshot = activeSessionId === null ? null : monitorSnapshots.get(activeSessionId) ?? null;
+  const processSnapshot = activeSessionId === null ? null : processSnapshots.get(activeSessionId) ?? null;
+  const monitorTask = useLongTask('monitor', activeSessionId);
+  const processTask = useLongTask('process', activeSessionId);
+  const sftpState = activeSessionId === null ? null : sftpStates.get(activeSessionId) ?? null;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
   /** 最近一次主机保存失败的结构化错误；在编辑弹窗内展示，保存成功后清空 */
@@ -77,7 +90,9 @@ export default function HomePage() {
     window.addEventListener('resize', resize);
     resize();
     useSessionStore.getState().initListeners().then(keep);
+    longTaskProjection.initListener().then(keep);
     useMonitorStore.getState().initListeners().then(keep);
+    useProcessStore.getState().initListeners().then(keep);
     useSftpStore.getState().initListeners().then(keep);
     useHostStore.getState().loadHosts();
     return () => {
@@ -93,11 +108,6 @@ export default function HomePage() {
   /** 打开指定主机的 SSH 会话。 */
   async function openSession(hostId: string) {
     await useSessionStore.getState().openSession(hostId);
-  }
-
-  /** 关闭 SSH 会话：标签栏与终端错误覆盖层共用同一入口。 */
-  async function closeSession(sessionId: string) {
-    await useSessionStore.getState().closeSession(sessionId);
   }
 
   /** 打开新建主机表单。 */
@@ -198,11 +208,16 @@ export default function HomePage() {
         onSearchChange={(query) => useHostStore.getState().setSearchQuery(query)}
         onSelect={(hostId) => useHostStore.getState().selectHost(hostId)}
         onOpen={openSession} onCreate={createHost} />
+      <RecentTransfers tasks={recentTransfers} onClear={() => useSftpStore.getState().clearRecentTransfers()} />
       <div className="sidebar-footer">
         {monitorCollapsed ? (
           <div className="sidebar-footer-row">
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
-              onInterfaceChange={(name) => activeView && useMonitorStore.getState().selectNetworkInterface(activeView, name)}
+              processSnapshot={processSnapshot} processSortMode={processSortMode}
+              monitorTask={monitorTask} processTask={processTask}
+              onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
+              onOpenProcess={activeSessionId === null ? undefined : () => useSessionStore.getState().openProcessTab(activeSessionId)}
+              onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
             <FooterActions theme={theme} />
@@ -210,7 +225,11 @@ export default function HomePage() {
         ) : (
           <>
             <ServerStatusPanel snapshot={snapshot} selectedInterfaceName={selectedInterfaceName}
-              onInterfaceChange={(name) => activeView && useMonitorStore.getState().selectNetworkInterface(activeView, name)}
+              processSnapshot={processSnapshot} processSortMode={processSortMode}
+              monitorTask={monitorTask} processTask={processTask}
+              onProcessSortModeChange={(mode) => useProcessStore.getState().setSortMode(mode)}
+              onOpenProcess={activeSessionId === null ? undefined : () => useSessionStore.getState().openProcessTab(activeSessionId)}
+              onInterfaceChange={(name) => activeSessionId && useMonitorStore.getState().selectNetworkInterface(activeSessionId, name)}
               trendSamples={trendSamples}
               collapsed={false} onToggle={() => useLayoutStore.getState().toggleMonitorCollapsed()} />
             <div className="sidebar-footer-row sidebar-footer-row--right"><FooterActions theme={theme} /></div>
@@ -219,26 +238,27 @@ export default function HomePage() {
       </div>
     </aside>
     <section className="main-panel">
-      {sessions.length > 0 && <div className="tabs-area"><TerminalTabs sessions={sessions} activeView={activeView}
-        onActivate={(view) => useSessionStore.getState().setActiveView(view)}
-        onClose={closeSession} /></div>}
+      {tabProjection.strip.length > 0 && <div className="tabs-area"><TerminalTabs items={tabProjection.strip}
+        onActivate={(tabId) => useSessionStore.getState().setActiveTab(tabId)}
+        onClose={(tabId) => useSessionStore.getState().closeTab(tabId)} /></div>}
       <div className="content-area">
-        <TerminalPane sessions={sessions} activeView={activeView} connections={connections}
+        <div className="terminal-surface" hidden={tabProjection.active.kind === 'process'}><TerminalPane terminals={tabProjection.terminals} connections={connections}
           challenges={hostKeyChallenges} saveErrors={hostKeySaveErrors}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
           onCreateHost={createHost}
-          onCloseTab={closeSession}
+          onCloseTab={(tabId) => useSessionStore.getState().closeTab(tabId)}
           onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
           onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
-          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />
-        {activeView !== null && <SftpPanel sessionId={activeView} state={sftpState}
+          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} /></div>
+        {tabProjection.active.kind === 'process' && <ProcessTabPane snapshot={processSnapshot} />}
+        {activeSessionId !== null && <SftpPanel sessionId={activeSessionId} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}
           onDownload={download} onUpload={upload}
-          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeView)} onRetry={retry}
+          onCancel={(taskId) => useSftpStore.getState().cancelTask(taskId, activeSessionId)} onRetry={retry}
           onOverwrite={overwrite}
-          onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeView)} />}
+          onClearTerminal={() => useSftpStore.getState().clearTerminalTasks(activeSessionId)} />}
       </div>
     </section>
     <HostEditorDialog open={editorOpen} editingHost={editingHost} saveError={editorError} groups={useMemo(

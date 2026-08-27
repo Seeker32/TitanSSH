@@ -18,6 +18,11 @@ use tauri::{AppHandle, Emitter, Runtime};
 /// SSH 连接阶段总超时时间（含 TCP、握手、认证），作为 libssh2 阻塞场景的外层兜底
 const CONNECT_TOTAL_TIMEOUT_SECS: u64 = 15;
 
+/// 凭据读取独立预算：首次访问系统钥匙串可能弹授权框等待用户，
+/// 预算必须明显长于连接阶段；授权框被遮挡或系统无响应时到期即上报 Timeout，
+/// 不会永久停留 Connecting。
+const CREDENTIAL_LOAD_TIMEOUT_SECS: u64 = 60;
+
 /// 连接阶段枚举，用于向前端与控制台报告当前卡点
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ConnectionPhase {
@@ -139,6 +144,7 @@ pub fn start_terminal_session<R: Runtime>(
                 ssh_transport::connect_terminal(host, password, passphrase, verifier, on_phase)
             },
         ),
+        Duration::from_secs(CREDENTIAL_LOAD_TIMEOUT_SECS),
         Duration::from_secs(CONNECT_TOTAL_TIMEOUT_SECS),
         on_exit,
     );
@@ -156,6 +162,7 @@ fn start_terminal_session_with_parts<R, F>(
     credential_loader: F,
     verifier: HostKeyVerifier,
     connect_fn: TerminalConnectFn,
+    credential_timeout: Duration,
     connect_timeout: Duration,
     on_exit: TerminalExitFn,
 ) where
@@ -164,14 +171,67 @@ fn start_terminal_session_with_parts<R, F>(
 {
     thread::spawn(move || {
         let _exit_guard = TerminalExitGuard::new(on_exit);
-        // 系统安全存储首次访问可能等待用户授权；终端工作线程直接等待授权结果
-        // ponytail: Keychain API 无法取消；先等待系统结果，若出现真实永久挂起再引入可取消凭据代理。
+        // 系统安全存储首次访问可能等待用户授权；凭据读取放至独立线程，
+        // 外层短轮询保证关闭可立即生效，且独立预算到期即上报 Timeout：
+        // 授权框被遮挡或系统无响应不会永久阻塞在 Connecting。
         emit_connection_progress(&app, &session_id, ConnectionPhase::LoadingCredentials);
         info!(
             "[session:{}][diagnostic] Starting credential load",
             session_id
         );
-        let credentials = match credential_loader(&host) {
+        let (cred_tx, cred_rx) =
+            mpsc::channel::<Result<(Option<String>, Option<String>), AppError>>();
+        let host_for_credentials = host.clone();
+        thread::spawn(move || {
+            // 接收端已放弃（超时/关闭退出）时 send 失败，加载线程随之结束
+            let _ = cred_tx.send(credential_loader(&host_for_credentials));
+        });
+        let credential_deadline = Instant::now() + credential_timeout;
+        let credential_result = loop {
+            // 凭据等待期间会话可能被关闭：必须立即退出而非继续等待系统响应
+            if shutdown.load(Ordering::Relaxed) {
+                info!(
+                    "[session:{}][diagnostic] Shutdown requested while loading credentials",
+                    session_id
+                );
+                return;
+            }
+            match cred_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => break result,
+                Err(RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= credential_deadline {
+                        error!(
+                            "[session:{}][diagnostic] Credential loading timed out after {:?}",
+                            session_id, credential_timeout
+                        );
+                        emit_session_status(
+                            &app,
+                            &session_id,
+                            &runtime_status,
+                            SessionStatus::Timeout,
+                            Some(timeout_status_detail(&ConnectionPhase::LoadingCredentials)),
+                        );
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // 凭据加载线程异常退出：必须发布终态，否则前端永远 Connecting
+                    error!(
+                        "[session:{}][diagnostic] Credential loader thread exited unexpectedly",
+                        session_id
+                    );
+                    emit_session_status(
+                        &app,
+                        &session_id,
+                        &runtime_status,
+                        SessionStatus::Error,
+                        Some(raw_status_error("凭据加载线程异常退出".to_string())),
+                    );
+                    return;
+                }
+            }
+        };
+        let credentials = match credential_result {
             Ok(creds) => {
                 info!(
                     "[session:{}][diagnostic] Credentials loaded successfully",

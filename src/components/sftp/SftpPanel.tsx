@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Tabs } from 'antd';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { SftpSessionState, TransferTask } from '@/types/sftp';
 import FileExplorer from './FileExplorer';
@@ -64,14 +65,17 @@ export default function SftpPanel(props: Props) {
     document.body.classList.add('sftp-resizing');
   }
 
+  /** 只接受当前 SFTP 面板声明的标签键，避免组件库回调污染本地状态。 */
+  function changeTab(key: string) {
+    if (key === 'explorer' || key === 'queue') setTab(key);
+  }
+
   return <div className="sftp-panel" style={{ height }}>
     <div data-testid="sftp-resizer" className="sftp-resizer" role="separator" aria-orientation="horizontal" onPointerDown={startResize} />
-    <div className="sftp-header">
-      <button data-testid="tab-explorer" className={`sftp-tab ${tab === 'explorer' ? 'sftp-tab--active' : ''}`}
-        onClick={() => setTab('explorer')}>{translate(locale, 'sftp.explorer')}</button>
-      <button data-testid="tab-queue" className={`sftp-tab ${tab === 'queue' ? 'sftp-tab--active' : ''}`}
-        onClick={() => setTab('queue')}>{translate(locale, 'sftp.queue')}</button>
-    </div>
+    <Tabs className="sftp-header" size="small" activeKey={tab} onChange={changeTab} items={[
+      { key: 'explorer', label: <span data-testid="tab-explorer">{translate(locale, 'sftp.explorer')}</span>, children: null },
+      { key: 'queue', label: <span data-testid="tab-queue">{translate(locale, 'sftp.queue')}</span>, children: null },
+    ]} />
     {!props.state ? <div className="sftp-placeholder">{translate(locale, 'sftp.selectSession')}</div>
       : tab === 'explorer' ? <FileExplorer state={props.state}
         onNavigate={(path) => props.onNavigate(props.sessionId, path)}

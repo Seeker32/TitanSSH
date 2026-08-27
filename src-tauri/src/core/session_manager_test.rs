@@ -6,11 +6,21 @@ mod tests {
 
     /// 创建共享运行时状态一致的 SessionManager。
     fn make_manager() -> SessionManager {
-        SessionManager::new(
-            MonitorService::new(),
-            SftpService::new(),
-            HostIdentityService::new(),
-        )
+        SessionManager::new()
+    }
+
+    /// SessionManager 的 clone 必须共享同一 Runtime Session 索引。
+    #[test]
+    fn cloned_manager_shares_runtime_session_index() {
+        let manager = SessionManager::new();
+        manager.insert_session_for_test("session-shared", make_host("host-1"));
+
+        let clone = manager.clone();
+        assert_eq!(clone.list_sessions().len(), 1);
+        clone
+            .close_session("session-shared", &tauri::test::mock_app().handle())
+            .unwrap();
+        assert!(manager.list_sessions().is_empty());
     }
 
     /// 构造测试用 HostConfig
@@ -90,11 +100,8 @@ mod tests {
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError("unused".to_string().into()))
         });
-        let manager = SessionManager::new(
-            MonitorService::new(),
-            sftp_service.clone(),
-            HostIdentityService::new(),
-        );
+        let manager =
+            SessionManager::with_adapters(sftp_service.clone(), HostIdentityService::new());
         for session_id in ["session-exit-a", "session-exit-b"] {
             manager.insert_session_for_test(session_id, make_host(session_id));
             sftp_service.register_session(session_id.to_string(), make_host(session_id));
@@ -115,7 +122,7 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::channel();
         let session_id = "session-runtime-status".to_string();
 
-        manager.sessions.lock().unwrap().insert(
+        manager.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
                 meta: SessionInfo {
@@ -150,11 +157,8 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
-        let manager = SessionManager::new(
-            MonitorService::new(),
-            sftp_service.clone(),
-            HostIdentityService::new(),
-        );
+        let manager =
+            SessionManager::with_adapters(sftp_service.clone(), HostIdentityService::new());
 
         let session = manager
             .open_session(app.handle().clone(), make_host("host-1"))
@@ -176,11 +180,8 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
-        let manager = SessionManager::new(
-            MonitorService::new(),
-            sftp_service.clone(),
-            HostIdentityService::new(),
-        );
+        let manager =
+            SessionManager::with_adapters(sftp_service.clone(), HostIdentityService::new());
         let mut host = make_host("host-terminal-startup-failure");
         host.password_ref = None;
 
@@ -214,11 +215,11 @@ mod tests {
                 "expected test failure".to_string().into(),
             ))
         });
-        let manager = SessionManager::new(MonitorService::new(), sftp_service, identity.clone());
+        let manager = SessionManager::with_adapters(sftp_service, identity.clone());
         let session_id = "session-identity-close".to_string();
         let (command_tx, _command_rx) = mpsc::channel();
 
-        manager.sessions.lock().unwrap().insert(
+        manager.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
                 meta: SessionInfo {
@@ -266,28 +267,26 @@ mod tests {
     /// close_session 必须在后端一次性停止 Terminal、Monitoring 并清理 File Transfer。
     #[test]
     fn close_session_tears_down_all_backend_work() {
-        use crate::core::monitor_service::MonitorTaskHandle;
-        use crate::models::monitor::{TaskInfo, TaskStatus};
+        use crate::models::monitor::TaskStatus;
         use tauri::test::mock_app;
 
         let app = mock_app();
-        let monitor_service = MonitorService::new();
         let sftp_service = SftpService::with_connector(|_, _| {
             Err(AppError::SshConnectionError(
                 "expected test failure".to_string().into(),
             ))
         });
-        let manager = SessionManager::new(
-            monitor_service.clone(),
-            sftp_service.clone(),
-            HostIdentityService::new(),
-        );
+        let manager =
+            SessionManager::with_adapters(sftp_service.clone(), HostIdentityService::new());
+        let monitor_service = manager.monitoring();
+        let process_service = manager.processes();
         let session_id = "session-close-all".to_string();
         let terminal_shutdown = Arc::new(AtomicBool::new(false));
         let monitor_shutdown = Arc::new(AtomicBool::new(false));
+        let process_shutdown = Arc::new(AtomicBool::new(false));
         let (command_tx, _command_rx) = mpsc::channel();
 
-        manager.sessions.lock().unwrap().insert(
+        manager.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
                 meta: SessionInfo {
@@ -305,18 +304,17 @@ mod tests {
                 host: make_host("host-1"),
             },
         );
-        monitor_service.tasks.lock().unwrap().insert(
-            "monitor-task".to_string(),
-            MonitorTaskHandle {
-                task_info: TaskInfo {
-                    task_id: "monitor-task".to_string(),
-                    task_type: "monitor".to_string(),
-                    session_id: Some(session_id.clone()),
-                    status: TaskStatus::Running,
-                    created_at: 1_710_000_000_000,
-                },
-                shutdown: monitor_shutdown.clone(),
-            },
+        monitor_service.insert_task_for_test(
+            "monitor-task",
+            &session_id,
+            TaskStatus::Running,
+            monitor_shutdown.clone(),
+        );
+        process_service.insert_task_for_test(
+            "process-task",
+            &session_id,
+            TaskStatus::Running,
+            process_shutdown.clone(),
         );
         sftp_service.register_session(session_id.clone(), make_host("host-1"));
 
@@ -326,7 +324,163 @@ mod tests {
 
         assert!(terminal_shutdown.load(Ordering::Relaxed));
         assert!(monitor_shutdown.load(Ordering::Acquire));
-        assert!(monitor_service.tasks.lock().unwrap().is_empty());
+        assert!(!monitor_service.task_exists_for_test("monitor-task"));
+        assert!(process_shutdown.load(Ordering::Acquire));
+        assert!(!process_service.task_exists_for_test("process-task"));
         assert!(!sftp_service.has_session(&session_id));
+    }
+
+    /// 显式 close 与 Terminal exit 竞争时只能有一个调用者取得 teardown 所有权。
+    #[test]
+    fn close_session_race_has_one_winner() {
+        use crate::models::monitor::TaskStatus;
+        use std::sync::{Arc, Barrier};
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let manager = make_manager();
+        let session_id = "session-close-race";
+        manager.insert_session_for_test(session_id, make_host("host-1"));
+
+        let monitor_shutdown = Arc::new(AtomicBool::new(false));
+        let process_shutdown = Arc::new(AtomicBool::new(false));
+        manager.monitoring().insert_task_for_test(
+            "monitor-race",
+            session_id,
+            TaskStatus::Running,
+            monitor_shutdown.clone(),
+        );
+        manager.processes().insert_task_for_test(
+            "process-race",
+            session_id,
+            TaskStatus::Running,
+            process_shutdown.clone(),
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first = manager.clone();
+        let second = manager.clone();
+        let first_barrier = barrier.clone();
+        let second_barrier = barrier;
+        let first_app = app.handle().clone();
+        let second_app = app.handle().clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.close_session(session_id, &first_app)
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.close_session(session_id, &second_app)
+        });
+
+        let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AppError::SessionNotFound(_))))
+                .count(),
+            1
+        );
+        assert!(monitor_shutdown.load(Ordering::Acquire));
+        assert!(process_shutdown.load(Ordering::Acquire));
+        assert!(!manager.monitoring().task_exists_for_test("monitor-race"));
+        assert!(!manager.processes().task_exists_for_test("process-race"));
+    }
+
+    /// 带释放信号的内存共享连接条目，供 teardown 回收断言。
+    struct DroppingEntry {
+        dropped: std::sync::mpsc::Sender<()>,
+    }
+
+    impl crate::core::shared_exec_registry::ExecConnectionEntry for DroppingEntry {
+        /// 派生固定输出 capability（teardown 测试不执行采集）。
+        fn exec_transport(&self) -> crate::core::ssh_transport::ExecTransport {
+            crate::core::ssh_transport::test_support::repeating_exec("METRIC=1".to_string())
+        }
+    }
+
+    impl Drop for DroppingEntry {
+        /// 最后一个引用消失时通知测试。
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    /// session teardown 必须回收共享 exec 注册表中的连接：条目释放、无泄漏；
+    /// 其他会话的连接不受影响。
+    #[test]
+    fn close_session_recycles_shared_exec_connection() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let manager = SessionManager::with_adapters(
+            SftpService::with_connector(|_, _| {
+                Err(AppError::SshConnectionError("unused".to_string().into()))
+            }),
+            HostIdentityService::new(),
+        );
+        let registry = manager.inner.exec_registry.clone();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let (other_tx, other_rx) = std::sync::mpsc::channel();
+
+        // 预置目标会话与其他会话的共享连接
+        registry
+            .resolve("session-close-exec", || {
+                Ok(DroppingEntry {
+                    dropped: dropped_tx,
+                })
+            })
+            .expect("预置目标会话连接应成功");
+        registry
+            .resolve("session-other-exec", || {
+                Ok(DroppingEntry { dropped: other_tx })
+            })
+            .expect("预置其他会话连接应成功");
+
+        manager.insert_session_for_test("session-close-exec", make_host("host-1"));
+
+        manager
+            .close_session("session-close-exec", &app.handle().clone())
+            .unwrap();
+
+        assert!(
+            !registry.contains("session-close-exec"),
+            "teardown 后不得残留连接条目"
+        );
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("teardown 必须释放共享连接（无泄漏）");
+        assert!(
+            registry.contains("session-other-exec"),
+            "回收不得影响其他会话的连接"
+        );
+        assert!(other_rx.try_recv().is_err(), "其他会话连接不得被释放");
+    }
+
+    /// 应用退出时除逐会话回收外，还需清空注册表：不在 sessions 索引中的
+    /// 残留条目（如回收后才插入的迟来连接）也不得泄漏。
+    #[test]
+    fn shutdown_all_clears_leftover_shared_exec_entries() {
+        use tauri::test::mock_app;
+
+        let app = mock_app();
+        let manager = SessionManager::new();
+        let registry = manager.inner.exec_registry.clone();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        registry
+            .resolve("session-orphan-exec", || {
+                Ok(DroppingEntry {
+                    dropped: dropped_tx,
+                })
+            })
+            .expect("预置孤立条目应成功");
+
+        manager.shutdown_all(app.handle());
+
+        assert!(!registry.contains("session-orphan-exec"));
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("退出兜底必须清空全部残留条目");
     }
 }

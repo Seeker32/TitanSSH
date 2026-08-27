@@ -4,12 +4,9 @@ mod errors;
 mod models;
 mod storage;
 
-use crate::core::host_identity::HostIdentityService;
 use crate::core::host_service::SharedHostConfigService;
 use crate::core::logging;
-use crate::core::monitor_service::MonitorService;
 use crate::core::session_manager::SessionManager;
-use crate::core::sftp_service::SftpService;
 use tauri::Manager;
 
 /// 安装 Tauri 初始化前的 panic 文件日志 hook，供二进制入口在启动第一步调用。
@@ -22,10 +19,6 @@ pub fn install_early_panic_hook() {
 /// 注册所有插件、全局状态和 invoke 命令处理器，
 /// 然后进入 Tauri 事件循环直到应用退出。
 pub fn run() {
-    let monitor_service = MonitorService::new();
-    let sftp_service = SftpService::new();
-    let identity_service = HostIdentityService::new();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -35,21 +28,15 @@ pub fn run() {
             logging::install_logger_for_app(app.handle());
             // 初始化 TitanSSH 独立信任存储（应用数据目录下的 known_hosts）；
             // 不读取系统 ~/.ssh/known_hosts，也不使用 keyring
-            app.state::<HostIdentityService>()
+            app.state::<SessionManager>()
+                .host_identity()
                 .init_trust_store(app.handle())?;
             // 受管共享主机服务：所有 host 命令复用同一实例并持锁串行化
             // hosts.json 的 load-modify-write 周期，防止并发 invoke 互相覆盖
             app.manage(SharedHostConfigService::new(app.handle())?);
             Ok(())
         })
-        .manage(SessionManager::new(
-            monitor_service.clone(),
-            sftp_service.clone(),
-            identity_service.clone(),
-        ))
-        .manage(monitor_service)
-        .manage(sftp_service)
-        .manage(identity_service)
+        .manage(SessionManager::new())
         .invoke_handler(tauri::generate_handler![
             commands::host::list_hosts,
             commands::host::save_host,
@@ -69,6 +56,9 @@ pub fn run() {
             commands::monitor::start_monitoring,
             commands::monitor::stop_monitoring,
             commands::monitor::get_monitor_status,
+            commands::process::start_process_monitoring,
+            commands::process::stop_process_monitoring,
+            commands::process::get_process_status,
             commands::sftp::sftp_list_dir,
             commands::sftp::sftp_download,
             commands::sftp::sftp_upload,

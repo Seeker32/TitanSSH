@@ -1,4 +1,5 @@
 use crate::core::host_identity::HostIdentityService;
+use crate::core::session_manager::SessionManager;
 use crate::errors::app_error::{AppError, ErrorDetail};
 use crate::models::host::{AuthType, CredentialInput, HostConfig, SaveHostRequest};
 use crate::storage::host_store::HostStore;
@@ -83,12 +84,12 @@ impl HostConfigService {
     ///
     /// # 参数
     /// - `app`: Tauri 应用句柄，用于解析 hosts.json 所在的应用数据目录与
-    ///   获取受管 HostIdentityService 状态
+    ///   获取 SessionManager 持有的 HostIdentityService 状态
     ///
     /// # 副作用
     /// 解析并创建应用数据目录；失败返回 StorageError
     pub fn new(app: &AppHandle) -> Result<Self, AppError> {
-        let identity_service = app.state::<HostIdentityService>().inner().clone();
+        let identity_service = app.state::<SessionManager>().host_identity();
         Ok(Self {
             host_store: HostStore::new(app)?,
             credential_store: Box::new(SecureCredentialStore),

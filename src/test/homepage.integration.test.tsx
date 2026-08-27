@@ -6,15 +6,17 @@ import { emitMockEvent, listen, resetMockEvents } from '@tauri-apps/api/event';
 import HomePage from '@/pages/HomePage';
 import { useHostStore } from '@/stores/host';
 import { useLayoutStore } from '@/stores/layout';
+import { longTaskProjection } from '@/stores/long-task';
 import { useLocaleStore } from '@/stores/locale';
 import { useMonitorStore } from '@/stores/monitor';
+import { useProcessStore } from '@/stores/process';
 import { useSessionStore } from '@/stores/session';
 import { useSftpStore } from '@/stores/sftp';
 import { useLogLevelStore } from '@/stores/log-level';
 import { useLogsStore } from '@/stores/logs';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
-import { makeHost, makeSession, makeSnapshot, makeTaskInfo } from './fixtures';
+import { makeHost, makeProcessSnapshot, makeProcessTaskInfo, makeSession, makeSnapshot, makeTabViewState, makeTaskInfo } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({ default: () => <div data-testid="xterm" /> }));
 const mockInvoke = vi.mocked(invoke);
@@ -25,6 +27,7 @@ function resetStores() {
   useHostStore.setState(useHostStore.getInitialState(), true);
   useLayoutStore.setState(useLayoutStore.getInitialState(), true);
   useMonitorStore.setState(useMonitorStore.getInitialState(), true);
+  useProcessStore.setState(useProcessStore.getInitialState(), true);
   useSessionStore.setState(useSessionStore.getInitialState(), true);
   useSftpStore.setState(useSftpStore.getInitialState(), true);
   useLogLevelStore.setState(useLogLevelStore.getInitialState(), true);
@@ -41,6 +44,7 @@ describe('HomePage integration', () => {
       if (command === 'list_hosts') return [makeHost()];
       if (command === 'open_session') return makeSession();
       if (command === 'start_monitoring') return makeTaskInfo();
+      if (command === 'start_process_monitoring') return makeProcessTaskInfo();
       if (command === 'sftp_list_dir') return [];
       return undefined;
     });
@@ -87,13 +91,49 @@ describe('HomePage integration', () => {
     ]);
   });
 
+  it('进程快照在侧栏显示 top-5，并可切换内存排序档', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => emitMockEvent('process:snapshot', makeProcessSnapshot()));
+
+    expect(screen.getByTestId('process-summary')).toHaveTextContent('worker');
+    await user.click(screen.getByRole('button', { name: '内存' }));
+    expect(screen.getByRole('button', { name: '内存' })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(screen.getByTestId('monitor-collapse-btn'));
+    await act(async () => emitMockEvent('process:snapshot', makeProcessSnapshot({ timestamp: 1_710_000_121_000 })));
+    await user.click(screen.getByTestId('monitor-strip'));
+    expect(screen.getByTestId('process-summary')).toHaveTextContent('worker');
+  });
+
+  it('从 top-5 打开进程标签，关闭后仍保留缓存快照', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.dblClick(await screen.findByTestId('host-card-host-1'));
+    await act(async () => emitMockEvent('process:snapshot', makeProcessSnapshot()));
+    const xterm = screen.getByTestId('xterm');
+
+    await user.click(screen.getByRole('button', { name: '查看全部进程' }));
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(screen.getByText('进程 · root@10.0.0.8')).toBeInTheDocument();
+    expect(screen.getByTestId('xterm')).toBe(xterm);
+
+    await user.click(screen.getByRole('button', { name: '关闭 进程 · root@10.0.0.8' }));
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(useProcessStore.getState().snapshots.has('session-1')).toBe(true);
+  });
+
   it('切换活动会话后保留各自的网卡选择', async () => {
     const user = userEvent.setup();
     render(<HomePage />);
     act(() => useSessionStore.setState({ sessions: new Map([
       ['session-1', makeSession()],
       ['session-2', makeSession({ sessionId: 'session-2' })],
-    ]), activeView: 'session-1' }));
+    ]), tabViews: makeTabViewState([
+      makeSession(), makeSession({ sessionId: 'session-2' }),
+    ], 'session-1') }));
+    longTaskProjection.activateSession('session-1');
+    longTaskProjection.activateSession('session-2');
     await act(async () => {
       emitMockEvent('monitor:snapshot', makeSnapshot({ network: {
         available: true,
@@ -108,9 +148,9 @@ describe('HomePage integration', () => {
       } }));
     });
     await user.selectOptions(screen.getByLabelText('网卡接口'), 'eth1');
-    act(() => useSessionStore.getState().setActiveView('session-2'));
+    act(() => useSessionStore.getState().setActiveTab('terminal:session-2'));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('ens5');
-    act(() => useSessionStore.getState().setActiveView('session-1'));
+    act(() => useSessionStore.getState().setActiveTab('terminal:session-1'));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('eth1');
   });
 
@@ -126,10 +166,15 @@ describe('HomePage integration', () => {
     });
     expect(screen.getByRole('status')).toHaveTextContent('正在请求终端 PTY...');
 
-    act(() => useSessionStore.setState({ sessions: new Map([
-      ...useSessionStore.getState().sessions,
-      ['session-2', makeSession({ sessionId: 'session-2' })],
-    ]) }));
+    act(() => useSessionStore.setState({
+      sessions: new Map([
+        ...useSessionStore.getState().sessions,
+        ['session-2', makeSession({ sessionId: 'session-2' })],
+      ]),
+      tabViews: makeTabViewState([
+        makeSession(), makeSession({ sessionId: 'session-2' }),
+      ], 'session-1'),
+    }));
     await act(async () => {
       emitMockEvent('session:status', { sessionId: 'session-2', status: SessionStatus.AuthFailed, error: null });
     });
@@ -385,6 +430,7 @@ describe('HomePage integration', () => {
     const eventNames = mockListen.mock.calls.map(([eventName]) => eventName);
 
     expect(eventNames.filter((name) => name === 'session:status')).toHaveLength(1);
+    expect(eventNames.filter((name) => name === 'task:status')).toHaveLength(1);
     expect(eventNames.filter((name) => name === 'monitor:snapshot')).toHaveLength(1);
     expect(eventNames.filter((name) => name === 'terminal:data')).toHaveLength(0);
   });
