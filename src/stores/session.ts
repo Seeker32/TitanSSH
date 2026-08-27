@@ -3,8 +3,6 @@ import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
 import type { HostIdentityChallenge, HostIdentityChallengeDismissed, SessionConnection, SessionInfo, SessionProgressEvent, SessionStatusEvent } from '@/types/session';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
-import type { TerminalTab } from '@/types/tab';
-import { processTabId, terminalTabId } from '@/types/tab';
 import type { AppErrorInfo, Locale, TranslationKey } from '@/i18n';
 import { formatAppError, toAppError, translate } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
@@ -12,13 +10,12 @@ import { longTaskProjection } from './long-task';
 import { useMonitorStore } from './monitor';
 import { useProcessStore } from './process';
 import { useSftpStore } from './sftp';
+import { emptyTabViewState, transitionTabViews, type TabId, type TabViewState } from './tab-view';
 
 interface SessionState {
   sessions: Map<string, SessionInfo>;
-  /** 标签视图模型（ADR-0002）：按插入顺序存储的标签实体；标签引用会话但不拥有连接 */
-  tabs: Map<string, TerminalTab>;
-  /** 当前激活标签；null 表示无激活视图（空态） */
-  activeTabId: string | null;
+  /** 标签视图状态（ADR-0002）；标签引用会话但不拥有连接。 */
+  tabViews: TabViewState;
   /** 按 sessionId 存储的连接生命周期投影（阶段 + 结构化错误）；Connected/Disconnected 后清除。 */
   connections: Map<string, SessionConnection>;
   /** 投影建立前到达的进度事件缓存（open_session 返回与首个 progress 事件的 IPC 竞态）；
@@ -33,12 +30,12 @@ interface SessionState {
   writeTerminal: (sessionId: string, data: string) => Promise<void>;
   resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
   /** 切换激活标签（视图选择状态，标签语义） */
-  setActiveTab: (tabId: string) => void;
+  setActiveTab: (tabId: TabId) => void;
   /** 打开指定会话的进程纯视图；重复打开只激活既有标签。 */
   openProcessTab: (sessionId: string) => void;
   /** 关闭标签：终端标签是会话锚点，关闭即触发 close_session 完整 teardown；
    *  纯视图标签（未来）仅移除自身，不影响会话生命周期 */
-  closeTab: (tabId: string) => Promise<void>;
+  closeTab: (tabId: TabId) => Promise<void>;
   applySessionStatus: (payload: SessionStatusEvent) => void;
   applySessionProgress: (payload: SessionProgressEvent) => void;
   applyHostIdentityChallenge: (payload: HostIdentityChallenge) => void;
@@ -106,8 +103,7 @@ function withoutHostKeyProjection(
 export const useSessionStore = create<SessionState>((set, get) => {
   return {
     sessions: new Map(),
-    tabs: new Map(),
-    activeTabId: null,
+    tabViews: emptyTabViewState,
     connections: new Map(),
     pendingProgress: new Map(),
     hostKeyChallenges: new Map(),
@@ -124,16 +120,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
         const pendingProgress = new Map(state.pendingProgress);
         pendingProgress.delete(sessionId);
         const projection = withoutHostKeyProjection(state.hostKeyChallenges, state.hostKeySaveErrors, sessionId);
-        // 标签随会话投影一并移除（终端标签是会话锚点，不残留无会话可引的标签）
-        const removedTabIds = new Set(
-          [...state.tabs.values()].filter((tab) => tab.sessionId === sessionId).map((tab) => tab.tabId),
-        );
-        const tabs = new Map(state.tabs);
-        removedTabIds.forEach((tabId) => tabs.delete(tabId));
-        // 激活标签被移除时回到空态（空态页）；后台标签关闭不影响激活态
-        const activeTabId = state.activeTabId !== null && removedTabIds.has(state.activeTabId) ? null : state.activeTabId;
+        const tabViews = transitionTabViews(state.tabViews, sessions, { type: 'session-removed', sessionId }).state;
         return {
-          sessions, connections, pendingProgress, tabs, activeTabId, ...projection,
+          sessions, connections, pendingProgress, tabViews, ...projection,
         };
       });
       useMonitorStore.getState().clearSession(sessionId);
@@ -150,17 +139,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
         const pendingPhase = state.pendingProgress.get(session.sessionId)?.phase ?? null;
         const pendingProgress = new Map(state.pendingProgress);
         pendingProgress.delete(session.sessionId);
-        // 打开会话即建立其终端标签（会话锚点）并激活：标签引用会话但不拥有连接
-        const tab: TerminalTab = {
-          tabId: terminalTabId(session.sessionId),
-          type: 'terminal',
-          sessionId: session.sessionId,
-          createdAt: Date.now(),
-        };
+        const sessions = new Map(state.sessions).set(session.sessionId, session);
+        const tabViews = transitionTabViews(state.tabViews, sessions, {
+          type: 'session-opened', sessionId: session.sessionId, createdAt: Date.now(),
+        }).state;
         return {
-          sessions: new Map(state.sessions).set(session.sessionId, session),
-          tabs: new Map(state.tabs).set(tab.tabId, tab),
-          activeTabId: tab.tabId,
+          sessions,
+          tabViews,
           connections: new Map(state.connections).set(session.sessionId, { phase: pendingPhase, error: null }),
           pendingProgress,
         };
@@ -213,40 +198,28 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
     /** 切换激活标签（标签语义的视图选择）；标签栏点击、视图切换共用。 */
     setActiveTab(tabId) {
-      set({ activeTabId: tabId });
+      set((state) => {
+        const tabViews = transitionTabViews(state.tabViews, state.sessions, { type: 'activated', tabId }).state;
+        return tabViews === state.tabViews ? state : { tabViews };
+      });
     },
 
     /** 打开指定会话的进程纯视图，不启动或停止任何采样任务。 */
     openProcessTab(sessionId) {
-      if (!get().sessions.has(sessionId)) return;
-      const tabId = processTabId(sessionId);
       set((state) => {
-        const tabs = new Map(state.tabs);
-        if (!tabs.has(tabId)) {
-          tabs.set(tabId, { tabId, type: 'process', sessionId, createdAt: Date.now() });
-        }
-        return { tabs, activeTabId: tabId };
+        const tabViews = transitionTabViews(state.tabViews, state.sessions, {
+          type: 'process-opened', sessionId, createdAt: Date.now(),
+        }).state;
+        return tabViews === state.tabViews ? state : { tabViews };
       });
     },
 
     /** 关闭标签（ADR-0002）：终端标签是会话锚点，关闭即触发 close_session 完整
      *  teardown（终端、SFTP、双采样、共享连接）；未知标签与非终端类型（未实现）均为无操作。 */
     async closeTab(tabId) {
-      const tab = get().tabs.get(tabId);
-      if (!tab) return;
-      if (tab.type === 'terminal') {
-        await get().closeSession(tab.sessionId);
-        return;
-      }
-      // 进程标签是纯视图，关闭后回到同会话终端，不影响快照与采样任务。
-      set((state) => {
-        const tabs = new Map(state.tabs);
-        tabs.delete(tabId);
-        const activeTabId = state.activeTabId === tabId
-          ? (tabs.has(terminalTabId(tab.sessionId)) ? terminalTabId(tab.sessionId) : null)
-          : state.activeTabId;
-        return { tabs, activeTabId };
-      });
+      const transition = transitionTabViews(get().tabViews, get().sessions, { type: 'close-requested', tabId });
+      if (transition.state !== get().tabViews) set({ tabViews: transition.state });
+      if (transition.effect) await get().closeSession(transition.effect.sessionId);
     },
 
     /** 应用后端权威会话状态；投影仅更新所属 session，Connected/Disconnected 后清除。 */

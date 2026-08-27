@@ -25,6 +25,7 @@ import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { useTrustedHostsStore } from '@/stores/trusted-hosts';
 import { translate, toAppError, type AppErrorInfo } from '@/i18n';
 import { useLocaleStore } from '@/stores/locale';
+import { projectTabViews } from '@/stores/tab-view';
 import { TERMINAL_THEME_NAMES, terminalThemes } from '@/components/terminal/terminalThemes';
 import type { HostConfig, SaveHostRequest } from '@/types/host';
 import { uploadTargetDir, type TransferTask } from '@/types/sftp';
@@ -35,8 +36,7 @@ export default function HomePage() {
   const searchQuery = useHostStore((state) => state.searchQuery);
   const selectedHostId = useHostStore((state) => state.selectedHostId);
   const sessionsMap = useSessionStore((state) => state.sessions);
-  const tabsMap = useSessionStore((state) => state.tabs);
-  const activeTabId = useSessionStore((state) => state.activeTabId);
+  const tabViews = useSessionStore((state) => state.tabViews);
   const connections = useSessionStore((state) => state.connections);
   const hostKeyChallenges = useSessionStore((state) => state.hostKeyChallenges);
   const hostKeySaveErrors = useSessionStore((state) => state.hostKeySaveErrors);
@@ -49,10 +49,9 @@ export default function HomePage() {
   const collapsedGroups = useLayoutStore((state) => state.collapsedGroups);
   const monitorCollapsed = useLayoutStore((state) => state.monitorCollapsed);
   const theme = useThemeStore((state) => state.theme);
-  // 标签视图模型（ADR-0002）：标签栏与内容区从标签列表渲染；激活会话由激活标签派生
-  const tabs = useMemo(() => [...tabsMap.values()], [tabsMap]);
-  const activeTab = activeTabId === null ? null : tabsMap.get(activeTabId) ?? null;
-  const activeSessionId = activeTab === null ? null : activeTab.sessionId;
+  const locale = useLocaleStore((state) => state.locale);
+  const tabProjection = useMemo(() => projectTabViews(tabViews, sessionsMap, locale), [tabViews, sessionsMap, locale]);
+  const activeSessionId = tabProjection.activeSessionId;
   const selectedInterfaceName = useMonitorStore((state) => activeSessionId === null ? null : state.selectedInterfaces.get(activeSessionId) ?? null);
   const trendSamples = useMonitorStore((state) => activeSessionId === null ? undefined : state.networkTrends.get(activeSessionId));
   const snapshot = activeSessionId === null ? null : monitorSnapshots.get(activeSessionId) ?? null;
@@ -239,11 +238,11 @@ export default function HomePage() {
       </div>
     </aside>
     <section className="main-panel">
-      {tabs.length > 0 && <div className="tabs-area"><TerminalTabs tabs={tabs} sessions={sessionsMap} activeTabId={activeTabId}
+      {tabProjection.strip.length > 0 && <div className="tabs-area"><TerminalTabs items={tabProjection.strip}
         onActivate={(tabId) => useSessionStore.getState().setActiveTab(tabId)}
         onClose={(tabId) => useSessionStore.getState().closeTab(tabId)} /></div>}
       <div className="content-area">
-        {activeTab?.type === 'process' ? <ProcessTabPane snapshot={processSnapshot} /> : <TerminalPane tabs={tabs} sessions={sessionsMap} activeTabId={activeTabId} connections={connections}
+        <div className="terminal-surface" hidden={tabProjection.active.kind === 'process'}><TerminalPane terminals={tabProjection.terminals} connections={connections}
           challenges={hostKeyChallenges} saveErrors={hostKeySaveErrors}
           onInput={({ sessionId, data }) => useSessionStore.getState().writeTerminal(sessionId, data)}
           onResize={({ sessionId, cols, rows }) => useSessionStore.getState().resizeTerminal(sessionId, cols, rows)}
@@ -251,7 +250,8 @@ export default function HomePage() {
           onCloseTab={(tabId) => useSessionStore.getState().closeTab(tabId)}
           onSaveIdentity={(sessionId) => useSessionStore.getState().acceptAndSaveHostIdentity(sessionId)}
           onAcceptIdentity={(sessionId) => useSessionStore.getState().acceptHostIdentity(sessionId)}
-          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} />}
+          onRejectIdentity={(sessionId) => useSessionStore.getState().rejectHostIdentity(sessionId)} /></div>
+        {tabProjection.active.kind === 'process' && <ProcessTabPane snapshot={processSnapshot} />}
         {activeSessionId !== null && <SftpPanel sessionId={activeSessionId} state={sftpState}
           onNavigate={(sessionId, path) => useSftpStore.getState().listDir(sessionId, path)}
           onSelect={(sessionId, path) => useSftpStore.getState().toggleSelect(sessionId, path)}

@@ -23,7 +23,7 @@ Tauri + React 19 + TS(strict) + event-driven desktop DevOps client: SSH, File Tr
 
 ## Data model
 
-JSON-serializable, camelCase, timestamps in ms. Models: HostConfig, SessionInfo, TerminalTab, FileTransferTask, MonitorSnapshot, ProcessInfo
+JSON-serializable, camelCase, timestamps in ms. Models: HostConfig, SessionInfo, TabView, FileTransferTask, MonitorSnapshot, ProcessInfo
 
 ## Security
 

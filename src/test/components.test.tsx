@@ -15,9 +15,9 @@ import HostIdentityCard from '@/components/terminal/HostIdentityCard';
 import TransferQueue from '@/components/sftp/TransferQueue';
 import { AuthType } from '@/types/host';
 import { ConnectionPhase, SessionStatus, type HostIdentityChallenge, type SessionInfo } from '@/types/session';
-import { terminalTabId } from '@/types/tab';
 import { useLocaleStore } from '@/stores/locale';
-import { makeHost, makeRemoteDir, makeRemoteEntry, makeSession, makeSnapshot, makeTerminalTab, makeTransferTask } from './fixtures';
+import { makeHost, makeRemoteDir, makeRemoteEntry, makeSession, makeSnapshot, makeTabViewState, makeTransferTask } from './fixtures';
+import { projectTabViews } from '@/stores/tab-view';
 
 vi.mock('@/components/terminal/XtermView', () => ({
   default: ({ sessionId, active, interactive }: { sessionId: string; active: boolean; interactive?: boolean }) => (
@@ -27,11 +27,9 @@ vi.mock('@/components/terminal/XtermView', () => ({
 
 /** 由会话列表推导 TerminalPane 的标签视图 props：每会话恰好一个终端标签，激活标签指定显隐 */
 function paneView(sessions: SessionInfo[], activeSessionId: string | null) {
-  return {
-    tabs: sessions.map((session) => makeTerminalTab({ tabId: terminalTabId(session.sessionId), sessionId: session.sessionId })),
-    sessions: new Map(sessions.map((session) => [session.sessionId, session])),
-    activeTabId: activeSessionId === null ? null : terminalTabId(activeSessionId),
-  };
+  const sessionMap = new Map(sessions.map((session) => [session.sessionId, session]));
+  const state = makeTabViewState(sessions, activeSessionId ?? undefined);
+  return { terminals: projectTabViews(state, sessionMap, 'zh-CN').terminals };
 }
 
 describe('React components', () => {
@@ -160,8 +158,9 @@ describe('React components', () => {
     const user = userEvent.setup();
     const activate = vi.fn();
     const close = vi.fn();
-    render(<TerminalTabs tabs={[makeTerminalTab()]} sessions={new Map([['session-1', makeSession({ status: SessionStatus.Connected })]])}
-      activeTabId="terminal:session-1" onActivate={activate} onClose={close} />);
+    const session = makeSession({ status: SessionStatus.Connected });
+    render(<TerminalTabs items={projectTabViews(makeTabViewState([session]), new Map([['session-1', session]]), 'zh-CN').strip}
+      onActivate={activate} onClose={close} />);
     expect(screen.getAllByRole('tab')).toHaveLength(1);
     expect(screen.queryByText('首页')).not.toBeInTheDocument();
     expect(document.querySelector('.dot-connected')).toBeInTheDocument();

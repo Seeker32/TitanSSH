@@ -16,8 +16,7 @@ import { useLogLevelStore } from '@/stores/log-level';
 import { useLogsStore } from '@/stores/logs';
 import { useTerminalThemeStore } from '@/stores/terminal-theme';
 import { ConnectionPhase, SessionStatus } from '@/types/session';
-import { terminalTabId } from '@/types/tab';
-import { makeHost, makeProcessSnapshot, makeProcessTaskInfo, makeSession, makeSnapshot, makeTaskInfo, makeTerminalTab } from './fixtures';
+import { makeHost, makeProcessSnapshot, makeProcessTaskInfo, makeSession, makeSnapshot, makeTabViewState, makeTaskInfo } from './fixtures';
 
 vi.mock('@/components/terminal/XtermView', () => ({ default: () => <div data-testid="xterm" /> }));
 const mockInvoke = vi.mocked(invoke);
@@ -112,10 +111,12 @@ describe('HomePage integration', () => {
     render(<HomePage />);
     await user.dblClick(await screen.findByTestId('host-card-host-1'));
     await act(async () => emitMockEvent('process:snapshot', makeProcessSnapshot()));
+    const xterm = screen.getByTestId('xterm');
 
     await user.click(screen.getByRole('button', { name: '查看全部进程' }));
     expect(screen.getByRole('table')).toBeInTheDocument();
     expect(screen.getByText('进程 · root@10.0.0.8')).toBeInTheDocument();
+    expect(screen.getByTestId('xterm')).toBe(xterm);
 
     await user.click(screen.getByRole('button', { name: '关闭 进程 · root@10.0.0.8' }));
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
@@ -128,10 +129,9 @@ describe('HomePage integration', () => {
     act(() => useSessionStore.setState({ sessions: new Map([
       ['session-1', makeSession()],
       ['session-2', makeSession({ sessionId: 'session-2' })],
-    ]), tabs: new Map([
-      [terminalTabId('session-1'), makeTerminalTab()],
-      [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
-    ]), activeTabId: terminalTabId('session-1') }));
+    ]), tabViews: makeTabViewState([
+      makeSession(), makeSession({ sessionId: 'session-2' }),
+    ], 'session-1') }));
     longTaskProjection.activateSession('session-1');
     longTaskProjection.activateSession('session-2');
     await act(async () => {
@@ -148,9 +148,9 @@ describe('HomePage integration', () => {
       } }));
     });
     await user.selectOptions(screen.getByLabelText('网卡接口'), 'eth1');
-    act(() => useSessionStore.getState().setActiveTab(terminalTabId('session-2')));
+    act(() => useSessionStore.getState().setActiveTab('terminal:session-2'));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('ens5');
-    act(() => useSessionStore.getState().setActiveTab(terminalTabId('session-1')));
+    act(() => useSessionStore.getState().setActiveTab('terminal:session-1'));
     expect(screen.getByLabelText('网卡接口')).toHaveValue('eth1');
   });
 
@@ -171,10 +171,9 @@ describe('HomePage integration', () => {
         ...useSessionStore.getState().sessions,
         ['session-2', makeSession({ sessionId: 'session-2' })],
       ]),
-      tabs: new Map([
-        ...useSessionStore.getState().tabs,
-        [terminalTabId('session-2'), makeTerminalTab({ tabId: terminalTabId('session-2'), sessionId: 'session-2' })],
-      ]),
+      tabViews: makeTabViewState([
+        makeSession(), makeSession({ sessionId: 'session-2' }),
+      ], 'session-1'),
     }));
     await act(async () => {
       emitMockEvent('session:status', { sessionId: 'session-2', status: SessionStatus.AuthFailed, error: null });
